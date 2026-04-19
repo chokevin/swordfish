@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check swordfish bench tests
+      - run: ruff format --check swordfish bench tests
+
+  # GPU tests run on self-hosted runners (to be set up).
+  # Leaving the placeholder here so the pattern is obvious.
+  # gpu-tests:
+  #   runs-on: [self-hosted, a100]
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - run: pip install uv && uv sync
+  #     - run: uv run pytest -q
