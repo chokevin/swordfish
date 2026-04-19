@@ -1,0 +1,55 @@
+# voice-agent-flex MultiKueue manager — values overlay for swordfish-autoresearch.
+#
+# Apply with:
+#   helm install swordfish-profile-$(date +%s) \
+#     ./deploy/charts/swordfish-autoresearch \
+#     -n ray \
+#     -f ./deploy/values/voice-agent-flex.yaml
+#
+# Mirrors the conventions in voice-agent/deploy/values/manager.yaml so the Job
+# routes through the same MultiKueue federation and reuses the gh-token /
+# blob-training / training-nfs that already exist in the ray namespace.
+
+run:
+  enabled: true
+
+  # Image — bump TAG after running deploy/image/build.sh push
+  image: ghcr.io/chokevin/swordfish-autoresearch:latest
+
+  # Profiling target
+  ref: main
+  shapes: voice
+  impls: "fp16,marlin"
+  repeats: "5"
+
+  # MultiKueue routing — manager-side localQueue, federated to A100 workers
+  queue: training-queue
+  priorityClass: eval-priority      # one-shot diagnostic, not a real training job
+
+  # Cluster-installed names
+  gpuClaim: full-gpu                # one full A100 from the DRA pool
+  dataPVC: blob-training            # /data — Azure Blob CSI
+  nfsPVC: training-nfs              # /data-nfs — long-term archive
+  ghTokenSecret:
+    name: gh-token
+    key: token
+
+  nodeSelector:
+    agentpool: gpu
+  tolerations:
+    - key: sku
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+
+  resources:
+    cpuRequest: "4"
+    cpuLimit: "12"
+    memoryRequest: "32Gi"
+    memoryLimit: "64Gi"
+  shmSize: "16Gi"
+
+  prDraft: true
+  branchPrefix: "autoresearch/profile"
+  activeDeadlineSeconds: 3600
+  ttlSecondsAfterFinished: 86400

@@ -1,0 +1,68 @@
+# swordfish-autoresearch — one-shot Marlin profiling pod
+#
+# Companion to bench/profile_marlin.sh and docs/profiling/RUN_ME_ON_A100.md.
+# Modeled on voice-agent/deploy/charts/ai-training-infra so it slots straight
+# into the voice-agent-flex (MultiKueue + DRA) cluster.
+
+run:
+  enabled: true
+
+  # Image — built from deploy/image/Dockerfile, pushed by deploy/image/build.sh
+  # to <CONFIRM-registry>/swordfish-autoresearch:<tag>.
+  image: ghcr.io/chokevin/swordfish-autoresearch:latest
+  imagePullPolicy: IfNotPresent
+
+  # What to profile
+  ref: main                        # git ref of swordfish to clone + profile
+  shapes: voice                    # bench shape set (voice/full/llama8b/...)
+  impls: "fp16,marlin"             # bench impls
+  repeats: "5"                     # timing-loop repeats per impl
+  marlinSha: "1f25790bdd49fba53106164a24666dade68d7c90"
+  repo: "chokevin/swordfish"
+
+  # Where it lands
+  prDraft: true                    # open the result PR as draft
+  branchPrefix: "autoresearch/profile"
+
+  # Kueue routing — voice-agent-flex uses MultiKueue → A100 workers
+  queue: training-queue
+  priorityClass: lora-priority     # eval-priority is fine too; this is a 1-GPU one-shot
+
+  # GPU claim (DRA). full-gpu == one whole A100, matching the chart we copied from.
+  gpuClaim: full-gpu
+
+  # Scheduling
+  nodeSelector:
+    agentpool: gpu
+  tolerations:
+    - key: sku
+      operator: Equal
+      value: gpu
+      effect: NoSchedule
+
+  # Resources
+  resources:
+    cpuRequest: "4"
+    cpuLimit: "12"
+    memoryRequest: "32Gi"
+    memoryLimit: "64Gi"
+  shmSize: "16Gi"
+
+  # Volumes — match the surrounding chart's PVC names so we plug into the
+  # existing blob/nfs storage without provisioning anything new.
+  dataPVC: blob-training           # /data — for caching downloads if needed
+  nfsPVC: training-nfs             # /data-nfs — long-term artifact archive
+
+  # Secrets
+  ghTokenSecret:
+    name: gh-token                 # same secret the autoresearch agent uses
+    key: token
+
+  # Job hygiene
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400   # GC after 24h
+  activeDeadlineSeconds: 3600      # one-shot profile must finish in 1h
+
+  gitUser:
+    email: autoresearch@swordfish.bot
+    name: swordfish-autoresearch
