@@ -11,7 +11,7 @@ import torch
 
 
 def quantize_symmetric_int4(
-    w: torch.Tensor,           # [K, N] fp16
+    w: torch.Tensor,  # [K, N] fp16
     group_size: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Symmetric per-group INT4 quantization.
@@ -38,7 +38,7 @@ def quantize_symmetric_int4(
     q = q.reshape(K, N)
 
     # pack along N: even cols in low nibble, odd cols in high nibble
-    low = q[:, 0::2]   # [K, N//2]
+    low = q[:, 0::2]  # [K, N//2]
     high = q[:, 1::2]  # [K, N//2]
     packed = (low | (high << 4)).to(torch.uint8)
 

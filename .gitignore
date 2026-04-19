@@ -22,6 +22,10 @@ uv.lock.local
 *.ncu-rep
 prof/
 profiles/
+# but DO commit profiling artifacts checked in under docs/profiling/
+!docs/profiling/**/*.nsys-rep
+!docs/profiling/**/*.sqlite
+!docs/profiling/**/*.ncu-rep
 
 # editor
 .vscode/
@@ -34,6 +38,9 @@ bench_results/
 *.csv
 *.parquet
 !bench/fixtures/**/*.csv
+!docs/profiling/**/*.csv
+!docs/profiling/**/*.json
+!docs/profiling/**/*.png
 
 # local junk
 scratch/

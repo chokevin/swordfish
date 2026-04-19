@@ -10,8 +10,8 @@ import torch
 
 
 def dequantize_int4(
-    packed: torch.Tensor,      # [K, N // 2] uint8, two int4 per byte along N
-    scales: torch.Tensor,      # [K // group_size, N] fp16
+    packed: torch.Tensor,  # [K, N // 2] uint8, two int4 per byte along N
+    scales: torch.Tensor,  # [K // group_size, N] fp16
     zeros: torch.Tensor | None = None,  # [K // group_size, N] fp16 or int
     group_size: int = 128,
 ) -> torch.Tensor:
@@ -40,9 +40,9 @@ def dequantize_int4(
 
 
 def reference_w4a16_matmul(
-    a: torch.Tensor,           # [M, K] fp16
-    packed: torch.Tensor,      # [K, N // 2] uint8
-    scales: torch.Tensor,      # [K // group_size, N] fp16
+    a: torch.Tensor,  # [M, K] fp16
+    packed: torch.Tensor,  # [K, N // 2] uint8
+    scales: torch.Tensor,  # [K // group_size, N] fp16
     zeros: torch.Tensor | None = None,
     group_size: int = 128,
     bias: torch.Tensor | None = None,  # [N] fp16
