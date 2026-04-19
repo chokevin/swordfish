@@ -61,6 +61,12 @@ run:
       operator: Equal
       value: gpu
       effect: NoSchedule
+    # The actual taint on aks-gpu-* nodes (gpu-operator default), not just sku=gpu.
+    # Voice-agent's running pods carry both; we mirror them.
+    - key: nvidia.com/gpu
+      operator: Equal
+      value: "true"
+      effect: NoSchedule
 
   # Lean — entrypoint shell + Python at idle is ~2 CPU / 4Gi. Headroom for
   # nsys ingestion (peaks ~8GB) and ncu-rep (~1GB). Stay polite citizens of
