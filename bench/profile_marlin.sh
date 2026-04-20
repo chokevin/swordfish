@@ -142,14 +142,16 @@ gpu__time_duration.sum"
 
 for SH in ${SHAPE_NAMES}; do
   echo "  ncu ${SH}"
-  # Full report (UI-loadable)
+  # Full report (UI-loadable). Capture stderr to a sidecar log so failures
+  # are diagnosable post-hoc instead of vanishing to /dev/null (iter-6 caught
+  # ncu producing empty CSVs with the actual error message hidden).
   ncu --set full \
     --section "${NCU_SECTIONS//,/ --section }" \
     --target-processes all \
     --replay-mode kernel \
     --export "${OUT}/${SH}.ncu-rep" --force-overwrite \
-    python "${OUT}/_run_one.py" "${SH}" "${IMPLS}" >/dev/null 2>&1 || \
-      echo "    (ncu full failed for ${SH} — see logs)"
+    python "${OUT}/_run_one.py" "${SH}" "${IMPLS}" >"${OUT}/${SH}.ncu.log" 2>&1 || \
+      echo "    (ncu full failed for ${SH} — see ${SH}.ncu.log)"
 
   # Flat CSV with only the roofline metrics (cheap second pass)
   ncu --csv \
@@ -157,7 +159,7 @@ for SH in ${SHAPE_NAMES}; do
     --target-processes all \
     --replay-mode kernel \
     python "${OUT}/_run_one.py" "${SH}" "${IMPLS}" \
-    > "${OUT}/${SH}.ncu.csv" 2>/dev/null || \
+    > "${OUT}/${SH}.ncu.csv" 2>"${OUT}/${SH}.ncu-csv.log" || \
       echo "    (ncu csv failed for ${SH})"
 done
 
