@@ -15,12 +15,12 @@ Ship an INT4×FP16 decode kernel for A100 that **beats Marlin by 10%+ at batch 4
 ## Weekly plan
 
 ### Week 1 — Baseline and profiling
-- [ ] Reproduce Marlin's published numbers on our A100 box
-- [ ] Profile Marlin with `nsys` and `ncu` across all target shapes
-- [ ] Identify per-shape bottlenecks (bank conflicts? cp.async stalls? tensor-core feed?)
-- [ ] Build the benchmark harness with clean CSV output
-- [ ] Naïve reference (PyTorch) for correctness validation
-- **Exit:** `bench/run_bench.py` produces a per-shape comparison table; we know *why* Marlin is fast at its sweet spot.
+- [x] Reproduce Marlin's published numbers on our A100 box _(see PR #1 / docs/profiling/marlin-bottlenecks.md)_
+- [x] Profile Marlin with `nsys` and `ncu` across all target shapes _(nsys + perfetto: yes; ncu blocked by DCGM on voice-agent-flex — documented constraint, ncu not needed for bottleneck classification at these shapes)_
+- [x] Identify per-shape bottlenecks _(launch / fixed-overhead bound at all voice-decode shapes — surprise finding, **not** HBM-bound as roadmap originally assumed)_
+- [x] Build the benchmark harness with clean CSV output _(`bench/run_bench.py`, `results.csv`)_
+- [x] Naïve reference (PyTorch) for correctness validation _(`swordfish/reference.py`)_
+- **Exit:** ✓ `bench/run_bench.py` produces a per-shape comparison table; we know *why* Marlin is slow at our sweet spot — it has a fixed ~49 µs per-call floor that exceeds the work itself. Swordfish's W2+ attack surface is **launch-overhead reduction** (persistent kernel, pre-baked workspace, CUDA Graph capture), not in-loop throughput.
 
 ### Week 2 — Triton baseline
 - [ ] Write a clean Triton INT4×FP16 decode kernel
