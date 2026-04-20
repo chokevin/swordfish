@@ -1,18 +1,12 @@
 #!/usr/bin/env bash
-# swordfish autoresearch entrypoint.
+# swordfish autoresearch inner entrypoint.
 #
-# What it does, in order:
-#   1. Clones swordfish at $REF.
-#   2. Installs swordfish into the pre-baked Python env (NGC torch, not uv venv).
-#   3. Runs bench/profile_marlin.sh — produces nsys/ncu/perfetto artifacts.
-#   4. Generates roofline.png from the ncu CSV.
-#   5. Renders SUMMARY.md from results.csv (PR body).
-#   6. Updates docs/profiling/INDEX.md with one new row.
-#   7. Archives the run dir to /data-nfs (long-term, off-repo).
-#   8. Commits to a per-run branch and opens a draft PR.
+# Invoked by /usr/local/bin/swordfish-autoresearch (deploy/image/bootstrap.sh
+# in the image) AFTER the repo has been cloned. CWD is the repo root, gh auth
+# is already configured. Anything in this file can be changed without
+# rebuilding the Docker image — push to main and re-run helm install.
 #
-# Inputs (all env, all defaulted):
-#   REF             git ref of swordfish (default main)
+# Inputs (env, all defaulted by bootstrap or chart):
 #   SHAPES          shape set name (default voice)
 #   IMPLS           comma-separated impls (default fp16,marlin)
 #   REPEATS         repeats per impl (default 5)
@@ -20,45 +14,34 @@
 #   MARLIN_SHA      pin (default baked into image)
 #   BRANCH_PREFIX   default "autoresearch/profile"
 #   PR_DRAFT        "true"/"false" (default true)
-#   GH_TOKEN        REQUIRED — repo:contents + pull-requests write
-#   GIT_USER_EMAIL  default autoresearch@swordfish.bot
-#   GIT_USER_NAME   default swordfish-autoresearch
+#   GH_TOKEN        REQUIRED — set by bootstrap from secret
 
 set -euo pipefail
 
-REF="${REF:-main}"
 SHAPES="${SHAPES:-voice}"
 IMPLS="${IMPLS:-fp16,marlin}"
 REPEATS="${REPEATS:-5}"
 REPO="${REPO:-chokevin/swordfish}"
 BRANCH_PREFIX="${BRANCH_PREFIX:-autoresearch/profile}"
 PR_DRAFT="${PR_DRAFT:-true}"
-GIT_USER_EMAIL="${GIT_USER_EMAIL:-autoresearch@swordfish.bot}"
-GIT_USER_NAME="${GIT_USER_NAME:-swordfish-autoresearch}"
 
-if [[ -z "${GH_TOKEN:-}" ]]; then
-  echo "FATAL: GH_TOKEN not set. Mount the gh-token secret." >&2
-  exit 1
-fi
-
-export GH_TOKEN
-git config --global user.email "${GIT_USER_EMAIL}"
-git config --global user.name "${GIT_USER_NAME}"
-git config --global credential.helper '!f() { echo "username=x-access-token"; echo "password=${GH_TOKEN}"; }; f'
-
-cd /work
-echo "=== clone swordfish @ ${REF} ==="
-git clone --depth 50 "https://github.com/${REPO}.git" swordfish
-cd swordfish
-git fetch --depth 50 origin "${REF}"
-git checkout "${REF}"
 SOURCE_SHA="$(git rev-parse HEAD)"
 SOURCE_SHA_SHORT="$(git rev-parse --short=7 HEAD)"
 echo "source SHA: ${SOURCE_SHA}"
 
-# Use the container's pre-built torch (CUDA-matched). Editable install adds
-# swordfish + bench extras without disturbing torch/triton.
-pip install --no-cache-dir -e ".[bench]"
+# Use the container's pre-built torch (CUDA-matched). Install swordfish
+# with --no-deps so pip doesn't yank torch/triton/numpy and replace them
+# with PyPI wheels (which would break Marlin's ABI binding to NGC torch).
+# Then install bench-only extras (tabulate/matplotlib/pandas) — none of
+# these depend on torch, so they can't drag in a torch upgrade.
+pip install --no-cache-dir --no-deps -e .
+pip install --no-cache-dir tabulate matplotlib pandas
+
+# Sanity: confirm we did NOT replace torch.
+python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda} '
+  f'device_count={torch.cuda.device_count()} '
+  f'sm={torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None}')"
+python -c "import marlin; print('marlin import OK')"
 
 echo
 echo "=== profile run: shapes=${SHAPES} impls=${IMPLS} repeats=${REPEATS} ==="

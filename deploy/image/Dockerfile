@@ -35,7 +35,7 @@ RUN TORCH_CUDA_ARCH_LIST="8.0" \
  && python -c "import marlin; print('marlin OK at', '${MARLIN_SHA}')"
 
 WORKDIR /work
-COPY entrypoint.sh /usr/local/bin/swordfish-autoresearch
+COPY bootstrap.sh /usr/local/bin/swordfish-autoresearch
 RUN chmod +x /usr/local/bin/swordfish-autoresearch
 
 # Sanity surface for `kubectl exec ... -- env`-style smoke tests.
