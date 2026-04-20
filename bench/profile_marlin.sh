@@ -145,8 +145,12 @@ for SH in ${SHAPE_NAMES}; do
   # Full report (UI-loadable). Capture stderr to a sidecar log so failures
   # are diagnosable post-hoc instead of vanishing to /dev/null (iter-6 caught
   # ncu producing empty CSVs with the actual error message hidden).
+  # IMPORTANT: do NOT quote the --section expansion — ncu wants each
+  # --section as a separate arg; quoting collapses them into one literal
+  # arg ("--section a --section b --section c") which ncu rejects with
+  # "did not match any section" (iter-7 catch).
   ncu --set full \
-    --section "${NCU_SECTIONS//,/ --section }" \
+    --section ${NCU_SECTIONS//,/ --section } \
     --target-processes all \
     --replay-mode kernel \
     --export "${OUT}/${SH}.ncu-rep" --force-overwrite \
