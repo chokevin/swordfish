@@ -33,8 +33,10 @@
 run:
   enabled: true
 
-  # Image — bump TAG after running deploy/image/build.sh push
+  # Image — `:latest` is intentionally re-pulled every run because we iterate
+  # on the image often. Pin to a `:sha-<7char>` tag for a reproducible run.
   image: ghcr.io/chokevin/swordfish-autoresearch:latest
+  imagePullPolicy: Always
 
   # Profiling target
   ref: main
