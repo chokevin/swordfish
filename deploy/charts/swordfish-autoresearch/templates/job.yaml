@@ -58,6 +58,12 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.run.ghTokenSecret.name }}
                   key: {{ .Values.run.ghTokenSecret.key }}
+          # GPU is requested via DRA only — see resourceClaims at pod spec
+          # level below. We deliberately do NOT set `nvidia.com/gpu: N` in
+          # limits/requests (legacy device-plugin path), because mixing the
+          # two on a DRA-enabled cluster causes the scheduler to over-count
+          # GPU usage and never schedules. The container references the DRA
+          # claim by name via `resources.claims[]`, which is the v1.32+ way.
           resources:
             claims:
               - name: gpu
@@ -76,6 +82,10 @@ spec:
               mountPath: /dev/shm
             - name: workspace
               mountPath: /work
+      # DRA: claim a GPU via the cluster's existing ResourceClaimTemplate
+      # ("full-gpu" by default). The container references this claim by
+      # name in containers[].resources.claims[]. We use DRA exclusively;
+      # no legacy nvidia.com/gpu device-plugin requests anywhere.
       resourceClaims:
         - name: gpu
           resourceClaimTemplateName: {{ .Values.run.gpuClaim }}

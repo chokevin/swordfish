@@ -93,6 +93,38 @@ If the Job hangs in the queue: check the `Workload` object — most often
 `AdmissionCheck` is failing because no worker cluster has a free A100, or
 the resource flavor is missing. See voice-agent-flex MultiKueue runbook.
 
+## We use DRA, not the legacy device plugin
+
+GPUs are requested via DynamicResourceAllocation:
+
+```yaml
+spec:
+  resourceClaims:
+    - name: gpu
+      resourceClaimTemplateName: full-gpu       # cluster-installed RCT
+  containers:
+    - name: profiler
+      resources:
+        claims:
+          - name: gpu                            # ← references pod claim by name
+        # NO `nvidia.com/gpu: 1` here. Mixing legacy + DRA on the same pod
+        # makes the scheduler over-count GPUs and never schedule.
+```
+
+The cluster's `full-gpu` RCT requests `count: 1` of `deviceClassName: gpu.nvidia.com`
+(`kubectl get resourceclaimtemplate -n ray full-gpu -o yaml`). Verify a live pod
+is going through DRA:
+
+```bash
+kubectl get pod -n ray <pod> -o jsonpath='{.spec.resourceClaims}{"\n"}{.status.resourceClaimStatuses}{"\n"}'
+# both should be non-empty
+```
+
+This matches voice-agent's serving + training pods. Also: voice-agent-flex's
+Kueue (v0.17.1) does not yet have `deviceClassMappings` configured, so DRA
+claims aren't gated by quota — Kueue admits on CPU/memory and the DRA scheduler
+gates GPU at L4. Documented in the airun-alignment table below.
+
 ## Cluster prerequisites
 
 (All present on voice-agent-flex per `voice-agent/deploy/values/manager.yaml`;
