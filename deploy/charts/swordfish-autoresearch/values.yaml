@@ -12,6 +12,14 @@ run:
   image: ghcr.io/chokevin/swordfish-autoresearch:latest
   imagePullPolicy: IfNotPresent
 
+  # ncu requires GPU performance-counter access to produce per-kernel SOL,
+  # MemoryWorkloadAnalysis, etc. NVIDIA gates this with a kernel-module flag,
+  # bypassed in-container with SYS_ADMIN. Default true because without it
+  # the bottleneck analysis is just wall-clock timing — we lose the whole
+  # point of the ncu deep-dive step. Set false on clusters where SYS_ADMIN is
+  # forbidden by policy and accept the analysis gap.
+  allowGpuPerfCounters: true
+
   # What to profile
   ref: main                        # git ref of swordfish to clone + profile
   shapes: voice                    # bench shape set (voice/full/llama8b/...)

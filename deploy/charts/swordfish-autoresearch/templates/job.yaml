@@ -30,6 +30,18 @@ spec:
         - name: profiler
           image: {{ .Values.run.image }}
           imagePullPolicy: {{ .Values.run.imagePullPolicy }}
+          # ncu (Nsight Compute) reads NVIDIA GPU performance counters via the
+          # NVreg_RestrictProfilingToAdminUsers kernel-module gate. The clean
+          # container-side fix is SYS_ADMIN. Without this, ncu prints
+          # "ERR_NVGPUCTRPERM" and produces a CSV with zero kernel rows, which
+          # breaks the bottleneck analysis (no dram__throughput, no hmma pct,
+          # no scheduler stalls). Caught in iter-5 (PR #1: empty ncu CSVs).
+          # Scoped to the profiler container only; the pod has no host mounts.
+          {{- if .Values.run.allowGpuPerfCounters }}
+          securityContext:
+            capabilities:
+              add: ["SYS_ADMIN"]
+          {{- end }}
           # The image's ENTRYPOINT is /usr/local/bin/swordfish-autoresearch
           # (see deploy/image/Dockerfile). All control is via env vars.
           env:
