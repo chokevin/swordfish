@@ -30,14 +30,27 @@ wrapper, not the kernel, is the W2 attack surface. Graph capture alone moved
 rvLLM's stack 27× before any kernel work; we expect it to flip Marlin from
 x0.62 to x>1 vs fp16 at 8b shapes WITHOUT touching CUDA.
 
+**W2 preconditions (must clear BEFORE optimization):**
+1. **Captured-baseline cluster run.** Trigger the autoresearch chart at HEAD
+   with the new `--capture` path active. Without a captured "before" number
+   per shape, every W2 win is unmeasurable. The CSV column to watch is
+   `wrapper_overhead_pct` — that's the headroom we're going to spend.
+2. **Verify capture path actually works on GPU.** The fp16 impl's lambda
+   calls `torch.matmul`, which allocates the output tensor inside the
+   captured region. rvLLM §5.2 says this binds to a stale device offset
+   on replay. If `cuda_graph_time_ms` returns `capture_error="..."` for fp16,
+   the fp16 impl needs to be rewritten with pre-allocated `out` BEFORE we
+   trust any captured numbers. (Marlin's wrapper already supports `out=`.)
+
 - [x] Workspace cache in `marlin_compat.py` (eliminates per-call int32 alloc) _(done this commit)_
 - [x] L0 correctness gate (`allclose AND cosine ≥ 0.999`) so wrong kernels don't ship speed numbers _(done this commit)_
 - [x] `--capture` flag in `bench/run_bench.py` — measures wrapper overhead per impl as `eager_ms - captured_ms`, so we can see the win before writing it _(done this commit)_
-- [ ] **Captured marlin entry point** — `marlin_matmul_captured(a, B, s, *, out)` that records into a CUDA graph at first call, replays thereafter. Pre-allocated `out` required (rvLLM §5.2).
+- [ ] **Captured marlin entry point** — `marlin_matmul_captured(a, B, s, *, out)` that records into a CUDA graph at first call, replays thereafter. Pre-allocated `out` required (rvLLM §5.2). Workspace cache must be warmed before capture (see `_get_workspace` docstring).
 - [ ] Eliminate per-call dtype/contiguity asserts in `marlin_matmul` (~5 µs win, free).
 - [ ] Write a clean Triton INT4×FP16 decode kernel
 - [ ] Packing utility compatible with Marlin's layout (for apples-to-apples)
 - [ ] Correctness passes for all voice-decode shapes (auto via L0 gate)
+- [ ] Run `bench/eval_ppl.py` on cluster (L2 of correctness pyramid) — needs HF auth for Llama-3-8B-Instruct
 - [ ] Match Marlin within 30% at batch=1 (don't optimize yet)
 - **Exit:** Triton kernel is correct and in the benchmark table; captured-marlin row is in the bench output; we have a measured `wrapper_overhead_pct` per shape.
 

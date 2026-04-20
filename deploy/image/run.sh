@@ -122,16 +122,25 @@ print(f"- **CUDA / torch / triton:** {env.get('torch_cuda','?')} / "
 print(f"- **shapes:** `{shapes}`  **impls:** `{impls}`  **repeats:** {repeats}")
 print(f"- **marlin SHA:** `{marlin_sha}`\n")
 print("## Results\n")
-print("| shape | impl | ms_mean | ms_p95 | TFLOPS | speedup vs fp16 | error |")
-print("|---|---|---|---|---|---|---|")
+print("| shape | impl | ms_mean | ms_p95 | TFLOPS | speedup vs fp16 | ms_captured | wrapper % | cosine | error |")
+print("|---|---|---|---|---|---|---|---|---|---|")
 for r in rows:
     if r.get("error"):
-        print(f"| {r['name']} | {r['impl']} | — | — | — | — | {r['error']} |")
+        print(f"| {r['name']} | {r['impl']} | — | — | — | — | — | — | — | {r['error']} |")
     else:
         ms = float(r['ms_mean']); p95 = float(r['ms_p95'])
         tf = float(r['tflops_mean']); sp = float(r['speedup_vs_fp16'])
-        print(f"| {r['name']} | {r['impl']} | {ms:.3f} | {p95:.3f} | {tf:.1f} | x{sp:.2f} | |")
-print("\n![roofline](./roofline.png)")
+        # New columns from the rvLLM lessons commit. Optional — the row may
+        # come from an older bench that didn't emit them.
+        cap = r.get('ms_captured', '') or ''
+        cap_str = f"{float(cap):.3f}" if cap not in ('', None) else "—"
+        wpct = r.get('wrapper_overhead_pct', '') or ''
+        wpct_str = f"{float(wpct):+.0f}%" if wpct not in ('', None) else "—"
+        cos = r.get('cosine', '') or ''
+        cos_str = f"{float(cos):.4f}" if cos not in ('', None) else "—"
+        print(f"| {r['name']} | {r['impl']} | {ms:.3f} | {p95:.3f} | {tf:.1f} | x{sp:.2f} | {cap_str} | {wpct_str} | {cos_str} | |")
+print("\n> `wrapper %` = `(ms_mean - ms_captured) / ms_mean`. Large positive value means most of the wall-clock is host-side dispatch, not GPU work — see `docs/profiling/marlin-bottlenecks.md` and `docs/lessons-rvllm.md`.\n")
+print("![roofline](./roofline.png)")
 PY
 
 echo

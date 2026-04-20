@@ -37,12 +37,31 @@ _WORKSPACE_CACHE: dict[tuple[int, str], torch.Tensor] = {}
 
 
 def _get_workspace(N: int, device: torch.device) -> torch.Tensor:
+    """Return a zeroed int32 scratch buffer for marlin.mul.
+
+    Cached per (N, device) — the cost we eliminate is the per-call
+    `torch.zeros(...)` ALLOCATION (~10 µs of host-side overhead identified
+    in the W1 bottleneck analysis), not the zeroing itself. Zeroing a
+    16-int tensor is ~1 µs and is REQUIRED: marlin's upstream uses this
+    buffer as an inter-CTA tile counter / sync barrier; stale values from
+    a previous call have caused silent reduction corruption in some
+    versions. We zero on every access — cheap, safe.
+
+    Capture caveat (rvLLM §5.2): the FIRST call for a new (N, device)
+    allocates inside the captured region, which binds to a stale device
+    offset on replay. Callers that capture into a CUDA graph MUST warm
+    this cache (call marlin_matmul once outside capture) before the
+    capture region. ``cuda_graph_time_ms`` in the bench harness does this
+    correctly via its warmup loop. New captured callers must do the same.
+    """
     key = (N, str(device))
     ws = _WORKSPACE_CACHE.get(key)
     if ws is None:
         # 16 ints per 128-wide N-tile is the upstream marlin convention.
         ws = torch.zeros(N // 128 * 16, device=device, dtype=torch.int32)
         _WORKSPACE_CACHE[key] = ws
+    else:
+        ws.zero_()
     return ws
 
 
