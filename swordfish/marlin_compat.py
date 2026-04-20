@@ -13,6 +13,12 @@ Marlin is not importable on macOS; this module is therefore split into:
   - ``dequantized_for_marlin``: CPU-runnable; what the GPU path feeds Marlin.
 The CPU test in ``tests/test_marlin_compat.py`` exercises the dequant path,
 which is what would fail silently if ``swordfish.pack`` ever changed format.
+
+Workspace cache (rvLLM lesson §3.1, our W1 finding):
+  ``marlin.mul`` requires a small int32 scratch buffer sized by N. Allocating
+  it on every call adds ~5–10 µs of host-side overhead — material when the
+  kernel itself is ~17 µs. We cache one workspace per (N, device) tuple at
+  module level. This is the single-arena pattern from rvLLM, scoped down.
 """
 
 from __future__ import annotations
@@ -20,6 +26,29 @@ from __future__ import annotations
 import torch
 
 from swordfish.reference import dequantize_int4
+
+# Workspace cache: (N, device_str) -> persistent int32 tensor.
+# Replaces the per-call torch.zeros allocation that dominated the wrapper
+# overhead identified in W1 (marlin-bottlenecks.md). The tensor is filled
+# with zeros once on creation; marlin.mul does not require it to be re-zeroed
+# between calls (it's used as scratch, not accumulator). We DO zero it on
+# eviction-style reuse just to be safe — see _get_workspace.
+_WORKSPACE_CACHE: dict[tuple[int, str], torch.Tensor] = {}
+
+
+def _get_workspace(N: int, device: torch.device) -> torch.Tensor:
+    key = (N, str(device))
+    ws = _WORKSPACE_CACHE.get(key)
+    if ws is None:
+        # 16 ints per 128-wide N-tile is the upstream marlin convention.
+        ws = torch.zeros(N // 128 * 16, device=device, dtype=torch.int32)
+        _WORKSPACE_CACHE[key] = ws
+    return ws
+
+
+def clear_workspace_cache() -> None:
+    """For tests that want to verify allocation behavior."""
+    _WORKSPACE_CACHE.clear()
 
 
 def dequantized_for_marlin(
@@ -75,18 +104,23 @@ def marlin_matmul(
     B: torch.Tensor,  # marlin-packed weight from to_marlin_layout
     s: torch.Tensor,  # marlin scales from to_marlin_layout
     group_size: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Thin wrapper around ``marlin.mul``. Returns [M, N] fp16."""
+    """Thin wrapper around ``marlin.mul``. Returns [M, N] fp16.
+
+    `out` may be passed to skip the per-call output allocation — important
+    inside a CUDA-graph capture region (rvLLM §5.2 lesson: any allocation
+    inside capture binds to a stale device offset on replay).
+    """
     try:
         import marlin  # type: ignore
     except ImportError as e:
         raise ImportError("marlin not installed.") from e
 
-    M, K = a.shape
+    M, _K = a.shape
     N = s.shape[1]
-    C = torch.empty(M, N, device=a.device, dtype=torch.float16)
-    # marlin requires a small int32 workspace buffer; size is per-N-tile.
-    # 16 ints per 128-wide N-tile is the upstream convention.
-    workspace = torch.zeros(N // 128 * 16, device=a.device, dtype=torch.int32)
-    marlin.mul(a, B, C, s, workspace)
-    return C
+    if out is None:
+        out = torch.empty(M, N, device=a.device, dtype=torch.float16)
+    workspace = _get_workspace(N, a.device)
+    marlin.mul(a, B, out, s, workspace)
+    return out

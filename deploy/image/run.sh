@@ -69,6 +69,33 @@ RUN_DIR="$(ls -td docs/profiling/marlin/*/ | head -1)"
 RUN_TS="$(basename "${RUN_DIR%/}")"
 echo "run dir: ${RUN_DIR}"
 
+# rvLLM lesson §5.1: no silent fallbacks. If an impl was REQUESTED but didn't
+# run (import failure, correctness failure, etc.), fail the autoresearch run
+# loudly here — don't open a draft PR with a misleading "marlin not measured"
+# row that someone has to notice. The L0 correctness gate in run_bench.py
+# turns numerically-wrong kernels into error= rows, which we surface here.
+python - "${RUN_DIR}" "${IMPLS}" <<'PY' || { echo "FATAL: requested impl did not run successfully — see errors above"; exit 1; }
+import csv, sys
+from pathlib import Path
+run_dir, impls_csv = sys.argv[1], sys.argv[2]
+requested = {s.strip() for s in impls_csv.split(",") if s.strip()}
+rows = list(csv.DictReader((Path(run_dir) / "results.csv").open()))
+seen_ok: set[str] = set()
+errs: list[str] = []
+for r in rows:
+    if r.get("error"):
+        errs.append(f"  {r.get('name','?')}/{r['impl']}: {r['error']}")
+    elif r.get("impl") in requested:
+        seen_ok.add(r["impl"])
+missing = requested - seen_ok
+if missing:
+    print(f"impls requested but no successful row: {sorted(missing)}", file=sys.stderr)
+if errs:
+    print("errors:", file=sys.stderr)
+    print("\n".join(errs), file=sys.stderr)
+sys.exit(1 if (missing or errs) else 0)
+PY
+
 echo
 echo "=== roofline plot ==="
 python -m bench.roofline "${RUN_DIR}" --gpu a100-80gb-sxm \

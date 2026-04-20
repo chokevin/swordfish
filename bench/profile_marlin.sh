@@ -64,7 +64,7 @@ import triton; print('triton', triton.__version__)" 2>/dev/null || true
 
 # ---- summary bench + Perfetto trace -----------------------------------------
 echo
-echo "[1/3] bench harness with --profile (Perfetto trace) ..."
+echo "[1/3] bench harness with --profile (Perfetto trace) + --capture (graph timing) ..."
 python -m bench.run_bench \
   --shapes "${SHAPES}" \
   --impls "${IMPLS}" \
@@ -72,7 +72,8 @@ python -m bench.run_bench \
   --iters "${ITERS}" \
   --warmup "${WARMUP}" \
   --out "${OUT}" \
-  --profile
+  --profile \
+  --capture
 
 # ---- per-shape nsys + ncu ---------------------------------------------------
 # Use --shapes-one (single shape per invocation) so ncu doesn't trace 6 shapes

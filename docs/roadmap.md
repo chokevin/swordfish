@@ -20,14 +20,26 @@ Ship an INT4×FP16 decode kernel for A100 that **beats Marlin by 10%+ at batch 4
 - [x] Identify per-shape bottlenecks _(launch / fixed-overhead bound at all voice-decode shapes — surprise finding, **not** HBM-bound as roadmap originally assumed)_
 - [x] Build the benchmark harness with clean CSV output _(`bench/run_bench.py`, `results.csv`)_
 - [x] Naïve reference (PyTorch) for correctness validation _(`swordfish/reference.py`)_
+- [x] **L0 correctness in bench:** every impl's output is `allclose`-checked against `reference_w4a16_matmul` on identical packed weights before timing — kernels with arithmetic bugs flunk loudly with a `max_relerr` field instead of producing misleading "fast but wrong" speed numbers. _(`bench/run_bench.py:bench_shape`)_
+- [x] **L2 perplexity harness:** `bench/eval_ppl.py` swaps every `nn.Linear` in a HF causal LM with a `QuantLinear[impl]` (sharing one packed/scales tensor across impls so quantization is held constant) and computes WikiText-2 PPL. Exits non-zero if swordfish drifts > 0.001 PPL from marlin on the same packed weights — that's a kernel-arithmetic bug masked by averaging. Bands: marlin vs fp16 ≤ 0.15 (the quant tax we accept), swordfish vs marlin ≤ 0.001 (we accept ~0).
 - **Exit:** ✓ `bench/run_bench.py` produces a per-shape comparison table; we know *why* Marlin appears slow at our shapes — its **GPU kernel is fast** (17.5 µs vs cuBLAS 23 µs at 8b shapes) but our `swordfish/marlin_compat.py` wrapper adds ~30 µs of host-side overhead per call vs cuBLAS's ~8 µs. **Wall-clock loss is in the wrapper, not the kernel.** Swordfish's W2+ attack is **integration-overhead reduction first** (pre-allocated workspace, CUDA Graph capture), kernel rewriting second.
 
-### Week 2 — Triton baseline
+### Week 2 — Wrapper overhead, then Triton baseline
+**Reordered after W1 finding + rvLLM lessons** (`docs/lessons-rvllm.md`): the
+wrapper, not the kernel, is the W2 attack surface. Graph capture alone moved
+rvLLM's stack 27× before any kernel work; we expect it to flip Marlin from
+x0.62 to x>1 vs fp16 at 8b shapes WITHOUT touching CUDA.
+
+- [x] Workspace cache in `marlin_compat.py` (eliminates per-call int32 alloc) _(done this commit)_
+- [x] L0 correctness gate (`allclose AND cosine ≥ 0.999`) so wrong kernels don't ship speed numbers _(done this commit)_
+- [x] `--capture` flag in `bench/run_bench.py` — measures wrapper overhead per impl as `eager_ms - captured_ms`, so we can see the win before writing it _(done this commit)_
+- [ ] **Captured marlin entry point** — `marlin_matmul_captured(a, B, s, *, out)` that records into a CUDA graph at first call, replays thereafter. Pre-allocated `out` required (rvLLM §5.2).
+- [ ] Eliminate per-call dtype/contiguity asserts in `marlin_matmul` (~5 µs win, free).
 - [ ] Write a clean Triton INT4×FP16 decode kernel
 - [ ] Packing utility compatible with Marlin's layout (for apples-to-apples)
-- [ ] Correctness passes for all voice-decode shapes
+- [ ] Correctness passes for all voice-decode shapes (auto via L0 gate)
 - [ ] Match Marlin within 30% at batch=1 (don't optimize yet)
-- **Exit:** Triton kernel is correct and in the benchmark table.
+- **Exit:** Triton kernel is correct and in the benchmark table; captured-marlin row is in the bench output; we have a measured `wrapper_overhead_pct` per shape.
 
 ### Week 3 — Triton tuning for batch 1–4
 - [ ] Tile size sweep, num_warps, num_stages
