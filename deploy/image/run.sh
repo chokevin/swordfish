@@ -37,10 +37,26 @@ echo "source SHA: ${SOURCE_SHA}"
 pip install --no-cache-dir --no-deps -e .
 pip install --no-cache-dir tabulate matplotlib pandas
 
-# Sanity: confirm we did NOT replace torch.
-python -c "import torch; print(f'torch={torch.__version__} cuda={torch.version.cuda} '
-  f'device_count={torch.cuda.device_count()} '
-  f'sm={torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None}')"
+# Sanity: confirm we did NOT replace torch + that Marlin's .so is ABI-compatible
+# with the running torch. If torch was upgraded during image build (or anyone
+# pip-installed something with a torch dependency in this layer), Marlin will
+# crash later with "Cannot access data pointer of Tensor that doesn't have
+# storage". Catch that here, before we waste an A100 reservation on profiling.
+python -c "
+import torch
+print(f'torch={torch.__version__} cuda={torch.version.cuda} '
+      f'device_count={torch.cuda.device_count()} '
+      f'sm={torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None}')
+assert torch.version.cuda and torch.version.cuda.startswith('12.'), \
+    f'Expected NGC torch with CUDA 12.x, got {torch.version.cuda}. ' \
+    f'Image was poisoned by a pip install that pulled torch from PyPI.'
+import marlin  # noqa: F401
+# Smoke: allocate a dummy and call marlin's data_ptr-using path indirectly
+# via a workspace tensor, which is what crashes when ABI is broken.
+ws = torch.zeros(16, device='cuda', dtype=torch.int32)
+assert ws.data_ptr() != 0
+print('marlin ABI smoke: OK')
+"
 python -c "import marlin; print('marlin import OK')"
 
 echo

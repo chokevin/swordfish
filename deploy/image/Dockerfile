@@ -27,12 +27,27 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 # Bake Marlin into the image at the pinned SHA so cold-start doesn't pay the
 # build cost every run. Build flag matches docs/profiling/RUN_ME_ON_A100.md.
+#
+# CRITICAL: --no-deps. Without this, pip pulls torch from PyPI (latest cu130
+# build) which replaces the NGC pre-built torch. The Marlin C++ extension then
+# gets compiled against the *new* torch's headers and at runtime crashes with
+# "Cannot access data pointer of Tensor that doesn't have storage" because the
+# resolved torch differs from the one Marlin's .so was linked against. Caught
+# in iter-3 of the cluster smoke test (sf-prof-260420-001232).
+#
+# We then assert torch is still the NGC-shipped version (2.4.x + CUDA 12.4) so
+# any future regression of this fails the BUILD, not the run.
 ARG MARLIN_SHA=1f25790bdd49fba53106164a24666dade68d7c90
 ENV MARLIN_SHA=${MARLIN_SHA}
-RUN TORCH_CUDA_ARCH_LIST="8.0" \
-    pip install --no-cache-dir \
+RUN TORCH_VERSION_BEFORE="$(python -c 'import torch; print(torch.__version__)')" \
+ && TORCH_CUDA_ARCH_LIST="8.0" \
+    pip install --no-cache-dir --no-deps \
       "git+https://github.com/IST-DASLab/marlin.git@${MARLIN_SHA}" \
- && python -c "import marlin; print('marlin OK at', '${MARLIN_SHA}')"
+ && TORCH_VERSION_AFTER="$(python -c 'import torch; print(torch.__version__)')" \
+ && echo "torch before: ${TORCH_VERSION_BEFORE}  after: ${TORCH_VERSION_AFTER}" \
+ && [ "${TORCH_VERSION_BEFORE}" = "${TORCH_VERSION_AFTER}" ] \
+        || { echo "FATAL: marlin install replaced torch (${TORCH_VERSION_BEFORE} -> ${TORCH_VERSION_AFTER}). Add the offending dep to a dedicated --no-deps install."; exit 1; } \
+ && python -c "import torch, marlin; print(f'marlin OK at ${MARLIN_SHA}; torch={torch.__version__} cuda={torch.version.cuda}')"
 
 WORKDIR /work
 COPY bootstrap.sh /usr/local/bin/swordfish-autoresearch
