@@ -20,7 +20,7 @@ Ship an INT4×FP16 decode kernel for A100 that **beats Marlin by 10%+ at batch 4
 - [x] Identify per-shape bottlenecks _(launch / fixed-overhead bound at all voice-decode shapes — surprise finding, **not** HBM-bound as roadmap originally assumed)_
 - [x] Build the benchmark harness with clean CSV output _(`bench/run_bench.py`, `results.csv`)_
 - [x] Naïve reference (PyTorch) for correctness validation _(`swordfish/reference.py`)_
-- **Exit:** ✓ `bench/run_bench.py` produces a per-shape comparison table; we know *why* Marlin is slow at our sweet spot — it has a fixed ~49 µs per-call floor that exceeds the work itself. Swordfish's W2+ attack surface is **launch-overhead reduction** (persistent kernel, pre-baked workspace, CUDA Graph capture), not in-loop throughput.
+- **Exit:** ✓ `bench/run_bench.py` produces a per-shape comparison table; we know *why* Marlin appears slow at our shapes — its **GPU kernel is fast** (17.5 µs vs cuBLAS 23 µs at 8b shapes) but our `swordfish/marlin_compat.py` wrapper adds ~30 µs of host-side overhead per call vs cuBLAS's ~8 µs. **Wall-clock loss is in the wrapper, not the kernel.** Swordfish's W2+ attack is **integration-overhead reduction first** (pre-allocated workspace, CUDA Graph capture), kernel rewriting second.
 
 ### Week 2 — Triton baseline
 - [ ] Write a clean Triton INT4×FP16 decode kernel
