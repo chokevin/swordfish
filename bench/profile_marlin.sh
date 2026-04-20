@@ -103,12 +103,16 @@ echo
 echo "[2/3] nsys per-shape timelines ..."
 for SH in ${SHAPE_NAMES}; do
   echo "  nsys ${SH}"
+  # nsys 2024.2 (NGC 24.05) is strict about flag parsing; --sample=none was
+  # ambiguous-matching against several `sampl*` options in iter-4. Drop the
+  # noise-reduction flags — defaults add a small CPU sampling overhead but
+  # don't pollute the GPU timeline, which is what we actually analyze.
   nsys profile \
     --trace=cuda,nvtx,osrt,cudnn \
-    --sample=none --cpuctxsw=none \
     --output="${OUT}/${SH}" \
     --force-overwrite=true \
-    -- python "${OUT}/_run_one.py" "${SH}" "${IMPLS}" >/dev/null
+    -- python "${OUT}/_run_one.py" "${SH}" "${IMPLS}" >/dev/null \
+    || { echo "WARN: nsys profile failed for ${SH}; continuing"; }
   # Export to SQLite (Perfetto's trace_processor can ingest this for unified view)
   nsys export --type=sqlite --output="${OUT}/${SH}.sqlite" --force-overwrite=true \
     "${OUT}/${SH}.nsys-rep" >/dev/null 2>&1 || true
