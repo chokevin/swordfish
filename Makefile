@@ -115,14 +115,16 @@ RUNE_RESULT_DIR ?= /data-nfs/swordfish/week1
         rune-submit-gemm-matrix rune-submit-liger-rmsnorm-a100 rune-submit-liger-swiglu-a100
 
 rune-install-profiles:
-	mkdir -p $(RUNE_PROFILES_DIR)
+	mkdir -p $(RUNE_PROFILES_DIR) $(RUNE_PROFILES_DIR)/airun-core
 	for f in infra/rune/profiles/*.yaml; do \
 		ln -sf $(PWD)/$$f $(RUNE_PROFILES_DIR)/$$(basename $$f); \
 	done
+	for f in infra/rune/profiles/airun-core/*.yaml; do \
+		ln -sf $(PWD)/$$f $(RUNE_PROFILES_DIR)/airun-core/$$(basename $$f); \
+	done
 	@echo "rune profiles installed under $(RUNE_PROFILES_DIR)/"
 	@echo "verify with: rune profile list"
-	@echo "if 'no profiles found', the YAMLs are failing schema validation;"
-	@echo "see infra/rune/README.md and the rune-profile-schema-validation todo"
+	@echo "expected: 3 swordfish-bench-* profiles + 8 airun-core (sandbox/serve/train)"
 
 rune-submit-gemm-a100:
 	rune submit $(RUNE_NAME_PREFIX)-$(RUNE_RUN_ID)-a100 \

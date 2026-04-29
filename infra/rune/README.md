@@ -26,8 +26,10 @@ mirror that JSON so dispatching via either path lands on the same pod shape.
 | --- | --- |
 | `infra/rune/image/Dockerfile` + `build.sh` | **Working source.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI (`.github/workflows/build-swordfish-image.yml`) is the canonical builder; pushes to `ghcr.io/chokevin/swordfish-bench`. Local `build.sh` defaults to podman, supports `CONTAINER_CMD=docker` override. |
 | `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint that runs `python -m swordfish.runner` with optional NCU wrap. Has on-the-fly `pip install liger-kernel` self-heal so it works whether or not the image baked it (`SWORDFISH_SKIP_LIGER_INSTALL=1` to disable). |
-| `Makefile` targets `rune-submit-*` | **Working invocation shape** (verified via `make -n`). Will succeed once the rune profile YAMLs validate. |
-| `infra/rune/profiles/*.yaml` | **DRAFT.** Built from rune binary strings + the cluster routing JSON. `rune profile list` currently rejects them silently. The canonical schema lives in private `applications/airun-zero/profiles/`; **diff one canonical profile against these drafts and fix the YAML before first dispatch.** Tracked as `rune-profile-schema-validation`. |
+| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles (`swordfish-bench-{a100,h100,h200}`) extending `ai-train-gpu-l`, routing to `kernel-mode-training` LocalQueue, image=`ghcr.io/chokevin/swordfish-bench:latest`, persistence on `training-nfs` PVC. `rune profile list` finds them, `rune profile show` resolves the extends chain cleanly, `rune submit --dry-run=client` produces a valid Kueue Job. |
+| `make rune-install-profiles` | **Working.** Symlinks `infra/rune/profiles/` into `~/.config/rune/profiles/`, plus copies the airun core profiles (`ai-train-gpu-l`, etc.) so `extends:` resolves locally. |
+| `Makefile` targets `rune-submit-*` | **Working invocation shape** (verified via `make -n`). |
+| GPU + PVC translation in V0 rune | **Known V0 gap.** The current rune binary renders `apiVersion: airun.aks.io/v1alpha1` Profiles but does **not** translate `spec.resources.persistence` to volumeMounts or `spec.resources.gpu`/`spec.resources.dra` to a DRA ResourceClaim. The job lands on Kueue with the right queue, image, and scheduling but currently no GPU. **Plan B (`make airun-render` + `make airun-apply`) is the path that produces a complete cluster-ready manifest today.** Tracked as `rune-v0-gpu-pvc-translation`. |
 
 ## Image: `ghcr.io/chokevin/swordfish-bench`
 
@@ -69,40 +71,20 @@ uses; pass `CONTAINER_CMD=docker` if you prefer.
 
 ## Profiles
 
-| Profile | Arch | Queue | Notes |
+`infra/rune/profiles/swordfish-pack.yaml` defines three profiles, all of
+which extend the airun-core `ai-train-gpu-l`:
+
+| Profile | Arch (intended) | Queue | Notes |
 | --- | --- | --- | --- |
-| `swordfish-bench-base.yaml` | (shared base) | `kernel-mode-training` | image, namespace, PVC, env, common resources |
-| `swordfish-bench-a100.yaml` | A100 SXM4-80GB | inherits | adds `SYS_ADMIN` cap for NCU; preflight required to pause DCGM exporter on target nodes |
-| `swordfish-bench-h100.yaml` | H100 NVL | inherits | NCU works without extra caps |
-| `swordfish-bench-h200.yaml` | H200 | inherits | capacity-gated; preflight before submit |
+| `swordfish-bench-a100` | A100 SXM4-80GB | `kernel-mode-training` | NCU on A100 needs SYS_ADMIN — fall back to `make airun-apply` for that case |
+| `swordfish-bench-h100` | H100 NVL | `kernel-mode-training` | NCU works without extra caps |
+| `swordfish-bench-h200` | H200 | `kernel-mode-training` | NCU works without extra caps |
 
-## Dispatching
-
-From the swordfish repo root, once the profile YAMLs validate:
-
-```bash
-make rune-submit-gemm-a100      # one fp16 4096^3 GEMM job on A100
-make rune-submit-gemm-h100      # same on H100 NVL
-make rune-submit-gemm-h200      # same on H200 (preflight gated)
-make rune-submit-gemm-matrix    # all three, named with a shared run-id
-
-make rune-submit-liger-rmsnorm-a100   # Liger RMSNorm sweep on A100
-make rune-submit-liger-swiglu-a100    # Liger SwiGLU sweep on A100
-```
-
-Or directly with rune:
-
-```bash
-rune submit swordfish-gemm-$(date +%H%M%S)-a100 \
-    --profile swordfish-bench-a100 \
-    --script infra/rune/scripts/swordfish-bench.sh \
-    -- run-gemm --backend torch \
-       --m 4096 --n 4096 --k 4096 --dtype fp16 \
-       --device auto --arch-label a100 \
-       --out /data-nfs/swordfish/week1/torch-gemm-a100.json
-```
-
-The script forwards everything after `--` to `python -m swordfish.runner`.
+Today the three profiles are functionally identical at the rune resolver
+level — Kueue routes to whichever ResourceFlavor in
+`team-kernel-mode-reserved-cq` has capacity. Per-arch routing via
+`spec.resources.dra.claimTemplate` is the next iteration once the V1
+rune webhook lands; until then, treat the arch suffix as a label hint.
 
 ## Installing the profiles into rune's search path
 
@@ -116,11 +98,14 @@ To make these profiles discoverable on a workstation:
 
 ```bash
 make rune-install-profiles      # symlinks infra/rune/profiles -> ~/.config/rune/profiles/
+                                # also copies the airun-core profiles so extends: resolves
 ```
 
-After install, `rune profile list` should show `swordfish-bench-{base,a100,h100,h200}`.
-If it still says "no profiles found" the YAMLs are failing schema validation —
-see the `rune-profile-schema-validation` todo.
+After install, `rune profile list` should show three swordfish-bench
+profiles plus the eight airun-core profiles they inherit from. If it
+still says "no profiles found" the YAMLs are failing schema validation —
+re-check `apiVersion: airun.aks.io/v1alpha1` and `kind: Profile` at the
+top of each doc.
 
 ## Plan B: dispatch via the airun render path (no rune profile required)
 

@@ -1,0 +1,102 @@
+# swordfish-pack — kernel-mode benchmark profiles
+#
+# Tenant overlay on top of airun core (see applications/airun-zero/profiles/core/).
+# Routes through the user-owned kernel-mode-training LocalQueue
+# (team-kernel-mode-reserved-cq) on voice-agent-flex.
+#
+# Inheritance: V1 webhook resolves spec.extends; V0 the rune CLI merges
+# client-side before rendering the Job.
+#
+# All three swordfish-bench-* profiles use the same image
+# (ghcr.io/chokevin/swordfish-bench:latest, baked with liger-kernel) and the
+# same kernel-mode-training queue. They differ only in gpu.size and the
+# memoryGiBMin floor that the airun capability resolver uses to pick a per-
+# cluster DRA claim template.
+#
+# A100 + Nsight Compute caveat: the canonical airun core profiles do not
+# expose container SYS_ADMIN through the Profile spec, which Nsight Compute
+# requires on A100 to read GPU performance counters. For A100 NCU runs,
+# fall back to `make airun-apply` (which renders a raw Kueue Job and adds
+# the cap explicitly via airun-gemm.voice-agent-flex.json). H100 NVL and
+# H200 NCU work with no extra privileges and run fine through rune.
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-bench-a100
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: train
+    swordfish.dev/arch: a100
+spec:
+  extends: ai-train-gpu-l
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  resources:
+    gpu:
+      size: l
+      memoryGiBMin: 60
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data-nfs
+  runtime:
+    image: ghcr.io/chokevin/swordfish-bench:latest
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-bench-h100
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: train
+    swordfish.dev/arch: h100
+spec:
+  extends: ai-train-gpu-l
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  resources:
+    gpu:
+      size: l
+      memoryGiBMin: 80
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data-nfs
+  runtime:
+    image: ghcr.io/chokevin/swordfish-bench:latest
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-bench-h200
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: train
+    swordfish.dev/arch: h200
+spec:
+  extends: ai-train-gpu-l
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  resources:
+    gpu:
+      size: l
+      memoryGiBMin: 120
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data-nfs
+  runtime:
+    image: ghcr.io/chokevin/swordfish-bench:latest
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench

@@ -1,0 +1,78 @@
+# ai-serve-gpu-l — serve lane, size L (full GPU), mission-critical
+# Catalog: airun core. No tenant semantics. Any team may use.
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: ai-serve-gpu-l
+  labels:
+    airun.aks.io/catalog: core
+    airun.aks.io/lane: serve
+    airun.aks.io/size: l
+spec:
+  lane: serve
+  queue:
+    clusterQueue: serving-cq
+    localQueue: serving-queue
+  scheduling:
+    nodeSelector: { airun.aks.io/lane: serve }
+    tolerations:
+      - { key: airun.aks.io/lane, operator: Equal, value: serve, effect: NoSchedule }
+    priorityClassName: airun-serve-critical
+  resources:
+    # V0: concrete claimTemplate. V1: capability resolver picks per-cluster.
+    gpu:
+      size: l                 # abstract — operator resolves to cluster-local claim
+      memoryGiBMin: 60        # portable capability floor
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests: { cpu: "4", memory: 16Gi }
+  runtime:
+    imagePullPolicy: IfNotPresent
+  policy:
+    preemptable: false
+    maxAdmissionLatencySeconds: 30
+---
+# ai-serve-gpu-m — serve lane, size M (MIG slice), mission-critical
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: ai-serve-gpu-m
+  labels: { airun.aks.io/catalog: core, airun.aks.io/lane: serve, airun.aks.io/size: m }
+spec:
+  lane: serve
+  queue: { clusterQueue: serving-cq, localQueue: serving-queue }
+  scheduling:
+    nodeSelector: { airun.aks.io/lane: serve }
+    tolerations:
+      - { key: airun.aks.io/lane, operator: Equal, value: serve, effect: NoSchedule }
+    priorityClassName: airun-serve-critical
+  resources:
+    gpu: { size: m, memoryGiBMin: 20 }
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: mig-3g40gb
+    requests: { cpu: "2", memory: 8Gi }
+  runtime: { imagePullPolicy: IfNotPresent }
+  policy:
+    preemptable: false
+    maxAdmissionLatencySeconds: 30
+---
+# ai-serve-cpu-m — serve lane, CPU-only (gateways, supervisors, lightweight APIs)
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: ai-serve-cpu-m
+  labels: { airun.aks.io/catalog: core, airun.aks.io/lane: serve, airun.aks.io/size: cpu-m }
+spec:
+  lane: serve
+  queue: { clusterQueue: serving-cq, localQueue: serving-queue }
+  scheduling:
+    nodeSelector: { airun.aks.io/lane: cpu }
+    priorityClassName: airun-serve-critical
+  resources:
+    requests: { cpu: "2", memory: 4Gi }
+  runtime: { imagePullPolicy: IfNotPresent }
+  policy:
+    preemptable: false
+    maxAdmissionLatencySeconds: 30
