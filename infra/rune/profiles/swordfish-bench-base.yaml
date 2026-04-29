@@ -20,7 +20,7 @@ metadata:
   name: swordfish-bench-base
   description: |
     Shared swordfish benchmark profile for voice-agent-flex (ray namespace,
-    fauna-train-queue, full-gpu DRA, training-nfs PVC mounted at /data-nfs).
+    kernel-mode-training, full-gpu DRA, training-nfs PVC mounted at /data-nfs).
     Per-arch profiles extend this file.
 
 spec:
@@ -28,7 +28,7 @@ spec:
   namespace: ray
 
   kueue:
-    queue: fauna-train-queue
+    queue: kernel-mode-training
 
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest

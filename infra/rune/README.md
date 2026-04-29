@@ -71,7 +71,7 @@ uses; pass `CONTAINER_CMD=docker` if you prefer.
 
 | Profile | Arch | Queue | Notes |
 | --- | --- | --- | --- |
-| `swordfish-bench-base.yaml` | (shared base) | `fauna-train-queue` | image, namespace, PVC, env, common resources |
+| `swordfish-bench-base.yaml` | (shared base) | `kernel-mode-training` | image, namespace, PVC, env, common resources |
 | `swordfish-bench-a100.yaml` | A100 SXM4-80GB | inherits | adds `SYS_ADMIN` cap for NCU; preflight required to pause DCGM exporter on target nodes |
 | `swordfish-bench-h100.yaml` | H100 NVL | inherits | NCU works without extra caps |
 | `swordfish-bench-h200.yaml` | H200 | inherits | capacity-gated; preflight before submit |

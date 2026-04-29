@@ -8,7 +8,7 @@ extends: swordfish-bench-base
 
 metadata:
   name: swordfish-bench-h100
-  description: H100 NVL swordfish benchmark on voice-agent-flex (ray/fauna-train-queue).
+  description: H100 NVL swordfish benchmark on voice-agent-flex (ray/kernel-mode-training).
 
 spec:
   scheduling:

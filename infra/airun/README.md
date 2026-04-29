@@ -51,7 +51,7 @@ The discovered `voice-agent-flex` routing is captured in
 
 - context: `voice-agent-flex`
 - namespace: `ray`
-- queue: `fauna-train-queue`
+- queue: `kernel-mode-training`
 - output PVC: `training-nfs`, mounted at `/data-nfs`
 - A100 selector: `agentpool=gpu`, `nvidia.com/mig.config=all-disabled`
 - H100 selector: `gpu=h100`

@@ -13,7 +13,7 @@ extends: swordfish-bench-base
 
 metadata:
   name: swordfish-bench-a100
-  description: A100 SXM4-80GB swordfish benchmark on voice-agent-flex (ray/fauna-train-queue).
+  description: A100 SXM4-80GB swordfish benchmark on voice-agent-flex (ray/kernel-mode-training).
 
 spec:
   scheduling:

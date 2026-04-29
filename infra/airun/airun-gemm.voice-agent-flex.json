@@ -32,7 +32,7 @@
   },
   "archs": {
     "a100": {
-      "queue": "fauna-train-queue",
+      "queue": "kernel-mode-training",
       "resource_claim_template": "full-gpu",
       "node_selector": {
         "agentpool": "gpu",
@@ -53,7 +53,7 @@
       ]
     },
     "h100": {
-      "queue": "fauna-train-queue",
+      "queue": "kernel-mode-training",
       "resource_claim_template": "full-gpu",
       "node_selector": {
         "gpu": "h100"
@@ -68,7 +68,7 @@
       ]
     },
     "h200": {
-      "queue": "fauna-train-queue",
+      "queue": "kernel-mode-training",
       "resource_claim_template": "full-gpu",
       "node_selector": {
         "gpu": "h200"
