@@ -24,12 +24,55 @@ mirror that JSON so dispatching via either path lands on the same pod shape.
 
 | What | Status |
 | --- | --- |
-| `infra/rune/image/Dockerfile` + `build.sh` | **Working source.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI (`.github/workflows/build-swordfish-image.yml`) is the canonical builder; pushes to `ghcr.io/chokevin/swordfish-bench`. Local `build.sh` defaults to podman, supports `CONTAINER_CMD=docker` override. |
-| `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint that runs `python -m swordfish.runner` with optional NCU wrap. Has on-the-fly `pip install liger-kernel` self-heal so it works whether or not the image baked it (`SWORDFISH_SKIP_LIGER_INSTALL=1` to disable). |
-| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles (`swordfish-bench-{a100,h100,h200}`) extending `ai-train-gpu-l`, routing to `kernel-mode-training` LocalQueue, image=`ghcr.io/chokevin/swordfish-bench:latest`, persistence on `training-nfs` PVC. `rune profile list` finds them, `rune profile show` resolves the extends chain cleanly, `rune submit --dry-run=client` produces a valid Kueue Job. |
-| `make rune-install-profiles` | **Working.** Symlinks `infra/rune/profiles/` into `~/.config/rune/profiles/`, plus copies the airun core profiles (`ai-train-gpu-l`, etc.) so `extends:` resolves locally. |
-| `Makefile` targets `rune-submit-*` | **Working invocation shape** (verified via `make -n`). |
-| GPU + PVC translation in V0 rune | **Known V0 gap.** The current rune binary renders `apiVersion: airun.aks.io/v1alpha1` Profiles but does **not** translate `spec.resources.persistence` to volumeMounts or `spec.resources.gpu`/`spec.resources.dra` to a DRA ResourceClaim. The job lands on Kueue with the right queue, image, and scheduling but currently no GPU. **Plan B (`make airun-render` + `make airun-apply`) is the path that produces a complete cluster-ready manifest today.** Tracked as `rune-v0-gpu-pvc-translation`. |
+| `infra/rune/image/Dockerfile` + `build.sh` | **Working.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI publishes to `ghcr.io/chokevin/swordfish-bench`. |
+| `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint, on-the-fly liger install self-heal. |
+| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles extending `ai-train-gpu-l`, queue=`kernel-mode-training`, image=`swordfish-bench:latest`. `rune profile show` resolves cleanly with parent's GPU/DRA/scheduling preserved (after re-declaring the parent's `resources.gpu/dra/requests` in each child to work around V0 rune's lack of deep-merge — see "PVC and merge gotchas" below). |
+| `make rune-install-profiles` | **Working.** Symlinks profiles + airun-core into `~/.config/rune/profiles/`. |
+| `Makefile` targets `rune-submit-*` | **Working invocation.** |
+| `rune submit --dry-run=client` GPU + DRA | **Working** for our profiles (DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct). |
+| `rune submit` PVC mount (`spec.resources.persistence`) | **NOT YET — V0 limitation.** The persistence array is a schema-valid hint but V0 rune `submit` does not translate it to volumeMounts/volumes. The `--volume` flag is in the binary but not yet exposed on `submit` (only `--pvc` on `shell`). For full PVC-mounted runs today, use Plan B (`make airun-render` + `make airun-apply`) which renders volumes explicitly from `infra/airun/airun-gemm.voice-agent-flex.json`. |
+
+## PVC and merge gotchas (V0 rune)
+
+Two V0 quirks that bit our first profile drafts; documenting so the next
+time we touch the profile we don't repeat them:
+
+### `spec.resources` is replaced wholesale, not deep-merged
+
+If a child profile sets *any* field under `spec.resources` (e.g.
+`persistence`), V0 rune's resolver replaces the entire `resources`
+block, dropping the parent's `gpu`/`dra`/`requests` blocks. Workaround:
+re-declare the parent's whole `resources` body in the child, then append
+the override.
+
+Our pack does this by repeating `gpu.size: l`, `gpu.memoryGiBMin: 60`,
+`dra.{deviceClass, claimTemplate: full-gpu}`, and
+`requests.{cpu: "16", memory: 64Gi}` from `ai-train-gpu-l` before
+adding `persistence`. The redundancy is intentional — it survives V0's
+shallow merge. V1 webhook resolution is documented to deep-merge, at
+which point the duplicates can be removed.
+
+### `spec.resources.persistence` is not honored by `rune submit` on V0
+
+V0 `rune submit` recognizes `spec.resources.gpu`, `spec.resources.dra`,
+and `spec.resources.requests` but **silently ignores
+`spec.resources.persistence`**. The rendered Job has no volumeMounts and
+no PVC volume. The binary contains a `--volume name=pvc:claimName` flag
+internally, but it is not exposed on `submit` (only `--pvc` on `shell`,
+which mounts the named PVC at `/workspace`).
+
+Hardcoded default in the rune binary for finetune workflows: `blob-training`
+PVC, expected to be pre-provisioned in the target namespace.
+
+For swordfish today, this means:
+- `rune submit` produces a Job that admits to Kueue but cannot read or
+  write `/data-nfs` at runtime. The benchmarks that need the PVC will
+  fail.
+- Plan B (`make airun-render` + `make airun-apply`) renders explicit
+  volumes/volumeMounts from `infra/airun/airun-gemm.voice-agent-flex.json`
+  and is the dispatch path to use until V1 rune lands.
+- `/data-nfs` mount expectations in `infra/rune/scripts/swordfish-bench.sh`
+  are honest but currently only met under Plan B.
 
 ## Image: `ghcr.io/chokevin/swordfish-bench`
 

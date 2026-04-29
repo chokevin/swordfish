@@ -36,9 +36,18 @@ spec:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
   resources:
+    # Note: V0 rune does not deep-merge spec.resources from parent; setting any
+    # resources field here replaces the parent's wholesale. Re-declare the
+    # parent's gpu/dra/requests so they survive the override.
     gpu:
       size: l
       memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
     persistence:
       - pvcName: training-nfs
         mountPath: /data-nfs
@@ -63,9 +72,18 @@ spec:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
   resources:
+    # Note: V0 rune does not deep-merge spec.resources from parent; setting any
+    # resources field here replaces the parent's wholesale. Re-declare the
+    # parent's gpu/dra/requests so they survive the override.
     gpu:
       size: l
-      memoryGiBMin: 80
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
     persistence:
       - pvcName: training-nfs
         mountPath: /data-nfs
@@ -90,9 +108,18 @@ spec:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
   resources:
+    # Note: V0 rune does not deep-merge spec.resources from parent; setting any
+    # resources field here replaces the parent's wholesale. Re-declare the
+    # parent's gpu/dra/requests so they survive the override.
     gpu:
       size: l
-      memoryGiBMin: 120
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
     persistence:
       - pvcName: training-nfs
         mountPath: /data-nfs
