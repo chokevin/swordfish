@@ -26,6 +26,9 @@ profiles/
 !docs/profiling/**/*.nsys-rep
 !docs/profiling/**/*.sqlite
 !docs/profiling/**/*.ncu-rep
+# and DO commit rune profile YAMLs (cluster wiring config, not python profiling artifacts)
+!infra/rune/profiles/
+!infra/rune/profiles/*.yaml
 
 # editor
 .vscode/
