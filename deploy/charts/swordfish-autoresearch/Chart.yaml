@@ -1,6 +1,0 @@
-apiVersion: v2
-name: swordfish-autoresearch
-description: One-shot Marlin profiling pod for swordfish — runs nsys+ncu+roofline on an A100, commits the artifacts back to the repo, opens a draft PR.
-type: application
-version: 0.1.0
-appVersion: "0.1.0"

@@ -1,0 +1,180 @@
+{
+  "count": 5,
+  "include_raw": false,
+  "recursive": true,
+  "result_dir": "runs/airun/week1",
+  "results": [
+    {
+      "backend": "torch",
+      "benchmark": "torch_gemm",
+      "dtype": "fp16",
+      "file": "torch-gemm-a100.json",
+      "finite_output": true,
+      "git_dirty": false,
+      "git_sha": null,
+      "gpu_class": "a100",
+      "gpu_name": "NVIDIA A100-SXM4-80GB",
+      "matches_reference": true,
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "mean_ms": 0.6049382476806641,
+      "min_ms": 0.570245132446289,
+      "ncu_complete": true,
+      "p50_ms": 0.6143590545654297,
+      "p95_ms": 0.6158950424194336,
+      "protocol_errors": [],
+      "scope": "gemm",
+      "shape": {
+        "k": 4096,
+        "m": 4096,
+        "n": 4096
+      },
+      "tflops": 227.1950137041947,
+      "tokens_per_second": null
+    },
+    {
+      "backend": "torch",
+      "benchmark": "torch_gemm",
+      "dtype": "fp16",
+      "file": "torch-gemm-h100.json",
+      "finite_output": true,
+      "git_dirty": false,
+      "git_sha": null,
+      "gpu_class": "h100",
+      "gpu_name": "NVIDIA H100 NVL",
+      "matches_reference": true,
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "mean_ms": 0.27789567947387694,
+      "min_ms": 0.2666476821899414,
+      "ncu_complete": true,
+      "p50_ms": 0.27215808868408203,
+      "p95_ms": 0.30511295318603515,
+      "protocol_errors": [],
+      "scope": "gemm",
+      "shape": {
+        "k": 4096,
+        "m": 4096,
+        "n": 4096
+      },
+      "tflops": 494.57031405527727,
+      "tokens_per_second": null
+    },
+    {
+      "backend": "torch",
+      "benchmark": "torch_gemm",
+      "dtype": "fp16",
+      "file": "torch-gemm-h200.json",
+      "finite_output": true,
+      "git_dirty": false,
+      "git_sha": null,
+      "gpu_class": "h200",
+      "gpu_name": "NVIDIA H200",
+      "matches_reference": true,
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "mean_ms": 0.1827612190246582,
+      "min_ms": 0.17708736419677734,
+      "ncu_complete": true,
+      "p50_ms": 0.17929536819458008,
+      "p95_ms": 0.20024000167846678,
+      "protocol_errors": [],
+      "scope": "gemm",
+      "shape": {
+        "k": 4096,
+        "m": 4096,
+        "n": 4096
+      },
+      "tflops": 752.0137707850192,
+      "tokens_per_second": null
+    },
+    {
+      "backend": "triton",
+      "benchmark": "marlin_w4a16_matmul",
+      "dtype": "fp16",
+      "file": "w4a16-triton-a100.json",
+      "finite_output": true,
+      "git_dirty": false,
+      "git_sha": null,
+      "gpu_class": "a100",
+      "gpu_name": "NVIDIA A100-SXM4-80GB",
+      "matches_reference": true,
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "mean_ms": 0.062047998110453285,
+      "min_ms": 0.053388798236846925,
+      "ncu_complete": null,
+      "p50_ms": 0.05864319801330566,
+      "p95_ms": 0.07411199808120728,
+      "protocol_errors": [],
+      "scope": "w4a16_matmul",
+      "shape": {
+        "k": 64,
+        "m": 64,
+        "n": 64
+      },
+      "tflops": 0.008449716605952395,
+      "tokens_per_second": null
+    },
+    {
+      "backend": "triton",
+      "benchmark": "marlin_w4a16_matmul",
+      "dtype": "fp16",
+      "file": "w4a16-triton-h100.json",
+      "finite_output": true,
+      "git_dirty": false,
+      "git_sha": null,
+      "gpu_class": "h100",
+      "gpu_name": "NVIDIA H100 NVL",
+      "matches_reference": true,
+      "max_abs_error": 0.0,
+      "max_rel_error": 0.0,
+      "mean_ms": 0.03232959906260172,
+      "min_ms": 0.02542079985141754,
+      "ncu_complete": null,
+      "p50_ms": 0.029356798529624938,
+      "p95_ms": 0.0422111988067627,
+      "protocol_errors": [],
+      "scope": "w4a16_matmul",
+      "shape": {
+        "k": 64,
+        "m": 64,
+        "n": 64
+      },
+      "tflops": 0.01621696572805589,
+      "tokens_per_second": null
+    }
+  ],
+  "schema_version": "swordfish.result_index.v1",
+  "skipped": [
+    {
+      "file": "results-index.json",
+      "reason": "not a swordfish result"
+    },
+    {
+      "file": "torch-gemm-a100.profile.raw.json",
+      "reason": "raw intermediate result"
+    },
+    {
+      "file": "torch-gemm-a100.raw.json",
+      "reason": "raw intermediate result"
+    },
+    {
+      "file": "torch-gemm-h100.profile.raw.json",
+      "reason": "raw intermediate result"
+    },
+    {
+      "file": "torch-gemm-h100.raw.json",
+      "reason": "raw intermediate result"
+    },
+    {
+      "file": "torch-gemm-h200.profile.raw.json",
+      "reason": "raw intermediate result"
+    },
+    {
+      "file": "torch-gemm-h200.raw.json",
+      "reason": "raw intermediate result"
+    }
+  ],
+  "skipped_count": 7
+}

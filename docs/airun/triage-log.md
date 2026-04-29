@@ -1,0 +1,61 @@
+# airun triage log
+
+## 2026-04-27 — swordfish GEMM jobs Pending after Kueue admission
+- Initial suspicion: L3
+- Actual root cause: L4/L5 split — the cluster exposes GPUs through DRA ResourceClaimTemplates/resourceslices, while the first swordfish Jobs requested legacy `nvidia.com/gpu`; after DRA was fixed, H200 remained blocked by regional Azure capacity.
+- Layers ruled out before finding it: L2, because all three Workloads were `Admitted=True` in `gpu-cluster-queue` with quota reserved.
+- Time to root cause: ~15 min
+- Fix: switch generated Jobs to use the `ray/full-gpu` ResourceClaimTemplate instead of legacy GPU requests; correct A100 toleration to `nvidia.com/gpu=true`.
+- Follow-up: H100 scheduled after the DRA switch and produced final JSON with NCU metrics at `/data-nfs/swordfish/week1/133050dra/torch-gemm-h100.json`. A100 also needed the actual node taint `nvidia.com/gpu=true`; it produced raw/final timing JSON at `/data-nfs/swordfish/week1/133050a100fix/torch-gemm-a100.json`, but NCU returned `ERR_NVGPUCTRPERM` so perf counters were not attached. H200 did not produce a result because repeated `flex-h200-*` NodeClaims failed with Azure `InsufficientCapacityError`; no other accessible context exposed a live H200 GPU node.
+- Cleanup note: the old H200 pod `sf-gemm-133050-h200-8wr7p` became an orphaned failed pod with only the `batch.kubernetes.io/job-tracking` finalizer after its Job and Workload were gone. Normal `kubectl delete --force` and metadata-only JSON patches could not remove it because the API rejected pod updates with `spec.tolerations: Forbidden`, even though the patch body only removed `/metadata/finalizers/0`; this needs cluster-admin/webhook cleanup if it continues to trigger `flex-h200` NodeClaims.
+- Latest recheck: `flex-h200` still reports Ready with 0 nodes, no live H200 node exists, and the orphaned `sf-gemm-133050-h200-8wr7p` pod is still being nominated to fresh `flex-h200-*` NodeClaims that fail with Azure `InsufficientCapacityError`. Do not submit more H200 jobs until the orphan pod is cleaned up or H200 capacity is confirmed.
+- Lesson: On this airun lane, `nvidia.com/gpu` node labels do not imply legacy `nvidia.com/gpu` allocatable; check DRA first, then check actual node taints instead of trusting ResourceFlavor tolerations.
+
+## 2026-04-27 — H200 benchmark blocker recheck
+- Initial suspicion: L5
+- Actual root cause: L5 (node-pool/region) — `flex-h200` is configured and Ready as a NodePool but has 0 nodes, and fresh `flex-h200-*` NodeClaims for `Standard_ND96isr_H200_v5` continue to fail with Azure `InsufficientCapacityError`.
+- Layers ruled out before finding it: L2, because `fauna-train-queue` and `gpu-cluster-queue` both reported 0 pending and 0 admitted workloads; L3/L4 as primary causes for the old stuck pod, because the current orphan requests legacy `nvidia.com/gpu=1` with `gpu=h200` selector/toleration and is being nominated to `flex-h200` rather than rejected for selector/taint mismatch.
+- Time to root cause: ~10 min
+- Fix: handed off to cluster-admin / Azure capacity. No safe in-session fix: `sf-gemm-133050-h200-8wr7p` is Failed with deletion timestamp `2026-04-27T20:51:50Z` and finalizer `batch.kubernetes.io/job-tracking`; a server-side dry-run finalizer patch still fails API validation with `spec.tolerations: Forbidden`.
+- Alternate-route check: no accessible kube context currently exposes a live H200 node. `voice-agent-flex` and `voice-agent-flex-admin` only expose `flex-h200` with 0 nodes; `npd-h200-test` is unreachable from this environment.
+- Cleanup route check: no safe `kubectl` finalizer-removal path is available from this session. JSON patch and merge patch dry-runs fail the same `spec.tolerations` validation in both normal and admin contexts, and the pod `finalize` subresource is not served for this resource.
+- Guard added: `python -m swordfish.runner render-airun-preflight` and `make airun-h200-preflight` now generate/run a fail-fast H200 preflight. In the current cluster state it exits 2 before submission because no `gpu=h200` node exists and `sf-gemm-133050-h200-8wr7p` still exists.
+- Submission guard added: `render-airun-gemm --arch-labels ...` can render/apply a subset of architectures, and Make defaults `AIRUN_ARCH_LABELS` to `a100 h100` so routine dry-run/apply commands do not include H200 while this blocker is active.
+- Latest completion check: fresh A100/H100 jobs were rerun from `/data-nfs/swordfish/src/rerun-161445` after fixing the job script to time GEMM outside NCU and run profiling as a separate pass. The copied local artifacts in `runs/airun/week1/` validate for A100/H100 without the NCU-complete gate: A100 mean `0.615004 ms` / `223.476 TFLOP/s` with `ncu.complete=false` due `ERR_NVGPUCTRPERM`; H100 mean `0.277896 ms` / `494.57 TFLOP/s` with `ncu.complete=true`. The strict gate still fails on A100 incomplete NCU plus missing H200.
+- A100 NCU follow-up: adding `SYS_ADMIN` to the A100 benchmark container changed the error from `ERR_NVGPUCTRPERM` to driver resource contention, likely DCGM/profiler conflict. Filtering NCU to GEMM-like kernels still failed directly on `ampere_fp16_s16816gemm_fp16_2...`, so A100 NCU completion now needs cluster/operator action rather than benchmark-script changes.
+- Lesson: H200 is currently a provider-capacity blocker plus an orphan-pod cleanup blocker; do not spend more benchmark time on H200 submissions until either a live H200 node exists or the stuck finalizer is cleared by a control-plane/admin path.
+
+## 2026-04-27 — strict gate blocked after A100/H100 clean-timing rerun
+- Initial suspicion: L4 for A100 NCU, L5 for H200 missing result
+- Actual root cause: L4 (GPU/driver/profiler) for A100 — Nsight Compute cannot acquire A100 performance counters even with `SYS_ADMIN`, GEMM kernel filtering, and a one-node DCGM exporter pause; L5 (node-pool/region) for H200 — `flex-h200` has 0 nodes and NodeClaims continue failing Azure `InsufficientCapacityError`.
+- Layers ruled out before finding it: A100 L2/L3 because the benchmark landed on `NVIDIA A100-SXM4-80GB` and produced valid timing/correctness JSON; H200 L2 because `fauna-train-queue` and `gpu-cluster-queue` show 0 pending/admitted workloads for the current check.
+- Time to root cause: ~20 min
+- Fix: A100 handed off to cluster/operator configuration for profiler resource/counter access; H200 handed off to Azure capacity plus control-plane cleanup for `sf-gemm-133050-h200-8wr7p`. No safe in-session fix remains.
+- Lesson: `SYS_ADMIN` is not sufficient proof that NCU can profile on airun; DCGM/operator-side profiler resource contention can still block A100 counters after the workload and DRA routing are healthy.
+
+## 2026-04-27 — W4A16 Triton A100/H100 jobs failed after scheduling
+- Initial suspicion: L4
+- Actual root cause: outside the airun ladder (application Triton kernel) — the first failure was a nested `@triton.jit` function whose annotations referenced local `tl`; after that was fixed, the kernel exposed an fp16/fp32 `tl.dot` dtype mismatch and unsigned INT4 nibble underflow.
+- Layers ruled out before finding it: L2, because both Kueue Workloads were admitted in `gpu-cluster-queue`; L3, because both pods were scheduled to the expected A100/H100 nodes; L5 for A100/H100, because live nodes ran the containers immediately.
+- Time to root cause: ~15 min
+- Fix: moved Triton imports/kernel definition to module scope while keeping Triton optional for CPU tests, made the Triton W4A16 path explicitly fp16-only with fp16 dequant tiles, and cast unpacked nibbles to signed int before subtracting 16. Fresh jobs `swordfish-w4a16-165327-{a100,h100}` completed with `matches_reference=true`.
+- Lesson: When identical A100/H100 jobs fail after admission and placement, read container logs before descending into GPU/node-pool triage; compiler/runtime stack traces usually mean application kernel code, not airun scheduling.
+
+## 2026-04-27 — H200 capacity returned, strict gate still blocked
+- Initial suspicion: L5
+- Actual root cause: L5 (node-pool/region) recovered for H200 — `flex-h200` now has two Ready `gpu=h200` nodes, so the H200 missing-result blocker is resolved; the remaining strict blocker is L4 A100 profiler access.
+- Layers ruled out before finding it: H200 L2, because `fauna-train-queue` and `gpu-cluster-queue` had no pending workloads and the new job was admitted; H200 L3, because `swordfish-gemm-180223-h200` scheduled to `flex-h200-zjj8s`; H200 L4, because the job produced passing correctness and `ncu.complete=true`.
+- Time to root cause: ~10 min
+- Fix: adjusted H200 preflight to treat the old `Failed` and deletion-marked `sf-gemm-133050-h200-8wr7p` pod as a warning once live Ready H200 nodes exist, uploaded current source to a fresh NFS path, ran `swordfish-gemm-180223-h200`, copied `torch-gemm-h200.json` into `runs/airun/week1/`, and regenerated the dashboard/completion report.
+- Follow-up: strict `make airun-validate-results` now fails only on A100 incomplete NCU. A fresh privileged A100 retry `swordfish-a100-ncu-181205-a100` still failed with driver resource unavailable and all required NCU metrics missing. A second-node A100 retry on `aks-gpu-33826946-vmss000000` with `SYS_ADMIN`, targeted DCGM exporter deletion, and `--kernel-name regex:.*gemm.*` also failed directly on `ampere_fp16_s16816gemm_fp16_2...`.
+- Lesson: Once live H200 nodes exist, a tombstoned failed pod with a deletion timestamp should not block single-arch H200 benchmarking, but it should remain documented for admin cleanup.
+
+## 2026-04-27 — A100 NCU unblocked by pausing DCGM exporter
+- Initial suspicion: L4
+- Actual root cause: L4 (GPU/profiler resource contention) — `nvidia-dcgm-exporter` was collecting/querying DCGM profiling metric groups on A100 nodes, which prevented Nsight Compute from acquiring the same driver profiling resource.
+- Layers ruled out before finding it: L2/L3, because A100 jobs were admitted, scheduled, and produced passing timing/correctness JSON; container permission alone, because `SYS_ADMIN` changed the error from `ERR_NVGPUCTRPERM` to driver resource unavailable but still failed; single-node exporter staleness, because deleting one A100 exporter pod and retrying still failed before the DaemonSet recreated it.
+- Time to root cause: ~25 min after changing from per-job retries to the GPU-operator/DCGM layer.
+- Fix: temporarily patched the `nvidia-dcgm-exporter` DaemonSet to exclude `gpu=a100` nodes, confirmed no exporter pods were running on the two A100 nodes, ran `swordfish-a100-dcgm-off-182331-a100` with `SYS_ADMIN`, copied the complete A100 NCU artifacts into `runs/airun/week1/`, then removed the temporary DaemonSet affinity patch.
+- Verification: `kubectl --context voice-agent-flex -n gpu-operator rollout status ds/nvidia-dcgm-exporter --timeout=300s` succeeded with 6/6 exporter pods ready, including both A100 nodes. `make airun-validate-results` now reports `GEMM result matrix is complete`.
+- Guardrail: added `make airun-a100-ncu-preflight`, and `make airun-apply` now invokes it automatically when `AIRUN_ARCH_LABELS` includes `a100`. The preflight fails before submission if running `nvidia-dcgm-exporter` pods are still on Ready target A100 nodes or if the A100 arch config lacks `SYS_ADMIN`.
+- Lesson: On this lane, complete A100 NCU requires a controlled profiling window where DCGM exporter is paused/excluded from the target A100 nodes, followed by immediate restore. Do not permanently disable DCGM and do not fake NCU completeness from partial profiler output.

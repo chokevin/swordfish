@@ -1,0 +1,86 @@
+{
+  "kubectl_context": "voice-agent-flex",
+  "namespace": "ray",
+  "image": "nvcr.io/nvidia/pytorch:25.03-py3",
+  "image_pull_policy": "IfNotPresent",
+  "python_command": ["python"],
+  "working_dir": "/data-nfs/swordfish/src/current",
+  "output_dir": "/data-nfs/swordfish/week1",
+  "name_prefix": "swordfish-gemm",
+  "result_prefix": "torch-gemm",
+  "backend": "torch",
+  "profile_ncu": true,
+  "m": 4096,
+  "n": 4096,
+  "k": 4096,
+  "dtype": "fp16",
+  "repeats": 5,
+  "warmup": 10,
+  "iters": 50,
+  "resources": {
+    "cpu_request": "8",
+    "memory_request": "64Gi",
+    "cpu_limit": "16",
+    "memory_limit": "128Gi"
+  },
+  "pvc": {
+    "claim_name": "training-nfs",
+    "mount_path": "/data-nfs"
+  },
+  "env": {
+    "REF": "local-worktree-current"
+  },
+  "archs": {
+    "a100": {
+      "queue": "fauna-train-queue",
+      "resource_claim_template": "full-gpu",
+      "node_selector": {
+        "agentpool": "gpu",
+        "nvidia.com/mig.config": "all-disabled"
+      },
+      "container_security_context": {
+        "capabilities": {
+          "add": ["SYS_ADMIN"]
+        }
+      },
+      "tolerations": [
+        {
+          "key": "nvidia.com/gpu",
+          "operator": "Equal",
+          "value": "true",
+          "effect": "NoSchedule"
+        }
+      ]
+    },
+    "h100": {
+      "queue": "fauna-train-queue",
+      "resource_claim_template": "full-gpu",
+      "node_selector": {
+        "gpu": "h100"
+      },
+      "tolerations": [
+        {
+          "key": "nvidia.com/gpu",
+          "operator": "Equal",
+          "value": "present",
+          "effect": "NoSchedule"
+        }
+      ]
+    },
+    "h200": {
+      "queue": "fauna-train-queue",
+      "resource_claim_template": "full-gpu",
+      "node_selector": {
+        "gpu": "h200"
+      },
+      "tolerations": [
+        {
+          "key": "nvidia.com/gpu",
+          "operator": "Equal",
+          "value": "present",
+          "effect": "NoSchedule"
+        }
+      ]
+    }
+  }
+}

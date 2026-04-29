@@ -1,0 +1,44 @@
+{
+  "namespace": "ray",
+  "image": "ghcr.io/chokevin/swordfish:REPLACE_WITH_COMMIT_SHA",
+  "working_dir": "/workspace/swordfish",
+  "output_dir": "/data-nfs/swordfish/week1",
+  "name_prefix": "swordfish-gemm",
+  "result_prefix": "torch-gemm",
+  "backend": "torch",
+  "profile_ncu": true,
+  "m": 4096,
+  "n": 4096,
+  "k": 4096,
+  "dtype": "fp16",
+  "repeats": 5,
+  "warmup": 10,
+  "iters": 50,
+  "pvc": {
+    "claim_name": "REPLACE_WITH_RESULTS_PVC",
+    "mount_path": "/data-nfs"
+  },
+  "env": {
+    "REF": "REPLACE_WITH_GIT_SHA_OR_BRANCH"
+  },
+  "archs": {
+    "a100": {
+      "queue": "REPLACE_WITH_A100_LOCALQUEUE",
+      "node_selector": {
+        "REPLACE_WITH_GPU_PRODUCT_LABEL": "REPLACE_WITH_A100_VALUE"
+      }
+    },
+    "h100": {
+      "queue": "REPLACE_WITH_H100_LOCALQUEUE",
+      "node_selector": {
+        "REPLACE_WITH_GPU_PRODUCT_LABEL": "REPLACE_WITH_H100_VALUE"
+      }
+    },
+    "h200": {
+      "queue": "REPLACE_WITH_H200_LOCALQUEUE",
+      "node_selector": {
+        "REPLACE_WITH_GPU_PRODUCT_LABEL": "REPLACE_WITH_H200_VALUE"
+      }
+    }
+  }
+}

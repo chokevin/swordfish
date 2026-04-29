@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Swordfish Kernel Roadmap</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="background-grid" aria-hidden="true"></div>
+    <main class="shell">
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Swordfish mission control</p>
+          <h1>35 weeks to become a Microsoft-visible LLM kernel shipper.</h1>
+          <p class="hero-text">
+            A workweek checklist for shipping quantized inference kernels, public
+            cross-architecture benchmark evidence, and vLLM plus ONNX Runtime PRs.
+          </p>
+          <div class="hero-actions">
+            <a class="button primary" href="#roadmap">Open roadmap</a>
+            <a class="button secondary" href="#benchmarks">Open results</a>
+            <a class="button secondary" href="#week-1">Start week 1</a>
+          </div>
+        </div>
+        <aside class="mission-card">
+          <div class="mission-card__ring" id="overall-ring">0%</div>
+          <div>
+            <p class="eyebrow">Primary lane</p>
+            <h2>FP8 / FP4 / INT4 quant kernels</h2>
+            <p>
+              Use the A100, H100, and H200 cluster as the moat: publish SOL
+              numbers most contributors cannot reproduce.
+            </p>
+          </div>
+        </aside>
+      </section>
+
+      <section class="stats" aria-label="roadmap stats">
+        <article>
+          <span class="stat-value">35</span>
+          <span class="stat-label">work weeks</span>
+        </article>
+        <article>
+          <span class="stat-value">3</span>
+          <span class="stat-label">GPU generations</span>
+        </article>
+        <article>
+          <span class="stat-value">8-12</span>
+          <span class="stat-label">public contributions</span>
+        </article>
+        <article>
+          <span class="stat-value">1</span>
+          <span class="stat-label">career move</span>
+        </article>
+      </section>
+
+      <section class="controls" aria-label="roadmap controls">
+        <label class="search">
+          <span>Search roadmap</span>
+          <input id="search" type="search" placeholder="Try FP4, vLLM, ORT, H200..." />
+        </label>
+        <div class="phase-filter" role="group" aria-label="phase filter">
+          <button class="filter active" data-phase="all">All</button>
+          <button class="filter" data-phase="foundation">Foundation</button>
+          <button class="filter" data-phase="depth">Lane depth</button>
+          <button class="filter" data-phase="shipping">Shipping</button>
+          <button class="filter" data-phase="conversion">Conversion</button>
+        </div>
+        <button id="reset-progress" class="button danger" type="button">Reset local checks</button>
+      </section>
+
+      <section class="phase-strip" aria-label="phase overview">
+        <article>
+          <span>Weeks 1-8</span>
+          <strong>Runner, dashboard, first PR, matmul fundamentals.</strong>
+        </article>
+        <article>
+          <span>Weeks 9-19</span>
+          <strong>DeepGEMM, Marlin/Machete, FP4, H200 angle.</strong>
+        </article>
+        <article>
+          <span>Weeks 20-30</span>
+          <strong>Writeups, vLLM/ORT PRs, major release-note PR.</strong>
+        </article>
+        <article>
+          <span>Weeks 31-35</span>
+          <strong>Internal pitch, role move, talk, year-end packet.</strong>
+        </article>
+      </section>
+
+      <section id="benchmarks" class="benchmark-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Benchmark evidence</p>
+            <h2>Latest result index</h2>
+          </div>
+          <p id="result-status">Loading docs/dashboard/results-index.json...</p>
+        </div>
+        <div class="table-wrap">
+          <table class="result-table">
+            <thead>
+              <tr>
+                <th>File</th>
+                <th>Benchmark</th>
+                <th>Backend</th>
+                <th>GPU</th>
+                <th>Shape</th>
+                <th>Mean ms</th>
+                <th>TFLOP/s</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="result-table-body">
+              <tr>
+                <td colspan="8">Generate results-index.json to populate this table.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="focus-panel">
+        <div>
+          <p class="eyebrow">Operating rhythm</p>
+          <h2>Read just enough. Trace. Build. Measure. Publish.</h2>
+        </div>
+        <ol>
+          <li><strong>Monday:</strong> read and write the week's target.</li>
+          <li><strong>Tuesday:</strong> trace the relevant code path.</li>
+          <li><strong>Wednesday:</strong> build the artifact.</li>
+          <li><strong>Thursday:</strong> measure, profile, test, or review.</li>
+          <li><strong>Friday:</strong> publish a concrete artifact.</li>
+        </ol>
+      </section>
+
+      <section id="roadmap" class="roadmap" aria-live="polite">
+        <div class="section-heading">
+          <p class="eyebrow">Week by week</p>
+          <h2>Roadmap checklist</h2>
+          <p id="visible-count"></p>
+        </div>
+        <div id="timeline" class="timeline"></div>
+      </section>
+    </main>
+    <script src="app.js"></script>
+  </body>
+</html>

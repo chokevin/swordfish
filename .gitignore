@@ -34,13 +34,11 @@ profiles/
 *.swp
 
 # outputs
+runs/
 bench_results/
+infra/airun/generated/
 *.csv
 *.parquet
-!bench/fixtures/**/*.csv
-!docs/profiling/**/*.csv
-!docs/profiling/**/*.json
-!docs/profiling/**/*.png
 
 # local junk
 scratch/

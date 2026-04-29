@@ -1,3 +1,3 @@
-"""swordfish — Ampere INT4 x FP16 decode kernels."""
+"""swordfish — cross-architecture kernel benchmark lab."""
 
 __version__ = "0.0.1"
