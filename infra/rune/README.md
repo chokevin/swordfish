@@ -10,6 +10,7 @@ The shape is:
                                 |                              |
                                 |                              +-- runs inside the pod
                                 +-- defines cluster wiring (queue/DRA/selectors/PVC/SYS_ADMIN)
+                                    on top of the swordfish-bench image
 ```
 
 `infra/airun/airun-gemm.voice-agent-flex.json` remains the source of truth for
@@ -23,15 +24,48 @@ mirror that JSON so dispatching via either path lands on the same pod shape.
 
 | What | Status |
 | --- | --- |
-| `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint that runs `python -m swordfish.runner` with optional NCU wrapping. Independent of the profile YAML schema. |
-| `Makefile` targets `rune-submit-*` | **Working.** Invocation shape verified via `make -n`. Will succeed once the profile YAMLs validate. |
-| `infra/rune/profiles/*.yaml` | **DRAFT.** Built from rune binary strings + the cluster routing JSON. `rune profile list` currently rejects them silently (likely a schema mismatch). The canonical schema lives in private `applications/airun-zero/profiles/`; **diff one canonical profile against these drafts and fix the YAML before first dispatch.** Tracked as `rune-profile-schema-validation`. |
-| `make rune-install-profiles` | **Working install path.** Symlinks the YAMLs into `$HOME/.config/rune/profiles/`. Will start working as soon as the YAMLs validate. |
+| `infra/rune/image/Dockerfile` + `build.sh` | **Working source.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI (`.github/workflows/build-swordfish-image.yml`) is the canonical builder; pushes to `ghcr.io/chokevin/swordfish-bench`. Local `build.sh` defaults to podman, supports `CONTAINER_CMD=docker` override. |
+| `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint that runs `python -m swordfish.runner` with optional NCU wrap. Has on-the-fly `pip install liger-kernel` self-heal so it works whether or not the image baked it (`SWORDFISH_SKIP_LIGER_INSTALL=1` to disable). |
+| `Makefile` targets `rune-submit-*` | **Working invocation shape** (verified via `make -n`). Will succeed once the rune profile YAMLs validate. |
+| `infra/rune/profiles/*.yaml` | **DRAFT.** Built from rune binary strings + the cluster routing JSON. `rune profile list` currently rejects them silently. The canonical schema lives in private `applications/airun-zero/profiles/`; **diff one canonical profile against these drafts and fix the YAML before first dispatch.** Tracked as `rune-profile-schema-validation`. |
 
-The profiles being draft-status does not block the cluster routing knowledge —
-all queue/DRA/selector/toleration/SYS_ADMIN values are pinned in the airun JSON
-and the per-arch profile YAMLs. The only unknown is the rune-specific YAML
-*structure* around those values.
+## Image: `ghcr.io/chokevin/swordfish-bench`
+
+Built by CI on push to `infra/rune/image/**`. Manual triggers via
+`gh workflow run build-swordfish-image.yml` accept `liger_version` and
+`liger_ref` build-arg overrides plus an optional extra `tag`.
+
+| Layer | What | Why |
+| --- | --- | --- |
+| Base | `nvcr.io/nvidia/pytorch:25.03-py3` | torch 2.7+nv25.03, CUDA 12.8, Triton, NCU, Nsys built against each other. The Ray-flavored cluster images do not ship this stack in a known-good combination. Don't reinvent it. |
+| OS | git + jq + gh CLI | gh used by Friday-publish flows that file Discussions/PRs from inside the runner. |
+| Tooling | uv 0.5.7 | swordfish uses `uv run` for dependency management. |
+| Kernel lib | `liger-kernel==0.5.10` (override via `LIGER_VERSION` or `LIGER_REF`) | The Week 1 first upstream touchpoint. Baked so cold-start does not pay pip install for every job. |
+
+The image deliberately does **not** carry the swordfish source tree — by
+convention the working copy lives on the `training-nfs` PVC at
+`/data-nfs/swordfish/src/current` so live edits land in the next pod
+without a rebuild. The in-pod script `cd`s there at startup.
+
+### Building locally (optional)
+
+CI is the canonical builder. Local builds are only needed to iterate on the
+Dockerfile itself.
+
+```bash
+# default: podman, host arch (arm64 on Apple silicon)
+infra/rune/image/build.sh
+
+# force amd64 (slow on arm via QEMU; same arch CI uses)
+PLATFORM=linux/amd64 infra/rune/image/build.sh
+
+# push (gh auth required)
+PUSH=1 infra/rune/image/build.sh
+```
+
+Docker Desktop on macOS often gives the VM only ~3.5GB RAM, which is tight
+for the ~12GB nvcr base. Podman with libkrun is what the swordfish dev box
+uses; pass `CONTAINER_CMD=docker` if you prefer.
 
 ## Profiles
 
@@ -100,6 +134,11 @@ schema is sorted:
 make airun-render
 make airun-apply
 ```
+
+Note: the airun JSON still pins `nvcr.io/nvidia/pytorch:25.03-py3` for
+backward compatibility with the Week 1 GEMM matrix; the in-pod script's
+on-the-fly `pip install liger-kernel` covers the Liger gap until that
+config is updated to the new image.
 
 ## Why both rune and `swordfish.runner render-airun-gemm`?
 

@@ -1,0 +1,91 @@
+name: build-swordfish-image
+
+# Builds and pushes ghcr.io/chokevin/swordfish-bench on changes to the image
+# build context. Tags: branch name, short SHA, latest on main, optional
+# version tag via workflow_dispatch.
+#
+# Note: the base is nvcr.io/nvidia/pytorch:25.03-py3 (~12GB), so this build
+# is slow (~15-30min on ubuntu-latest). We reclaim ~30GB of preinstalled
+# tooling first to avoid running out of disk on the base image pull.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/rune/image/**"
+      - ".github/workflows/build-swordfish-image.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "infra/rune/image/**"
+      - ".github/workflows/build-swordfish-image.yml"
+  workflow_dispatch:
+    inputs:
+      liger_version:
+        description: "Override LIGER_VERSION build arg (PyPI release)"
+        required: false
+        type: string
+      liger_ref:
+        description: "Override LIGER_REF build arg (git ref against linkedin/Liger-Kernel)"
+        required: false
+        type: string
+      tag:
+        description: "Extra image tag to publish (e.g. v0.1.0)"
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/swordfish-bench
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reclaim ~30GB on the runner — the base image is huge and the default
+      # ubuntu-latest image ships ~14GB of preinstalled tooling we don't need.
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,format=short
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./infra/rune/image
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ${{ inputs.liger_version && format('LIGER_VERSION={0}', inputs.liger_version) || '' }}
+            ${{ inputs.liger_ref && format('LIGER_REF={0}', inputs.liger_ref) || '' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -54,6 +54,20 @@ fi
 echo "args:       $*"
 echo "=================="
 
+# Defense in depth: the canonical swordfish-bench image bakes liger-kernel,
+# but we may also be running on the nvcr.io/nvidia/pytorch base if the new
+# image hasn't propagated yet, or on a stale tag. Check liger and install on
+# the fly if missing — costs ~10s once and saves a failed run. Skipped when
+# SWORDFISH_SKIP_LIGER_INSTALL=1 is set (e.g., for non-Liger GEMM jobs that
+# want to keep the env stable).
+if [[ "${SWORDFISH_SKIP_LIGER_INSTALL:-0}" != "1" ]]; then
+  if ! python -c "import liger_kernel" >/dev/null 2>&1; then
+    echo "liger_kernel missing; installing on the fly (set SWORDFISH_SKIP_LIGER_INSTALL=1 to disable)"
+    pip install --no-cache-dir "liger-kernel==${SWORDFISH_LIGER_VERSION:-0.5.10}" >&2
+  fi
+  python -c "import liger_kernel; print(f'liger_kernel: {getattr(liger_kernel, \"__version__\", \"unknown\")}')" || true
+fi
+
 # Inject --arch-label only if the caller did not pass one. Avoids surprising
 # overrides when the caller specifies a deliberate label.
 inject_arch=""
