@@ -17,6 +17,11 @@ from swordfish.runner.airun import (
 from swordfish.runner.backends import available_gemm_backends
 from swordfish.runner.compare import write_results_comparison
 from swordfish.runner.index import write_result_index
+from swordfish.runner.liger_perkernel import (
+    DEFAULT_DTYPE as LIGER_DEFAULT_DTYPE,
+    KERNEL_NAMES as LIGER_KERNEL_NAMES,
+    run_liger_perkernel,
+)
 from swordfish.runner.matrix import (
     DEFAULT_ARCH_LABELS,
     run_gemm_matrix,
@@ -50,6 +55,31 @@ def _cmd_run_gemm(args: argparse.Namespace) -> int:
         seed=args.seed,
         ncu_csv=args.ncu_csv,
         backend=args.backend,
+    )
+    result["command"] = argv
+    write_result(result, args.out)
+    print(f"wrote {args.out}", file=sys.stderr)
+    return 0
+
+
+def _cmd_run_liger_perkernel(args: argparse.Namespace) -> int:
+    argv = sys.argv if args.argv is None else args.argv
+    result = run_liger_perkernel(
+        kernel=args.kernel,
+        batch=args.batch,
+        seq=args.seq,
+        hidden=args.hidden,
+        intermediate=args.intermediate,
+        eps=args.eps,
+        dtype=args.dtype,
+        repeats=args.repeats,
+        warmup=args.warmup,
+        iters=args.iters,
+        device_name=args.device,
+        allow_cpu=args.allow_cpu,
+        arch_label=args.arch_label,
+        seed=args.seed,
+        ncu_csv=args.ncu_csv,
     )
     result["command"] = argv
     write_result(result, args.out)
@@ -279,6 +309,43 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--ncu-csv", type=Path, default=None)
     run.add_argument("--out", type=Path, required=True)
     run.set_defaults(func=_cmd_run_gemm)
+
+    liger = sub.add_parser(
+        "liger-perkernel",
+        help="run one paired baseline-vs-Liger per-kernel benchmark",
+    )
+    liger.add_argument(
+        "--kernel",
+        choices=LIGER_KERNEL_NAMES,
+        required=True,
+        help="which kernel to bench (rmsnorm and swiglu are implemented; "
+        "rope and fused_linear_ce raise NotImplementedError until follow-up work)",
+    )
+    liger.add_argument("--batch", type=int, default=4)
+    liger.add_argument("--seq", type=int, default=2048)
+    liger.add_argument("--hidden", type=int, default=4096)
+    liger.add_argument("--intermediate", type=int, default=14336)
+    liger.add_argument("--eps", type=float, default=1e-6)
+    liger.add_argument(
+        "--dtype",
+        choices=["fp16", "bf16", "fp32"],
+        default=LIGER_DEFAULT_DTYPE,
+        help="bf16 matches Liger's published defaults",
+    )
+    liger.add_argument("--repeats", type=int, default=5)
+    liger.add_argument("--warmup", type=int, default=10)
+    liger.add_argument("--iters", type=int, default=50)
+    liger.add_argument("--device", default="auto")
+    liger.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="allow CPU smoke; Liger half is reported as skipped on CPU",
+    )
+    liger.add_argument("--arch-label", choices=["a100", "h100", "h200"], default=None)
+    liger.add_argument("--seed", type=int, default=0)
+    liger.add_argument("--ncu-csv", type=Path, default=None)
+    liger.add_argument("--out", type=Path, required=True)
+    liger.set_defaults(func=_cmd_run_liger_perkernel)
 
     attach = sub.add_parser("attach-ncu", help="attach Nsight Compute CSV summary to a JSON result")
     attach.add_argument("--result", type=Path, required=True)

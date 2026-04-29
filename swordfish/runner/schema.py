@@ -10,6 +10,13 @@ from typing import Any
 
 SCHEMA_VERSION = "swordfish.runner.v1"
 
+# Training-side benchmarks (Liger per-kernel sweeps, FSDP step timing) carry
+# different fields than the inference GEMM/transformer schema: peak memory,
+# forward+backward latency, optimizer config, distributed strategy, and a
+# liger_patch sub-block describing which kernels were swapped. Kept as a
+# sibling schema so the inference schema does not get overloaded.
+TRAINING_SCHEMA_VERSION = "swordfish.training.v1"
+
 
 DTYPE_BYTES = {
     "fp16": 2,
@@ -92,6 +99,53 @@ def validate_result_protocol(result: dict[str, Any]) -> list[str]:
         errors.append("result.env must be an object")
     else:
         errors.extend(_missing(env, COMMON_ENV_FIELDS, "env"))
+
+    return errors
+
+
+# Training-side schema. Each per-kernel result captures the matched baseline +
+# Liger pair on identical input, so the metrics block carries both modes plus
+# explicit deltas. End-to-end FSDP step results reuse the same wrapper but with
+# config.scope == "train_step" and metrics.modes == {"baseline": ...} only.
+TRAINING_CONFIG_FIELDS = ("scope", "kernel", "dtype", "shape")
+TRAINING_LIGER_FIELDS = ("applied", "version", "kernel_module")
+
+
+def validate_training_result_protocol(result: dict[str, Any]) -> list[str]:
+    """Return missing fields for a training-side result (Liger sweep, FSDP step)."""
+    errors = _missing(result, COMMON_RESULT_FIELDS, "result")
+    if errors:
+        return errors
+    if result.get("schema_version") != TRAINING_SCHEMA_VERSION:
+        errors.append(f"result.schema_version must be {TRAINING_SCHEMA_VERSION}")
+
+    config = result["config"]
+    if not isinstance(config, dict):
+        errors.append("result.config must be an object")
+    else:
+        errors.extend(_missing(config, TRAINING_CONFIG_FIELDS, "config"))
+        shape = config.get("shape")
+        if not isinstance(shape, dict) or not shape:
+            errors.append("config.shape must be a non-empty object")
+        liger = config.get("liger")
+        if not isinstance(liger, dict):
+            errors.append("config.liger must be an object")
+        else:
+            errors.extend(_missing(liger, TRAINING_LIGER_FIELDS, "config.liger"))
+
+    env = result.get("env")
+    if not isinstance(env, dict):
+        errors.append("result.env must be an object")
+    else:
+        errors.extend(_missing(env, COMMON_ENV_FIELDS, "env"))
+
+    metrics = result.get("metrics")
+    if not isinstance(metrics, dict):
+        errors.append("result.metrics must be an object")
+    else:
+        modes = metrics.get("modes")
+        if not isinstance(modes, dict) or not modes:
+            errors.append("metrics.modes must be a non-empty object")
 
     return errors
 

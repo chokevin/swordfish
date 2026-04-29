@@ -29,8 +29,15 @@ from swordfish.quant.marlin_triton import (
 from swordfish.runner.backends import available_gemm_backends, get_gemm_backend
 from swordfish.runner.compare import render_results_comparison
 from swordfish.runner.index import build_result_index
+from swordfish.runner.liger_perkernel import KERNEL_NAMES as LIGER_KERNEL_NAMES, run_liger_perkernel
 from swordfish.runner.matrix import run_gemm_matrix, validate_gemm_matrix_results
-from swordfish.runner.schema import gpu_class_from_name, parse_ncu_csv, validate_result_protocol
+from swordfish.runner.schema import (
+    TRAINING_SCHEMA_VERSION,
+    gpu_class_from_name,
+    parse_ncu_csv,
+    validate_result_protocol,
+    validate_training_result_protocol,
+)
 from swordfish.runner.status import render_completion_report
 from swordfish.runner.torch_gemm import (
     _reference_check,
@@ -823,3 +830,117 @@ def test_parse_ncu_csv_reports_missing_metrics_for_malformed_csv(tmp_path):
         "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
     ]
     assert parsed["complete"] is False
+
+
+def test_liger_perkernel_rmsnorm_cpu_smoke_skips_liger_half(tmp_path):
+    """CPU smoke: baseline runs; Liger half is reported as skipped."""
+    result = run_liger_perkernel(
+        kernel="rmsnorm",
+        batch=2,
+        seq=4,
+        hidden=8,
+        intermediate=16,
+        eps=1e-6,
+        dtype="fp32",
+        repeats=1,
+        warmup=0,
+        iters=1,
+        device_name="cpu",
+        allow_cpu=True,
+        arch_label="a100",
+    )
+
+    assert result["schema_version"] == TRAINING_SCHEMA_VERSION
+    assert result["benchmark"] == "liger_perkernel_rmsnorm"
+    assert validate_training_result_protocol(result) == []
+    assert result["config"]["scope"] == "liger_perkernel"
+    assert result["config"]["kernel"] == "rmsnorm"
+    assert result["config"]["shape"] == {"batch": 2, "seq": 4, "hidden": 8, "intermediate": 16}
+    assert result["config"]["liger"]["applied"] is False
+
+    baseline = result["metrics"]["modes"]["baseline"]
+    liger = result["metrics"]["modes"]["liger"]
+    assert baseline["skipped"] is False
+    assert baseline["forward_ms"]["mean_ms"] >= 0
+    assert baseline["backward_ms"]["mean_ms"] >= 0
+    assert baseline["finite_output"] is True
+
+    assert liger["skipped"] is True
+    assert liger["skip_reason"] is not None
+    assert result["metrics"]["deltas"]["forward_speedup"] is None
+    assert result["correctness"]["baseline_finite"] is True
+    assert result["correctness"]["liger_finite"] is None
+
+
+def test_liger_perkernel_swiglu_cpu_smoke():
+    result = run_liger_perkernel(
+        kernel="swiglu",
+        batch=2,
+        seq=4,
+        hidden=8,
+        intermediate=16,
+        eps=1e-6,
+        dtype="fp32",
+        repeats=1,
+        warmup=0,
+        iters=1,
+        device_name="cpu",
+        allow_cpu=True,
+        arch_label="h100",
+    )
+
+    assert validate_training_result_protocol(result) == []
+    assert result["config"]["kernel"] == "swiglu"
+    baseline = result["metrics"]["modes"]["baseline"]
+    assert baseline["finite_output"] is True
+    assert baseline["forward_ms"]["mean_ms"] >= 0
+
+
+def test_liger_perkernel_rope_not_implemented_yet():
+    with pytest.raises(NotImplementedError, match="rope"):
+        run_liger_perkernel(
+            kernel="rope",
+            batch=1,
+            seq=4,
+            hidden=8,
+            intermediate=16,
+            eps=1e-6,
+            dtype="fp32",
+            repeats=1,
+            warmup=0,
+            iters=1,
+            device_name="cpu",
+            allow_cpu=True,
+        )
+
+
+def test_liger_perkernel_rejects_unknown_kernel():
+    with pytest.raises(ValueError, match="unknown kernel"):
+        run_liger_perkernel(
+            kernel="bogus",
+            batch=1,
+            seq=4,
+            hidden=8,
+            intermediate=16,
+            eps=1e-6,
+            dtype="fp32",
+            repeats=1,
+            warmup=0,
+            iters=1,
+            device_name="cpu",
+            allow_cpu=True,
+        )
+
+
+def test_liger_perkernel_kernel_names_match_advertised_set():
+    assert LIGER_KERNEL_NAMES == ("rmsnorm", "swiglu", "rope", "fused_linear_ce")
+
+
+def test_validate_training_result_protocol_reports_missing_fields():
+    bare = {"schema_version": TRAINING_SCHEMA_VERSION}
+    errors = validate_training_result_protocol(bare)
+    assert any("benchmark" in e for e in errors)
+    assert any("config" in e for e in errors)
+    assert any("env" in e for e in errors)
+    assert any("metrics" in e for e in errors)
+    assert any("correctness" in e for e in errors)
