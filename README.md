@@ -85,25 +85,48 @@ uv run python -m swordfish.runner run-gemm \
   --out runs/week1/torch-gemm-a100.json
 ```
 
-To dispatch a Kueue Job through `rune` (the day-to-day path), preview the
-manifest first:
+To dispatch a Kueue Job through `rune` (the day-to-day path), use the
+swordfish runner CLI — it builds the right `rune submit` argv from typed
+dataclasses, so callers don't have to remember the
+`--profile`/`--script`/`--output`/`--volume` shape:
 
 ```bash
 make rune-install-profiles                              # one-time symlink
 
+# preview the rendered Job manifest (no cluster contact)
+uv run python -m swordfish.runner submit-bench \
+  --workload gemm --arch h100 --m 4096 --n 4096 --k 4096 --dtype fp16 \
+  --dry-run client --print-yaml
+
+# real submission
+uv run python -m swordfish.runner submit-bench --workload gemm --arch h100
+```
+
+The same flow from a Python script:
+
+```python
+from swordfish.dispatch import TorchGemmRun
+result = TorchGemmRun(arch="h100").submit()
+print(result.name)
+```
+
+Or the equivalent low-level `rune submit` invocation if you need a one-off
+shape with arbitrary args:
+
+```bash
 rune submit my-bench \
   --profile swordfish-bench-h100 \
   --script infra/rune/scripts/swordfish-bench.sh \
   --output /data/swordfish/week1/torch-gemm-h100.json \
-  --dry-run=client \
   -- run-gemm --backend torch --m 4096 --n 4096 --k 4096 \
      --dtype fp16 --device auto \
      --out /data/swordfish/week1/torch-gemm-h100.json
 ```
 
-Drop `--dry-run=client` to actually submit, then fetch the JSON back with
+After a real submit, fetch the JSON back with
 `rune submit get my-bench -n ray --output raw > my-bench.json`. The Python SDK
-`swordfish.dispatch.LigerPerkernelRun` wraps the same flow as a typed dataclass.
+(`swordfish.dispatch.TorchGemmRun`, `LigerPerkernelRun`) wraps the same flow
+as typed dataclasses with `.submit()` and `.fetch_result()` methods.
 
 A100 + Nsight Compute is a known limitation: rune profiles can't currently
 expose container `SYS_ADMIN`, which NCU needs to read A100 perf counters. The

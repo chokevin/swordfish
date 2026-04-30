@@ -38,6 +38,7 @@ from swordfish.dispatch.runs import (
     DEFAULT_PVC,
     LigerPerkernelMatrix,
     LigerPerkernelRun,
+    TorchGemmRun,
 )
 from swordfish.dispatch.topology import (
     find_topology_policy,
@@ -58,6 +59,7 @@ __all__ = [
     "RuneSubmit",
     "RuneSubmitGetMissingAnnotationsError",
     "RuneSubmitResult",
+    "TorchGemmRun",
     "build_and_push_dev_image",
     "fetch_result",
     "fetch_via_rune_submit_get",

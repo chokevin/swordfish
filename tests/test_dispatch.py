@@ -13,6 +13,7 @@ from swordfish.dispatch import (
     LigerPerkernelRun,
     RuneSubmit,
     RuneSubmitGetMissingAnnotationsError,
+    TorchGemmRun,
     fetch_via_rune_submit_get,
 )
 
@@ -110,18 +111,28 @@ def test_rune_submit_rejects_unknown_profile_mode():
         RuneSubmit(name="j", preset="p", script="s.sh", profile_mode="vtune")
 
 
-def test_liger_perkernel_run_defaults_to_kernel_mode_preset():
+def test_liger_perkernel_run_defaults_to_swordfish_profile_pack():
+    """Default submit path uses the swordfish-bench-<arch> profile (not raw preset)
+    so edits to swordfish/dispatch/profiles.py flow into actual jobs."""
     run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
     submit = run.to_rune_submit()
-    assert submit.preset == "azure.kernel-mode.training.l"
-    assert submit.profile is None
+    assert submit.profile == "swordfish-bench-a100"
+    assert submit.preset is None
     assert submit.image == DEFAULT_IMAGE
     assert submit.volumes == [f"data=pvc:{DEFAULT_PVC}"]
 
 
-def test_liger_perkernel_run_h200_uses_large_memory_preset():
+def test_liger_perkernel_run_explicit_preset_overrides_profile_default():
+    """Callers can opt back to the raw preset shortcut."""
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", preset="azure.kernel-mode.training.l")
+    submit = run.to_rune_submit()
+    assert submit.preset == "azure.kernel-mode.training.l"
+    assert submit.profile is None
+
+
+def test_liger_perkernel_run_h200_defaults_to_h200_profile():
     run = LigerPerkernelRun(kernel="rmsnorm", arch="h200")
-    assert run.resolved_preset == "azure.kernel-mode.large-memory.xl"
+    assert run.resolved_profile == "swordfish-bench-h200"
 
 
 def test_liger_perkernel_run_name_is_kebab_case_and_normalized():
@@ -164,7 +175,7 @@ def test_liger_perkernel_run_to_command_renders_full_invocation():
     assert "rune" in cmd
     assert "submit" in cmd
     assert "sf-liger-rmsnorm-a100" in cmd
-    assert "--preset azure.kernel-mode.training.l" in cmd
+    assert "--profile swordfish-bench-a100" in cmd
     assert "--volume data=pvc:training-nfs" in cmd
     assert "--dry-run client" in cmd
     assert "liger-perkernel" in cmd
@@ -516,3 +527,235 @@ def test_liger_perkernel_run_fetch_result_traces_use_explicit_path_pvc_artifact(
     assert target.read_bytes() == payload_json
     trace_local = target.with_suffix(".ncu-rep")
     assert trace_local.read_bytes() == payload_trace
+
+
+# ---------------------------------------------------------------------------
+# TorchGemmRun
+# ---------------------------------------------------------------------------
+
+
+def test_torch_gemm_run_defaults_to_swordfish_profile_pack():
+    run = TorchGemmRun(arch="a100")
+    submit = run.to_rune_submit()
+    assert submit.profile == "swordfish-bench-a100"
+    assert submit.preset is None
+
+
+def test_torch_gemm_run_h200_defaults_to_h200_profile():
+    run = TorchGemmRun(arch="h200")
+    assert run.resolved_profile == "swordfish-bench-h200"
+
+
+def test_torch_gemm_run_explicit_preset_overrides_profile_default():
+    run = TorchGemmRun(arch="a100", preset="azure.kernel-mode.training.l")
+    submit = run.to_rune_submit()
+    assert submit.preset == "azure.kernel-mode.training.l"
+    assert submit.profile is None
+
+
+def test_torch_gemm_run_rejects_unknown_arch():
+    with pytest.raises(ValueError, match="unknown arch"):
+        TorchGemmRun(arch="mi300x")
+
+
+def test_torch_gemm_run_forwarded_args_match_runner_subcommand():
+    run = TorchGemmRun(arch="h100", m=8192, n=4096, k=2048, dtype="bf16")
+    forwarded = run.forwarded_args
+    assert forwarded[0] == "run-gemm"
+    for flag in ("--backend", "--m", "--n", "--k", "--dtype", "--arch-label", "--out"):
+        assert flag in forwarded
+    assert "8192" in forwarded
+    assert "4096" in forwarded
+    assert "2048" in forwarded
+    assert "bf16" in forwarded
+    assert "h100" in forwarded
+    assert "/data/swordfish/week1/torch-gemm-h100.json" in forwarded
+
+
+def test_torch_gemm_run_renders_native_output_flag():
+    run = TorchGemmRun(arch="h100")
+    args = run.to_rune_submit().to_args()
+    assert "--output" in args
+    assert args[args.index("--output") + 1] == "/data/swordfish/week1/torch-gemm-h100.json"
+
+
+def test_torch_gemm_run_to_command_renders_full_invocation():
+    run = TorchGemmRun(arch="a100")
+    cmd = run.to_command(dry_run="client")
+    assert "rune" in cmd
+    assert "submit" in cmd
+    assert "sf-gemm-torch-a100" in cmd
+    assert "--volume data=pvc:training-nfs" in cmd
+    assert "--dry-run client" in cmd
+    assert "run-gemm" in cmd
+
+
+def test_torch_gemm_run_profile_mode_passes_through_native_flag():
+    run = TorchGemmRun(arch="h100", profile_mode="ncu")
+    args = run.to_rune_submit().to_args()
+    assert "--profile-mode" in args
+    assert args[args.index("--profile-mode") + 1] == "ncu"
+
+
+def test_torch_gemm_run_custom_name_normalized():
+    run = TorchGemmRun(arch="a100", name="My_Gemm_Run")
+    assert run.resolved_name == "my-gemm-run"
+
+
+def test_torch_gemm_run_preset_and_profile_are_mutually_exclusive():
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TorchGemmRun(arch="a100", preset="x", profile="y")
+
+
+def test_torch_gemm_run_image_and_pvc_inherit_dispatch_defaults():
+    run = TorchGemmRun(arch="a100")
+    submit = run.to_rune_submit()
+    assert submit.image == DEFAULT_IMAGE
+    assert "data=pvc:" + DEFAULT_PVC in submit.volumes
+
+
+# ---------------------------------------------------------------------------
+# profile YAML sync — the on-disk pack must equal Python source of truth
+# ---------------------------------------------------------------------------
+
+
+def test_swordfish_pack_yaml_in_sync_with_python_source():
+    """
+    The committed `infra/rune/profiles/swordfish-pack.yaml` is generated from
+    `swordfish.dispatch.profiles`. This test fails (with a clear hint) if anyone
+    edits one without regenerating the other.
+    """
+    from swordfish.dispatch.profiles import PACK_YAML_PATH, render_pack_yaml
+
+    expected = render_pack_yaml()
+    actual = Path(PACK_YAML_PATH).read_text()
+    assert expected == actual, (
+        f"{PACK_YAML_PATH} is out of sync with swordfish.dispatch.profiles. Run: make rune-profiles"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI subcommands: submit-bench and generate-rune-profiles
+# ---------------------------------------------------------------------------
+
+
+def test_submit_bench_cli_constructs_torch_gemm_run(monkeypatch):
+    from swordfish.runner.cli import _build_submit_run, build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit-bench",
+            "--workload",
+            "gemm",
+            "--arch",
+            "h100",
+            "--m",
+            "1024",
+            "--n",
+            "2048",
+            "--k",
+            "4096",
+            "--dtype",
+            "bf16",
+            "--name",
+            "my-test",
+        ]
+    )
+    run = _build_submit_run(args)
+    assert isinstance(run, TorchGemmRun)
+    assert run.arch == "h100"
+    assert run.m == 1024 and run.n == 2048 and run.k == 4096
+    assert run.dtype == "bf16"
+    assert run.name == "my-test"
+
+
+def test_submit_bench_cli_constructs_liger_run_for_rmsnorm(monkeypatch):
+    from swordfish.runner.cli import _build_submit_run, build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(
+        ["submit-bench", "--workload", "liger-rmsnorm", "--arch", "a100", "--profile-mode", "ncu"]
+    )
+    run = _build_submit_run(args)
+    assert isinstance(run, LigerPerkernelRun)
+    assert run.kernel == "rmsnorm"
+    assert run.dtype == "bf16"
+    assert run.profile_mode == "ncu"
+
+
+def test_submit_bench_cli_propagates_result_root_and_script(monkeypatch):
+    from swordfish.runner.cli import _build_submit_run, build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "submit-bench",
+            "--workload",
+            "gemm",
+            "--arch",
+            "h100",
+            "--result-root",
+            "/data/custom",
+            "--script",
+            "/tmp/my.sh",
+        ]
+    )
+    run = _build_submit_run(args)
+    assert run.result_root == "/data/custom"
+    assert str(run.script) == "/tmp/my.sh"
+    # Output path should follow the new result_root
+    assert run.out_path == "/data/custom/torch-gemm-h100.json"
+
+
+def test_submit_bench_cli_dry_run_invokes_submit(monkeypatch, capsys):
+    from swordfish.runner import cli
+
+    captured: dict = {}
+
+    def fake_submit(self, *, dry_run=None, **kwargs):
+        captured["arch"] = self.arch
+        captured["dry_run"] = dry_run
+        from swordfish.dispatch.rune import RuneSubmitResult
+
+        return RuneSubmitResult(
+            name=self.resolved_name,
+            args=["rune"],
+            rendered_yaml="kind: Job",
+            stdout="kind: Job",
+            stderr="",
+        )
+
+    monkeypatch.setattr(TorchGemmRun, "submit", fake_submit)
+    rc = cli.main(["submit-bench", "--workload", "gemm", "--arch", "a100", "--dry-run", "client"])
+    assert rc == 0
+    assert captured == {"arch": "a100", "dry_run": "client"}
+
+
+def test_generate_rune_profiles_check_passes_when_in_sync(tmp_path):
+    from swordfish.dispatch.profiles import render_pack_yaml
+    from swordfish.runner import cli
+
+    target = tmp_path / "pack.yaml"
+    target.write_text(render_pack_yaml())
+    rc = cli.main(["generate-rune-profiles", "--check", "--out", str(target)])
+    assert rc == 0
+
+
+def test_generate_rune_profiles_check_fails_when_drifted(tmp_path):
+    from swordfish.runner import cli
+
+    target = tmp_path / "pack.yaml"
+    target.write_text("# stale\n")
+    rc = cli.main(["generate-rune-profiles", "--check", "--out", str(target)])
+    assert rc == 1
+
+
+def test_generate_rune_profiles_writes_when_no_check(tmp_path):
+    from swordfish.dispatch.profiles import render_pack_yaml
+    from swordfish.runner import cli
+
+    target = tmp_path / "subdir" / "pack.yaml"
+    rc = cli.main(["generate-rune-profiles", "--out", str(target)])
+    assert rc == 0
+    assert target.read_text() == render_pack_yaml()

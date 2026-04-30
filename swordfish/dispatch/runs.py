@@ -24,6 +24,18 @@ DEFAULT_PRESET = "azure.kernel-mode.training.l"
 DEFAULT_BENCH_SCRIPT = Path("infra/rune/scripts/swordfish-bench.sh")
 DEFAULT_RESULT_ROOT = "/data/swordfish/week1"
 
+# Profile pack defined in swordfish/dispatch/profiles.py and rendered to
+# infra/rune/profiles/swordfish-pack.yaml. Dispatching by profile (rather than
+# by raw preset) is what makes the YAML pack the source of truth: edit
+# profiles.py, regenerate, and `make rune-submit-*` automatically picks up the
+# new image / queue / persistence shape.
+SWORDFISH_PROFILE_PREFIX = "swordfish-bench-"
+
+
+def default_profile_for(arch: str) -> str:
+    return f"{SWORDFISH_PROFILE_PREFIX}{arch}"
+
+
 ARCH_TO_PRESET = {
     "a100": "azure.kernel-mode.training.l",
     "h100": "azure.kernel-mode.training.l",  # same lane today; H100 in kernel-mode pending
@@ -109,6 +121,22 @@ class LigerPerkernelRun:
         return self.preset or ARCH_TO_PRESET[self.arch]
 
     @property
+    def resolved_profile(self) -> str | None:
+        """Which rune profile to submit with.
+
+        Defaults to the swordfish-bench pack profile for this arch so the
+        committed `infra/rune/profiles/swordfish-pack.yaml` (regenerated from
+        `swordfish.dispatch.profiles`) is what actually drives image, queue,
+        and persistence on every submit. Callers can opt back to the raw
+        preset shortcut by setting `preset=...` explicitly.
+        """
+        if self.profile:
+            return self.profile
+        if self.preset:
+            return None
+        return default_profile_for(self.arch)
+
+    @property
     def out_path(self) -> str:
         return f"{self.result_root}/liger-perkernel/{self.kernel}-{self.arch}.json"
 
@@ -189,8 +217,9 @@ class LigerPerkernelRun:
             profile_mode=self.profile_mode,
             output=self.out_path,
         )
-        if self.profile:
-            kwargs["profile"] = self.profile
+        resolved_profile = self.resolved_profile
+        if resolved_profile:
+            kwargs["profile"] = resolved_profile
         else:
             kwargs["preset"] = self.resolved_preset
         return RuneSubmit(**kwargs)
@@ -330,6 +359,128 @@ class LigerPerkernelRun:
             trace_local.write_bytes(trace_payload)
 
         return result
+
+
+@dataclass
+class TorchGemmRun:
+    """One torch/cuBLAS GEMM benchmark on a single arch.
+
+    Programmatic equivalent of `make rune-submit-gemm-<arch>`. The shell-out
+    target shape is identical (script-mode, kernel-mode-training queue,
+    `--output` annotations); this class collapses the argv-construction into
+    typed fields.
+    """
+
+    arch: str = "a100"
+    backend: str = "torch"
+    m: int = 4096
+    n: int = 4096
+    k: int = 4096
+    dtype: str = "fp16"
+    repeats: int = 5
+    warmup: int = 10
+    iters: int = 50
+    name: str | None = None
+    namespace: str = DEFAULT_NAMESPACE
+    context: str | None = None
+    image: str = DEFAULT_IMAGE
+    script: str | Path = DEFAULT_BENCH_SCRIPT
+    pvc: str = DEFAULT_PVC
+    result_root: str = DEFAULT_RESULT_ROOT
+    preset: str | None = None
+    profile: str | None = None
+    extra_args: list[str] = field(default_factory=list)
+    container_env: dict[str, str] = field(default_factory=dict)
+    rune_bin: str = "rune"
+    profile_mode: str | None = None  # ncu | nsys | None
+
+    def __post_init__(self) -> None:
+        if self.arch not in ARCH_TO_PRESET:
+            raise ValueError(
+                f"unknown arch {self.arch!r}; expected one of {sorted(ARCH_TO_PRESET)}"
+            )
+        if self.preset and self.profile:
+            raise ValueError("preset and profile are mutually exclusive")
+        if self.profile_mode and self.profile_mode not in PROFILE_MODES:
+            raise ValueError(f"profile_mode {self.profile_mode!r} not in {PROFILE_MODES}")
+
+    @property
+    def resolved_name(self) -> str:
+        return _normalize_name(self.name or f"sf-gemm-{self.backend}-{self.arch}")
+
+    @property
+    def resolved_preset(self) -> str:
+        if self.profile:
+            return ""
+        return self.preset or ARCH_TO_PRESET[self.arch]
+
+    @property
+    def resolved_profile(self) -> str | None:
+        if self.profile:
+            return self.profile
+        if self.preset:
+            return None
+        return default_profile_for(self.arch)
+
+    @property
+    def out_path(self) -> str:
+        return f"{self.result_root}/{self.backend}-gemm-{self.arch}.json"
+
+    @property
+    def forwarded_args(self) -> list[str]:
+        return [
+            "run-gemm",
+            "--backend",
+            self.backend,
+            "--m",
+            str(self.m),
+            "--n",
+            str(self.n),
+            "--k",
+            str(self.k),
+            "--dtype",
+            self.dtype,
+            "--repeats",
+            str(self.repeats),
+            "--warmup",
+            str(self.warmup),
+            "--iters",
+            str(self.iters),
+            "--device",
+            "auto",
+            "--arch-label",
+            self.arch,
+            "--out",
+            self.out_path,
+        ]
+
+    def to_rune_submit(self) -> RuneSubmit:
+        kwargs: dict = dict(
+            name=self.resolved_name,
+            image=self.image,
+            script=self.script,
+            namespace=self.namespace,
+            context=self.context,
+            volumes=[f"data=pvc:{self.pvc}"],
+            extra_args=list(self.extra_args),
+            forwarded_args=self.forwarded_args,
+            container_env=dict(self.container_env),
+            rune_bin=self.rune_bin,
+            profile_mode=self.profile_mode,
+            output=self.out_path,
+        )
+        resolved_profile = self.resolved_profile
+        if resolved_profile:
+            kwargs["profile"] = resolved_profile
+        else:
+            kwargs["preset"] = self.resolved_preset
+        return RuneSubmit(**kwargs)
+
+    def to_command(self, *, dry_run: str | None = None) -> str:
+        return self.to_rune_submit().to_command(dry_run=dry_run)
+
+    def submit(self, *, dry_run: str | None = None, check: bool = True) -> RuneSubmitResult:
+        return self.to_rune_submit().submit(dry_run=dry_run, check=check)
 
 
 @dataclass

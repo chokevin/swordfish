@@ -7,6 +7,11 @@ import json
 import sys
 from pathlib import Path
 
+from swordfish.dispatch import (
+    LigerPerkernelRun,
+    TorchGemmRun,
+)
+from swordfish.dispatch.profiles import PACK_YAML_PATH, render_pack_yaml
 from swordfish.quant.marlin_triton import run_w4a16_benchmark, write_w4a16_result
 from swordfish.runner.backends import available_gemm_backends
 from swordfish.runner.compare import write_results_comparison
@@ -237,6 +242,71 @@ def _cmd_render_completion_report(args: argparse.Namespace) -> int:
     return 1 if args.fail_on_incomplete and errors else 0
 
 
+def _build_submit_run(args: argparse.Namespace):
+    """Translate `submit-bench` argv into the matching dispatch dataclass."""
+    common: dict = {}
+    if getattr(args, "result_root", None):
+        common["result_root"] = args.result_root
+    if getattr(args, "script", None):
+        common["script"] = args.script
+    if args.workload == "gemm":
+        return TorchGemmRun(
+            arch=args.arch,
+            backend=args.backend,
+            m=args.m,
+            n=args.n,
+            k=args.k,
+            dtype=args.dtype or "fp16",
+            repeats=args.repeats,
+            warmup=args.warmup,
+            iters=args.iters,
+            name=args.name,
+            profile_mode=args.profile_mode,
+            **common,
+        )
+    kernel = "rmsnorm" if args.workload == "liger-rmsnorm" else "swiglu"
+    return LigerPerkernelRun(
+        kernel=kernel,
+        arch=args.arch,
+        dtype=args.dtype or "bf16",
+        repeats=args.repeats,
+        warmup=args.warmup,
+        iters=args.iters,
+        name=args.name,
+        profile_mode=args.profile_mode,
+        **common,
+    )
+
+
+def _cmd_submit_bench(args: argparse.Namespace) -> int:
+    run = _build_submit_run(args)
+    result = run.submit(dry_run=args.dry_run)
+    print(result.name, file=sys.stderr)
+    if args.print_yaml and result.rendered_yaml:
+        print(result.rendered_yaml)
+    return 0
+
+
+def _cmd_generate_rune_profiles(args: argparse.Namespace) -> int:
+    rendered = render_pack_yaml()
+    out: Path = args.out
+    if args.check:
+        existing = out.read_text() if out.exists() else ""
+        if existing != rendered:
+            print(
+                f"FAIL: {out} is out of sync with swordfish.dispatch.profiles.\n"
+                f"      Run: uv run python -m swordfish.runner generate-rune-profiles",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"{out} in sync", file=sys.stderr)
+        return 0
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(rendered)
+    print(f"wrote {out}", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="swordfish cross-arch benchmark runner")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -454,6 +524,79 @@ def build_parser() -> argparse.ArgumentParser:
     )
     completion.add_argument("--out", type=Path, required=True)
     completion.set_defaults(func=_cmd_render_completion_report)
+
+    submit = sub.add_parser(
+        "submit-bench",
+        help="dispatch a swordfish benchmark via the rune SDK (replaces "
+        "Makefile rune-submit-* shell-outs)",
+    )
+    submit.add_argument(
+        "--workload",
+        choices=["gemm", "liger-rmsnorm", "liger-swiglu"],
+        required=True,
+    )
+    submit.add_argument("--arch", choices=["a100", "h100", "h200"], required=True)
+    submit.add_argument("--name", default=None, help="override generated job name")
+    submit.add_argument("--profile-mode", choices=["ncu", "nsys"], default=None)
+    submit.add_argument(
+        "--dry-run",
+        choices=["client", "server"],
+        default=None,
+        help="render-only without submitting (client = local, server = api dry-run)",
+    )
+    submit.add_argument(
+        "--print-yaml",
+        action="store_true",
+        help="print the rendered Job manifest after submit/dry-run",
+    )
+    submit.add_argument("--m", type=int, default=4096, help="GEMM only")
+    submit.add_argument("--n", type=int, default=4096, help="GEMM only")
+    submit.add_argument("--k", type=int, default=4096, help="GEMM only")
+    submit.add_argument(
+        "--dtype",
+        default=None,
+        help="GEMM dtype (default fp16) or liger dtype (default bf16)",
+    )
+    submit.add_argument("--repeats", type=int, default=5)
+    submit.add_argument("--warmup", type=int, default=10)
+    submit.add_argument("--iters", type=int, default=50)
+    submit.add_argument(
+        "--backend",
+        choices=available_gemm_backends(),
+        default="torch",
+        help="GEMM only",
+    )
+    submit.add_argument(
+        "--result-root",
+        default=None,
+        help=("PVC directory the in-pod runner writes results to (default: /data/swordfish/week1)"),
+    )
+    submit.add_argument(
+        "--script",
+        default=None,
+        help=(
+            "override the in-pod entrypoint script (default: infra/rune/scripts/swordfish-bench.sh)"
+        ),
+    )
+    submit.set_defaults(func=_cmd_submit_bench)
+
+    profiles_cmd = sub.add_parser(
+        "generate-rune-profiles",
+        help="regenerate the swordfish rune profile pack from the Python "
+        "source of truth in swordfish.dispatch.profiles",
+    )
+    profiles_cmd.add_argument(
+        "--out",
+        type=Path,
+        default=Path(PACK_YAML_PATH),
+        help=f"destination path (default: {PACK_YAML_PATH})",
+    )
+    profiles_cmd.add_argument(
+        "--check",
+        action="store_true",
+        help="exit non-zero if the on-disk file does not match (no write)",
+    )
+    profiles_cmd.set_defaults(func=_cmd_generate_rune_profiles)
 
     return parser
 

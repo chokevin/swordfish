@@ -22,9 +22,9 @@ The shape is:
 | --- | --- |
 | `infra/rune/image/Dockerfile` + `build.sh` | **Working.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI publishes to `ghcr.io/chokevin/swordfish-bench`. |
 | `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint, on-the-fly liger install self-heal. |
-| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles extending `ai-train-gpu-l`, queue=`kernel-mode-training`, image=`swordfish-bench:latest`, PVC `training-nfs` mounted at `/data` (rune storage contract). Deep-merge of `spec.resources` and `spec.runtime` from the parent now happens in rune itself, so the pack only declares deltas. |
-| `make rune-install-profiles` | **Working.** Symlinks the pack into `~/.config/rune/profiles/`. The core parents are embedded in the rune binary; no extra symlink needed. |
-| Makefile targets `rune-submit-*` | **Working invocation.** Each target sets `--output` so `rune submit get` can fetch results. |
+| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles extending `ai-train-gpu-l`, queue=`kernel-mode-training`, image=`swordfish-bench:latest`, PVC `training-nfs` mounted at `/data` (rune storage contract). Generated from `swordfish/dispatch/profiles.py` — edit the Python, then `make rune-profiles`. A sync test in `tests/test_dispatch.py` enforces the invariant. Deep-merge of `spec.resources` and `spec.runtime` from the parent now happens in rune itself, so the pack only declares deltas. |
+| `make rune-install-profiles` | **Working.** Verifies the YAML is in sync with the Python source, then symlinks the pack into `~/.config/rune/profiles/`. The core parents are embedded in the rune binary; no extra symlink needed. |
+| Makefile targets `rune-submit-*` | **Working.** Each target shells out to `python -m swordfish.runner submit-bench --workload {gemm,liger-rmsnorm,liger-swiglu} --arch {a100,h100,h200}`; the dispatch SDK builds and invokes the right `rune submit` argv. Each sets `--output` so `rune submit get` can fetch results. |
 | `rune submit --dry-run=client` GPU + DRA + PVC | **Working** — DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct, PVC mounted at `/data` with hot `/mnt` scratch added by rune. |
 | `rune submit --profile-mode ncu\|nsys` | **Working** — output lands at `/data/<job-name>/profile/profile.{ncu-rep\|nsys-rep}`; image must have `ncu` / `nsys` on PATH (the swordfish-bench image does). |
 | `rune submit --output /data/...` + `rune submit get NAME` | **Working** — annotations recorded; `rune submit get NAME --output raw` cats the file via a one-shot helper Pod. Use `--artifact NAME` for items inside a directory output. |
@@ -81,7 +81,10 @@ uses; pass `CONTAINER_CMD=docker` if you prefer.
 ## Profiles
 
 `infra/rune/profiles/swordfish-pack.yaml` defines three profiles, all of
-which extend the embedded core profile `ai-train-gpu-l`:
+which extend the embedded core profile `ai-train-gpu-l`. The pack is
+**generated from `swordfish/dispatch/profiles.py`** — edit the Python
+constants and run `make rune-profiles` to regenerate; CI fails the build
+if the two drift via `tests/test_dispatch.py::test_swordfish_pack_yaml_in_sync_with_python_source`.
 
 | Profile | Arch (intended) | Queue | Notes |
 | --- | --- | --- | --- |
@@ -122,6 +125,26 @@ rune profile doctor swordfish-bench-a100 --context voice-agent-flex-admin -n ray
 
 ## Day-to-day flows
 
+The day-to-day entrypoint is the Python dispatch SDK; it builds the right
+`rune submit` argv from typed dataclasses so callers don't have to remember
+the `--profile`/`--script`/`--output`/`--volume` shape.
+
+```bash
+# preferred: dispatch via the swordfish runner CLI (python wraps rune)
+uv run python -m swordfish.runner submit-bench \
+  --workload gemm --arch h100 --m 4096 --n 4096 --k 4096 --dtype fp16
+
+# the same workload from a Python script:
+python -c "from swordfish.dispatch import TorchGemmRun; print(TorchGemmRun(arch='h100').submit().name)"
+
+# preview the rendered Job manifest without submitting
+uv run python -m swordfish.runner submit-bench --workload gemm --arch a100 \
+  --dry-run client --print-yaml
+```
+
+If you need a one-off submission with arbitrary args, the underlying
+`rune submit` is still available:
+
 ```bash
 # preview the rendered Job manifest (no cluster contact)
 rune submit my-bench --profile swordfish-bench-a100 \
@@ -154,5 +177,6 @@ rune submit get my-bench-ncu -n ray \
 ```
 
 The Python SDK in `swordfish/dispatch/` wraps all of this: see
-`swordfish/dispatch/runs.py` (`LigerPerkernelRun`) for the typed-dataclass
-shape that compiles to the equivalent `rune submit` invocation.
+`swordfish/dispatch/runs.py` (`LigerPerkernelRun`, `TorchGemmRun`) for the
+typed-dataclass shape that compiles to the equivalent `rune submit`
+invocation, and `swordfish/dispatch/profiles.py` for the profile pack.

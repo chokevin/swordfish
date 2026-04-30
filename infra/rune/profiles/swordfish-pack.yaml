@@ -1,5 +1,8 @@
 # swordfish-pack — kernel-mode benchmark profiles
 #
+# GENERATED FROM swordfish/dispatch/profiles.py — do not edit by hand.
+# Regenerate with: make rune-profiles
+#
 # Each profile extends the embedded core profile `ai-train-gpu-l` (built into
 # the rune binary — no symlink needed). All three profiles share image, queue,
 # persistence, and DRA claim; they differ only in the arch label so dashboards
