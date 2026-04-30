@@ -7,7 +7,10 @@ needed.
 
 from __future__ import annotations
 
+import os
 import re
+import shlex
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
@@ -23,6 +26,7 @@ DEFAULT_PVC = "training-nfs"
 DEFAULT_PRESET = "azure.kernel-mode.training.l"
 DEFAULT_BENCH_SCRIPT = Path("infra/rune/scripts/swordfish-bench.sh")
 DEFAULT_RESULT_ROOT = "/data/swordfish/week1"
+IN_POD_BENCH_SCRIPT = "/work/swordfish/infra/rune/scripts/swordfish-bench.sh"
 
 ARCH_TO_PRESET = {
     "a100": "azure.kernel-mode.training.l",
@@ -32,6 +36,8 @@ ARCH_TO_PRESET = {
 
 LIGER_KERNELS = ("rmsnorm", "swiglu", "rope", "fused_linear_ce")
 LIGER_KERNELS_IMPLEMENTED = ("rmsnorm", "swiglu")
+PROFILE_MODES = ("ncu", "nsys")
+PROFILE_EXTENSIONS = {"ncu": "ncu.csv", "nsys": "nsys-rep"}
 
 _NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
@@ -75,6 +81,7 @@ class LigerPerkernelRun:
     profile: str | None = None
     extra_args: list[str] = field(default_factory=list)
     rune_bin: str = "rune"
+    profile_mode: str | None = None  # ncu | nsys | None
 
     def __post_init__(self) -> None:
         if self.kernel not in LIGER_KERNELS:
@@ -88,6 +95,8 @@ class LigerPerkernelRun:
             )
         if self.preset and self.profile:
             raise ValueError("preset and profile are mutually exclusive")
+        if self.profile_mode and self.profile_mode not in PROFILE_MODES:
+            raise ValueError(f"profile_mode {self.profile_mode!r} not in {PROFILE_MODES}")
 
     @property
     def resolved_name(self) -> str:
@@ -102,6 +111,13 @@ class LigerPerkernelRun:
     @property
     def out_path(self) -> str:
         return f"{self.result_root}/liger-perkernel/{self.kernel}-{self.arch}.json"
+
+    @property
+    def profile_out_path(self) -> str | None:
+        if not self.profile_mode:
+            return None
+        ext = PROFILE_EXTENSIONS[self.profile_mode]
+        return f"{self.result_root}/liger-perkernel/{self.kernel}-{self.arch}.{ext}"
 
     @property
     def forwarded_args(self) -> list[str]:
@@ -133,11 +149,44 @@ class LigerPerkernelRun:
             self.out_path,
         ]
 
+    def _render_profile_wrapper(self) -> Path:
+        """Generate a tempfile bash wrapper that exports SWORDFISH_PROFILE then
+        execs the in-pod bench script. Used when profile_mode is set so the
+        bench script wraps the python invocation in ncu/nsys."""
+        assert self.profile_mode is not None
+        out_path = self.profile_out_path or ""
+        contents = (
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            f"export SWORDFISH_PROFILE={shlex.quote(self.profile_mode)}\n"
+            f"export SWORDFISH_PROFILE_OUT={shlex.quote(out_path)}\n"
+            f'exec bash {shlex.quote(IN_POD_BENCH_SCRIPT)} "$@"\n'
+        )
+        fd, tmp_path = tempfile.mkstemp(prefix=f"sf-rune-{self.profile_mode}-", suffix=".sh")
+        with os.fdopen(fd, "w") as f:
+            f.write(contents)
+        os.chmod(tmp_path, 0o755)
+        return Path(tmp_path)
+
     def to_rune_submit(self) -> RuneSubmit:
+        # When profile_mode is set, the only supported flow is the bash
+        # entrypoint (because the wrapper execs into the in-pod bench
+        # script). Custom Python scripts under profile mode are out of scope
+        # for now — the user can do their own ncu/nsys wrapping inside.
+        if self.profile_mode is not None:
+            if Path(self.script).resolve() != Path(DEFAULT_BENCH_SCRIPT).resolve():
+                raise ValueError(
+                    "profile_mode is only supported with the default bench "
+                    "script; for custom scripts, wrap the python call yourself"
+                )
+            script_path: str | Path = self._render_profile_wrapper()
+        else:
+            script_path = self.script
+
         kwargs: dict = dict(
             name=self.resolved_name,
             image=self.image,
-            script=self.script,
+            script=script_path,
             namespace=self.namespace,
             context=self.context,
             volumes=[f"data=pvc:{self.pvc}"],
@@ -191,12 +240,17 @@ class LigerPerkernelRun:
         pod: str | None = None,
         pod_label_selector: str | None = None,
         kubectl_bin: str = "kubectl",
+        include_traces: bool = False,
     ) -> FetchedResult:
         """Copy this run's result JSON back from the cluster PVC.
 
         Uses kubectl cp via the benchmark pod (if still around) or any pod
         with the training-nfs PVC mounted. Best-effort convenience until
         swordfish promotes to a level-2 managed eval.
+
+        With include_traces=True, also fetches the profiler artifact
+        (`.ncu.csv` for profile_mode='ncu', `.nsys-rep` for 'nsys') next to
+        the result JSON.
         """
         from swordfish.dispatch.results import fetch_result as _fetch
 
@@ -205,7 +259,7 @@ class LigerPerkernelRun:
             if local_path
             else Path("runs/airun/week1") / Path(self.out_path).relative_to("/data/swordfish/week1")
         )
-        return _fetch(
+        result = _fetch(
             job_name=self.resolved_name,
             remote_path=self.out_path,
             local_path=target,
@@ -215,6 +269,29 @@ class LigerPerkernelRun:
             pod_label_selector=pod_label_selector,
             kubectl_bin=kubectl_bin,
         )
+
+        if include_traces and self.profile_mode and self.profile_out_path:
+            trace_local = target.with_suffix("." + PROFILE_EXTENSIONS[self.profile_mode])
+            try:
+                _fetch(
+                    job_name=self.resolved_name,
+                    remote_path=self.profile_out_path,
+                    local_path=trace_local,
+                    namespace=self.namespace,
+                    context=self.context,
+                    pod=pod or result.pod,
+                    pod_label_selector=pod_label_selector,
+                    kubectl_bin=kubectl_bin,
+                )
+            except Exception as e:  # noqa: BLE001
+                import sys
+
+                print(
+                    f"warning: trace fetch failed ({self.profile_mode} -> {trace_local}): {e}",
+                    file=sys.stderr,
+                )
+
+        return result
 
 
 @dataclass

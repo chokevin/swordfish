@@ -16,10 +16,16 @@
 # preflight. The optional /data volume (training-nfs) is for result JSONs.
 #
 # Profile-supplied environment variables consumed here:
-#   RUNE_DATA_DIR   — V1 storage contract; durable mount (default /data).
-#                      Result JSONs land under $RUNE_DATA_DIR/swordfish/...
+#   RUNE_DATA_DIR        — V1 storage contract; durable mount (default /data).
+#                           Result JSONs land under $RUNE_DATA_DIR/swordfish/...
 #   SWORDFISH_ARCH_LABEL — a100/h100/h200, used as the default --arch-label
-#                      when the caller does not pass one.
+#                           when the caller does not pass one.
+#   SWORDFISH_PROFILE    — when set, wraps the python invocation in a
+#                           profiler. Values: ncu | nsys | none (default).
+#   SWORDFISH_PROFILE_OUT — explicit path for profile output. When unset the
+#                           script derives it from the --out flag in $@:
+#                             ncu  -> ${out_json%.json}.ncu.csv
+#                             nsys -> ${out_json%.json}.nsys-rep
 #
 # Usage (forwarded by rune):
 #   bash infra/rune/scripts/swordfish-bench.sh \
@@ -32,6 +38,7 @@ set -euo pipefail
 
 DATA_DIR="${RUNE_DATA_DIR:-/data}"
 ARCH_LABEL="${SWORDFISH_ARCH_LABEL:-}"
+PROFILE="${SWORDFISH_PROFILE:-none}"
 
 # The image has source baked at /work/swordfish. Cd there so relative result
 # paths and `git`-style commands (rare) work as expected.
@@ -44,6 +51,7 @@ echo "host:        $(hostname)"
 echo "swordfish:   ${SWORDFISH_SHA:-unknown} (baked into image)"
 echo "data_dir:    ${DATA_DIR}"
 echo "arch_label:  ${ARCH_LABEL:-<unset>}"
+echo "profile:     ${PROFILE}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   echo "gpu:         $(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)"
 fi
@@ -62,4 +70,74 @@ if [[ -n "$ARCH_LABEL" ]]; then
   fi
 fi
 
-exec python -m swordfish.runner "$@" "${inject_arch[@]}"
+PYTHON_CMD=(python -m swordfish.runner "$@" "${inject_arch[@]}")
+
+# Derive a default profile output path from the --out flag the caller passed
+# to swordfish.runner. The profile output sits next to the result JSON so
+# fetch_result(include_traces=True) can grab both with one path stem.
+derive_profile_out() {
+  local extension="$1"
+  local out_json=""
+  local prev=""
+  for a in "$@"; do
+    if [[ "$prev" == "--out" ]]; then
+      out_json="$a"
+      break
+    fi
+    if [[ "$a" == --out=* ]]; then
+      out_json="${a#--out=}"
+      break
+    fi
+    prev="$a"
+  done
+  if [[ -z "$out_json" ]]; then
+    echo "${DATA_DIR}/swordfish/profile.${extension}"
+  else
+    echo "${out_json%.json}.${extension}"
+  fi
+}
+
+case "$PROFILE" in
+  none|"")
+    exec "${PYTHON_CMD[@]}"
+    ;;
+  ncu)
+    if ! command -v ncu >/dev/null 2>&1; then
+      echo "SWORDFISH_PROFILE=ncu but ncu is not on PATH" >&2
+      exit 3
+    fi
+    out="${SWORDFISH_PROFILE_OUT:-$(derive_profile_out csv "$@")}"
+    out="${out%.ncu.csv}.ncu.csv"
+    mkdir -p "$(dirname "$out")"
+    echo "wrapping in ncu -> $out"
+    exec ncu \
+        --csv \
+        --log-file "$out" \
+        --target-processes all \
+        --section LaunchStats \
+        --section Occupancy \
+        --section SpeedOfLight \
+        --section MemoryWorkloadAnalysis \
+        "${PYTHON_CMD[@]}"
+    ;;
+  nsys)
+    if ! command -v nsys >/dev/null 2>&1; then
+      echo "SWORDFISH_PROFILE=nsys but nsys is not on PATH" >&2
+      exit 3
+    fi
+    out="${SWORDFISH_PROFILE_OUT:-$(derive_profile_out nsys-rep "$@")}"
+    out="${out%.nsys-rep}"
+    mkdir -p "$(dirname "$out")"
+    echo "wrapping in nsys -> ${out}.nsys-rep"
+    exec nsys profile \
+        --output "$out" \
+        --trace cuda,nvtx,osrt \
+        --stats true \
+        --force-overwrite true \
+        "${PYTHON_CMD[@]}"
+    ;;
+  *)
+    echo "unknown SWORDFISH_PROFILE=${PROFILE}; expected one of: none, ncu, nsys" >&2
+    exit 3
+    ;;
+esac

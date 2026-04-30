@@ -162,3 +162,44 @@ def test_liger_perkernel_run_name_too_long_rejected():
     run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", name="x" * 60)
     with pytest.raises(ValueError, match="too long"):
         run.resolved_name
+
+
+def test_liger_perkernel_run_profile_mode_ncu_renders_wrapper():
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="ncu")
+    submit = run.to_rune_submit()
+    # The script field now points to a tempfile wrapper, not the default
+    # bench script. The tempfile contents export SWORDFISH_PROFILE.
+    from pathlib import Path
+
+    wrapper_path = Path(str(submit.script))
+    contents = wrapper_path.read_text()
+    assert "SWORDFISH_PROFILE=ncu" in contents
+    assert "/work/swordfish/infra/rune/scripts/swordfish-bench.sh" in contents
+
+
+def test_liger_perkernel_run_profile_mode_nsys_path():
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="h200", profile_mode="nsys")
+    assert run.profile_out_path == "/data/swordfish/week1/liger-perkernel/rmsnorm-h200.nsys-rep"
+
+
+def test_liger_perkernel_run_profile_mode_rejects_unknown():
+    with pytest.raises(ValueError, match="profile_mode"):
+        LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="vtune")
+
+
+def test_liger_perkernel_run_profile_mode_rejects_custom_script():
+    with pytest.raises(ValueError, match="default bench script"):
+        run = LigerPerkernelRun(
+            kernel="rmsnorm",
+            arch="a100",
+            profile_mode="ncu",
+            script="experiments/custom.py",
+        )
+        run.to_rune_submit()
+
+
+def test_liger_perkernel_run_no_profile_mode_no_wrapper():
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
+    submit = run.to_rune_submit()
+    assert "infra/rune/scripts/swordfish-bench.sh" in str(submit.script)
+    assert run.profile_out_path is None
