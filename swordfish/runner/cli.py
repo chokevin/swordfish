@@ -4,16 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
 from pathlib import Path
 
 from swordfish.quant.marlin_triton import run_w4a16_benchmark, write_w4a16_result
-from swordfish.runner.airun import (
-    load_airun_gemm_config,
-    write_airun_gemm_manifests,
-    write_airun_preflight_script,
-)
 from swordfish.runner.backends import available_gemm_backends
 from swordfish.runner.compare import write_results_comparison
 from swordfish.runner.index import write_result_index
@@ -35,8 +29,6 @@ from swordfish.transformer.bench import (
     run_transformer_forward_benchmark,
     run_transformer_train_step_benchmark,
 )
-
-KUBECTL_TIMEOUT_SECONDS = 120
 
 
 def _cmd_run_gemm(args: argparse.Namespace) -> int:
@@ -243,48 +235,6 @@ def _cmd_render_completion_report(args: argparse.Namespace) -> int:
     )
     print(f"wrote {path}", file=sys.stderr)
     return 1 if args.fail_on_incomplete and errors else 0
-
-
-def _cmd_render_airun_gemm(args: argparse.Namespace) -> int:
-    config = load_airun_gemm_config(args.config)
-    paths = write_airun_gemm_manifests(
-        config,
-        args.manifest_dir,
-        arch_labels=args.arch_labels,
-    )
-    for path in paths:
-        print(f"wrote {path}", file=sys.stderr)
-    if args.apply or args.dry_run_client:
-        context = args.context or config.kubectl_context
-        cmd = ["kubectl"]
-        if context:
-            cmd.extend(["--context", context])
-        cmd.append("apply")
-        if args.dry_run_client:
-            cmd.extend(["--dry-run=client", "--validate=false"])
-        for path in paths:
-            cmd.extend(["-f", str(path)])
-        subprocess.run(cmd, check=True, timeout=KUBECTL_TIMEOUT_SECONDS)
-    return 0
-
-
-def _cmd_render_airun_preflight(args: argparse.Namespace) -> int:
-    config = load_airun_gemm_config(args.config)
-    path = write_airun_preflight_script(
-        config,
-        arch_label=args.arch_label,
-        out_path=args.out,
-        blocker_pod=args.blocker_pod,
-    )
-    print(f"wrote {path}", file=sys.stderr)
-    if args.run:
-        completed = subprocess.run(
-            ["bash", str(path)],
-            check=False,
-            timeout=KUBECTL_TIMEOUT_SECONDS,
-        )
-        return int(completed.returncode)
-    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -504,45 +454,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     completion.add_argument("--out", type=Path, required=True)
     completion.set_defaults(func=_cmd_render_completion_report)
-
-    render = sub.add_parser(
-        "render-airun-gemm",
-        help="render or apply one Kueue Job manifest per A100/H100/H200 GEMM run",
-    )
-    render.add_argument("--config", type=Path, required=True)
-    render.add_argument("--manifest-dir", type=Path, required=True)
-    render.add_argument(
-        "--arch-labels",
-        nargs="+",
-        choices=list(DEFAULT_ARCH_LABELS),
-        default=None,
-        help="render/apply only these architecture jobs; defaults to every arch in the config",
-    )
-    render.add_argument(
-        "--context", default=None, help="kubectl context for --apply/--dry-run-client"
-    )
-    render.add_argument("--apply", action="store_true", help="run kubectl apply after rendering")
-    render.add_argument(
-        "--dry-run-client",
-        action="store_true",
-        help="run kubectl apply --dry-run=client --validate=false after rendering",
-    )
-    render.set_defaults(func=_cmd_render_airun_gemm)
-
-    preflight = sub.add_parser(
-        "render-airun-preflight",
-        help="render a fail-fast kubectl preflight script for one airun GPU route",
-    )
-    preflight.add_argument("--config", type=Path, required=True)
-    preflight.add_argument("--arch-label", choices=list(DEFAULT_ARCH_LABELS), required=True)
-    preflight.add_argument("--out", type=Path, required=True)
-    preflight.add_argument(
-        "--blocker-pod",
-        default=None,
-        help="optional known pod name that must not exist before submitting",
-    )
-    preflight.add_argument("--run", action="store_true", help="run the rendered script with bash")
-    preflight.set_defaults(func=_cmd_render_airun_preflight)
 
     return parser
 

@@ -1,20 +1,18 @@
 # swordfish-pack — kernel-mode benchmark profiles
 #
-# Tenant overlay on top of airun core. Each profile extends ai-train-gpu-l
-# (now embedded in the rune binary — no symlink needed). All three profiles
-# share image, queue, persistence, and DRA claim; they differ only in the
-# arch label so dashboards / `rune profile list` can tell them apart.
+# Each profile extends the embedded core profile `ai-train-gpu-l` (built into
+# the rune binary — no symlink needed). All three profiles share image, queue,
+# persistence, and DRA claim; they differ only in the arch label so dashboards
+# and `rune profile list` can tell them apart.
 #
 # rune resolves spec.extends with deep-merge of spec.resources and spec.runtime
 # (see applications/rune/internal/profile/loader.go), so we only need to declare
 # the deltas. The parent ai-train-gpu-l supplies gpu/dra/requests defaults.
 #
-# A100 + Nsight Compute caveat: the canonical airun core profiles do not
-# expose container SYS_ADMIN through the Profile spec, which Nsight Compute
-# requires on A100 to read GPU performance counters. For A100 NCU runs,
-# fall back to `make airun-apply` (which renders a raw Kueue Job and adds
-# the cap explicitly via airun-gemm.voice-agent-flex.json). H100 NVL and
-# H200 NCU work with no extra privileges and run fine through rune.
+# A100 + Nsight Compute caveat: rune profiles cannot currently expose container
+# SYS_ADMIN, which Nsight Compute requires on A100 to read GPU performance
+# counters. A100 NCU is a known limitation tracked in docs/airun/a100-ncu-blocker.md;
+# H100 NVL and H200 NCU work with no extra privileges and run fine through rune.
 
 ---
 apiVersion: airun.aks.io/v1alpha1

@@ -1,4 +1,4 @@
-"""Torch/cuBLAS GEMM smoke benchmark used by the airun runner."""
+"""Torch/cuBLAS GEMM smoke benchmark."""
 
 from __future__ import annotations
 

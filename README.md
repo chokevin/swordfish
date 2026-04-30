@@ -19,7 +19,7 @@ PyTorch/Inductor, CUTLASS/CuTe, JAX/Pallas, TileLang, and pyptx.
 
 - **Monday baseline.** `torch.mm`, M=N=K=4096, fp16, 10 warmup + 50 timed iterations × 5 repeats. One full A100, one full H100 NVL, one full H200 once H200 capacity/preflight is healthy. Non-goals: no custom kernel, no tuning, no SOTA claims.
 - **Tuesday handoff.** Detailed in [`docs/notes/week1-tuesday-handoff.md`](docs/notes/week1-tuesday-handoff.md). The chosen first upstream touchpoint is Liger Kernel cross-fleet training profile (LinkedIn / Microsoft); rationale and contribution shape in [`docs/notes/liger-first-touch.md`](docs/notes/liger-first-touch.md).
-- **Wednesday measurement.** bf16 to match Liger defaults; baseline is the unmodified Hugging Face reference; rows land under `runs/airun/week1/liger-perkernel/`.
+- **Wednesday measurement.** bf16 to match Liger defaults; baseline is the unmodified Hugging Face reference; rows land under `runs/rune/week1/liger-perkernel/`.
 - **Friday artifact.** Writeup at `docs/profiling/liger-fleet-2026-w1.md`; maintainer packet via `swordfish.runner render-upstream-packet --target liger`; public artifact is a Discussion (not Issue, not PR) sharing reproducible JSON.
 
 ### Week 1 preconditions tracked separately
@@ -85,35 +85,36 @@ uv run python -m swordfish.runner run-gemm \
   --out runs/week1/torch-gemm-a100.json
 ```
 
-To render the airun/Kueue jobs, copy the source to `training-nfs`, replace the
-source/ref placeholders in `infra/airun/airun-gemm.voice-agent-flex.json`, then
-dry-run the A100/H100 path:
+To dispatch a Kueue Job through `rune` (the day-to-day path), preview the
+manifest first:
 
 ```bash
-uv run python -m swordfish.runner render-airun-gemm \
-  --config infra/airun/airun-gemm.voice-agent-flex.json \
-  --manifest-dir infra/airun/generated/week1 \
-  --arch-labels a100 h100 \
-  --dry-run-client
+make rune-install-profiles                              # one-time symlink
+
+rune submit my-bench \
+  --profile swordfish-bench-h100 \
+  --script infra/rune/scripts/swordfish-bench.sh \
+  --output /data/swordfish/week1/torch-gemm-h100.json \
+  --dry-run=client \
+  -- run-gemm --backend torch --m 4096 --n 4096 --k 4096 \
+     --dtype fp16 --device auto \
+     --out /data/swordfish/week1/torch-gemm-h100.json
 ```
 
-Submitting A100 with NCU is guarded because DCGM exporter can hold the same
-profiling resources Nsight Compute needs. `make airun-apply` now runs the A100
-NCU preflight automatically when `AIRUN_ARCH_LABELS` includes `a100`; use
-`make airun-a100-ncu-preflight` directly to confirm DCGM has been paused on the
-target A100 nodes before spending a benchmark job.
+Drop `--dry-run=client` to actually submit, then fetch the JSON back with
+`rune submit get my-bench -n ray --output raw > my-bench.json`. The Python SDK
+`swordfish.dispatch.LigerPerkernelRun` wraps the same flow as a typed dataclass.
 
-H200 remains guarded by an explicit preflight because capacity on this lane can
-come and go, and the old deletion-marked orphan pod is still documented for
-cluster-admin cleanup. Run `make airun-h200-apply` instead of calling apply
-directly; it runs the H200 preflight first and submits only if that preflight
-exits 0.
+A100 + Nsight Compute is a known limitation: rune profiles can't currently
+expose container `SYS_ADMIN`, which NCU needs to read A100 perf counters. The
+fix lives in rune (let profiles request `securityContext.capabilities.add:
+SYS_ADMIN` under a kueue-gated allowlist). H100 NVL and H200 NCU run cleanly.
 
 After all three jobs have produced final JSON files, use the strict completion
 gate:
 
 ```bash
-make airun-validate-results
+make validate-results
 ```
 
 It fails until A100, H100, and H200 each have a schema-valid `torch-gemm-*.json`
@@ -128,7 +129,8 @@ final JSON.
 swordfish/
 ├── swordfish/runner/        # GEMM smoke runner and result schema
 ├── swordfish/transformer/   # PyTorch GPT-style reference model and benchmark
-├── infra/airun/             # airun run notes and overlays
+├── swordfish/dispatch/      # Python SDK wrapping `rune submit`
+├── infra/rune/              # rune profiles, image, and in-pod bench script
 ├── docs/dashboard/          # 35-week roadmap dashboard
 ├── docs/research/           # research notes for upstream contribution lanes
 └── tests/                   # local schema/CLI tests

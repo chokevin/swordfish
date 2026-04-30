@@ -268,7 +268,7 @@ class LigerPerkernelRun:
         target = (
             Path(local_path)
             if local_path
-            else Path("runs/airun/week1") / Path(self.out_path).relative_to("/data/swordfish/week1")
+            else Path("runs/rune/week1") / Path(self.out_path).relative_to("/data/swordfish/week1")
         )
         target.parent.mkdir(parents=True, exist_ok=True)
 
