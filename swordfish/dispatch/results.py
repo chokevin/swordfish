@@ -1,22 +1,19 @@
-"""Result-fetch helper for level-1 (submit-only) swordfish runs.
+"""Result-fetch helpers for level-1 (submit-only) swordfish runs.
 
-V0/V1 rune does not have `rune submit get` to read back result JSONs the way
-`rune eval get` does for level-2 managed evals. Until swordfish promotes to
-level-2 (a swordfish-bench harness with `rune eval --harness ...`), the
-result JSON sits on the training-nfs PVC at the path the in-pod entrypoint
-wrote it to.
+Two paths exist:
 
-This helper grabs it back via `kubectl cp` from any pod that has the PVC
-mounted. Strategy:
+1. **`fetch_via_rune_submit_get`** (preferred): shells out to
+   `rune submit get NAME --output raw` which uses the `airun.aks.io/result-{path,pvc}`
+   annotations recorded by `rune submit --output PATH` and pulls the file via a
+   one-shot helper Pod. Binary-safe (returns `bytes`).
+2. **`fetch_result`** (legacy / overrides): shells out to `kubectl cp` from the
+   benchmark pod or any pod with the PVC mounted. Used for jobs submitted
+   without `--output`, or when the caller wants a specific pod (debugging).
 
-1. Look for the actual benchmark pod (still around if --grace-period is
-   long enough or the Job hasn't been GC'd).
-2. Otherwise, look for any "shell" or "helper" pod in the namespace with the
-   same PVC mounted.
-3. Otherwise, instruct the user to start one via `rune shell --pvc ...`.
-
-The function is a best-effort convenience. For audited result transfer,
-promote to level-2 and use `rune eval get`.
+The `LigerPerkernelRun.fetch_result` helper prefers (1) and only falls back to
+(2) when annotations are missing on the Job (legacy case) or the caller passes
+explicit `pod=` / `pod_label_selector=`. All other errors propagate so callers
+notice them.
 """
 
 from __future__ import annotations
@@ -32,6 +29,15 @@ class ResultFetchError(RuntimeError):
     pass
 
 
+class RuneSubmitGetMissingAnnotationsError(ResultFetchError):
+    """Raised when `rune submit get` reports the Job has no result-path annotation.
+
+    Callers can catch this specifically to fall back to legacy kubectl-cp.
+    All other failures (auth, missing artifact, helper-pod failure) raise the
+    base `ResultFetchError` and should propagate.
+    """
+
+
 @dataclass(frozen=True)
 class FetchedResult:
     name: str
@@ -42,6 +48,63 @@ class FetchedResult:
     @property
     def parsed(self) -> dict:
         return json.loads(self.local_path.read_text())
+
+
+def fetch_via_rune_submit_get(
+    *,
+    name: str,
+    namespace: str = "ray",
+    context: str | None = None,
+    path: str | None = None,
+    pvc: str | None = None,
+    artifact: str | None = None,
+    rune_bin: str = "rune",
+) -> bytes:
+    """Pull a result file from the cluster via `rune submit get NAME -o raw`.
+
+    Returns the raw bytes verbatim. Caller decides whether to decode (for JSON)
+    or write to disk (for `.ncu-rep` / `.nsys-rep` binary traces).
+
+    Override semantics (see ai2/applications/rune/internal/cli/submit_get.go):
+    - If neither `path` nor `pvc` is set, rune reads the recorded
+      `airun.aks.io/result-path` and `airun.aks.io/result-pvc` annotations.
+    - If `path` is set, it overrides the recorded path. PVC must come from
+      either `pvc=` or the recorded annotation.
+    - `artifact` is appended to the path (must be a directory). For example,
+      a profile-mode trace lives at `/data/<name>/profile/profile.<ext>`,
+      so pass `path=/data/<name>/profile`, `artifact=profile.<ext>`.
+
+    Raises `RuneSubmitGetMissingAnnotationsError` if rune reports the Job has
+    no recorded path (subclass of `ResultFetchError`); raises `ResultFetchError`
+    for everything else.
+    """
+    if shutil.which(rune_bin) is None:
+        raise ResultFetchError(f"{rune_bin} not on PATH; install rune or pass rune_bin=")
+
+    args: list[str] = [rune_bin, "submit", "get", name, "-n", namespace, "--output", "raw"]
+    if context:
+        args += ["--context", context]
+    if path:
+        args += ["--path", path]
+    if pvc:
+        args += ["--pvc", pvc]
+    if artifact:
+        args += ["--artifact", artifact]
+
+    proc = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        # Decode stderr for inspection (rune prints English errors there).
+        stderr = proc.stderr.decode("utf-8", errors="replace")
+        # Rune writes "has no airun.aks.io/result-path" when the Job's
+        # annotations are missing — see internal/cli/submit_get.go:resolveTarget.
+        if "has no airun.aks.io/result-path" in stderr:
+            raise RuneSubmitGetMissingAnnotationsError(
+                f"job {name!r} has no airun.aks.io/result-path annotation; "
+                "resubmit with `--output PATH` or pass --path/--pvc explicitly. "
+                f"rune stderr: {stderr.strip()}"
+            )
+        raise ResultFetchError(f"rune submit get failed ({proc.returncode}): {stderr.strip()}")
+    return proc.stdout
 
 
 def fetch_result(
@@ -56,6 +119,9 @@ def fetch_result(
     kubectl_bin: str = "kubectl",
 ) -> FetchedResult:
     """Copy a result JSON from a cluster PVC back to the local filesystem.
+
+    Legacy / explicit-pod path. Prefer `fetch_via_rune_submit_get` for jobs
+    submitted with `rune submit --output PATH`.
 
     Args:
         job_name: rune job name (used as a label fallback to find the pod).

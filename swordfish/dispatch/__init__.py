@@ -22,7 +22,9 @@ from swordfish.dispatch.image import (
 from swordfish.dispatch.results import (
     FetchedResult,
     ResultFetchError,
+    RuneSubmitGetMissingAnnotationsError,
     fetch_result,
+    fetch_via_rune_submit_get,
 )
 from swordfish.dispatch.rune import (
     RuneCommandError,
@@ -54,9 +56,11 @@ __all__ = [
     "ResultFetchError",
     "RuneCommandError",
     "RuneSubmit",
+    "RuneSubmitGetMissingAnnotationsError",
     "RuneSubmitResult",
     "build_and_push_dev_image",
     "fetch_result",
+    "fetch_via_rune_submit_get",
     "find_topology_policy",
     "topology_policy_env",
 ]

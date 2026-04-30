@@ -57,7 +57,14 @@ class RuneSubmit:
     after_success: str | None = None
     extra_args: list[str] = field(default_factory=list)
     forwarded_args: list[str] = field(default_factory=list)
+    # `env` is the *subprocess* environment for the local `rune` invocation.
+    # `container_env` is rendered as repeated `--env KEY=VAL` and ends up on
+    # the workload pod. The two are deliberately separate so passing
+    # KUBECONFIG locally doesn't accidentally leak into the cluster job.
     env: dict[str, str] = field(default_factory=dict)
+    container_env: dict[str, str] = field(default_factory=dict)
+    profile_mode: str | None = None  # ncu | nsys | None
+    output: str | None = None
     rune_bin: str = "rune"
 
     def __post_init__(self) -> None:
@@ -69,6 +76,16 @@ class RuneSubmit:
             raise ValueError("preset and profile are mutually exclusive")
         if self.script is None:
             raise ValueError("script is required for level-1 submits")
+        if self.profile_mode is not None and self.profile_mode not in ("ncu", "nsys"):
+            raise ValueError(
+                f"profile_mode must be one of ncu|nsys|None; got {self.profile_mode!r}"
+            )
+        for k in self.container_env:
+            if k.startswith("RUNE_") or k.startswith("AIRUN_"):
+                raise ValueError(
+                    f"container_env key {k!r} uses reserved RUNE_/AIRUN_ namespace; "
+                    "rune rejects these on the wire — pick a different name"
+                )
 
     def to_args(self, *, dry_run: str | None = None) -> list[str]:
         """Render the equivalent rune submit argv (without env)."""
@@ -85,6 +102,14 @@ class RuneSubmit:
             args += ["--volume", v]
         for m in self.mounts:
             args += ["--mount", m]
+        # Sort container_env for deterministic argv (test stability and
+        # easier diffing of recorded commands).
+        for k in sorted(self.container_env):
+            args += ["--env", f"{k}={self.container_env[k]}"]
+        if self.profile_mode:
+            args += ["--profile-mode", self.profile_mode]
+        if self.output:
+            args += ["--output", self.output]
         if self.after_success:
             args += ["--after-success", self.after_success]
         if self.context:

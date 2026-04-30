@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from swordfish.dispatch import (
@@ -10,6 +12,8 @@ from swordfish.dispatch import (
     LigerPerkernelMatrix,
     LigerPerkernelRun,
     RuneSubmit,
+    RuneSubmitGetMissingAnnotationsError,
+    fetch_via_rune_submit_get,
 )
 
 
@@ -65,6 +69,45 @@ def test_rune_submit_to_command_is_shell_safe():
     cmd = submit.to_command()
     # spaces in path are quoted
     assert "'run.sh with spaces.sh'" in cmd
+
+
+def test_rune_submit_renders_profile_mode_flag():
+    submit = RuneSubmit(name="j", preset="p", script="s.sh", profile_mode="ncu")
+    args = submit.to_args()
+    assert "--profile-mode" in args
+    assert args[args.index("--profile-mode") + 1] == "ncu"
+
+
+def test_rune_submit_renders_output_flag():
+    submit = RuneSubmit(name="j", preset="p", script="s.sh", output="/data/foo/out.json")
+    args = submit.to_args()
+    assert "--output" in args
+    assert args[args.index("--output") + 1] == "/data/foo/out.json"
+
+
+def test_rune_submit_renders_container_env_flags_alphabetized():
+    submit = RuneSubmit(
+        name="j",
+        preset="p",
+        script="s.sh",
+        container_env={"FOO": "1", "BAR": "two", "ZED": "3"},
+    )
+    args = submit.to_args()
+    # alphabetized: BAR, FOO, ZED — three pairs of --env flags in that order
+    env_pairs = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
+    assert env_pairs == ["BAR=two", "FOO=1", "ZED=3"]
+
+
+def test_rune_submit_rejects_reserved_container_env_keys():
+    with pytest.raises(ValueError, match="reserved"):
+        RuneSubmit(name="j", preset="p", script="s.sh", container_env={"RUNE_FOO": "x"})
+    with pytest.raises(ValueError, match="reserved"):
+        RuneSubmit(name="j", preset="p", script="s.sh", container_env={"AIRUN_BAR": "x"})
+
+
+def test_rune_submit_rejects_unknown_profile_mode():
+    with pytest.raises(ValueError, match="profile_mode"):
+        RuneSubmit(name="j", preset="p", script="s.sh", profile_mode="vtune")
 
 
 def test_liger_perkernel_run_defaults_to_kernel_mode_preset():
@@ -128,6 +171,17 @@ def test_liger_perkernel_run_to_command_renders_full_invocation():
     assert "/data/swordfish/week1/liger-perkernel/rmsnorm-a100.json" in cmd
 
 
+def test_liger_perkernel_run_renders_native_output_flag():
+    """The --output flag should be present so `rune submit get` can fetch results."""
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
+    args = run.to_rune_submit().to_args()
+    assert "--output" in args
+    assert (
+        args[args.index("--output") + 1]
+        == "/data/swordfish/week1/liger-perkernel/rmsnorm-a100.json"
+    )
+
+
 def test_liger_perkernel_run_profile_path_disables_preset():
     run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile="swordfish-bench-a100")
     submit = run.to_rune_submit()
@@ -164,22 +218,29 @@ def test_liger_perkernel_run_name_too_long_rejected():
         run.resolved_name
 
 
-def test_liger_perkernel_run_profile_mode_ncu_renders_wrapper():
+def test_liger_perkernel_run_profile_mode_passes_through_native_flag():
+    """profile_mode must render as the native --profile-mode CLI flag."""
     run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="ncu")
-    submit = run.to_rune_submit()
-    # The script field now points to a tempfile wrapper, not the default
-    # bench script. The tempfile contents export SWORDFISH_PROFILE.
-    from pathlib import Path
-
-    wrapper_path = Path(str(submit.script))
-    contents = wrapper_path.read_text()
-    assert "SWORDFISH_PROFILE=ncu" in contents
-    assert "/work/swordfish/infra/rune/scripts/swordfish-bench.sh" in contents
+    args = run.to_rune_submit().to_args()
+    assert "--profile-mode" in args
+    assert args[args.index("--profile-mode") + 1] == "ncu"
+    # script should NOT be a tempfile wrapper anymore — it's the bench script verbatim
+    script_idx = args.index("--script") + 1
+    assert "swordfish-bench.sh" in args[script_idx]
 
 
-def test_liger_perkernel_run_profile_mode_nsys_path():
+def test_liger_perkernel_run_profile_mode_nsys_path_uses_rune_hardcoded_dir():
+    """Rune's renderer hardcodes /data/<job-name>/profile/profile.<ext>."""
     run = LigerPerkernelRun(kernel="rmsnorm", arch="h200", profile_mode="nsys")
-    assert run.profile_out_path == "/data/swordfish/week1/liger-perkernel/rmsnorm-h200.nsys-rep"
+    assert run.profile_out_dir == "/data/sf-liger-rmsnorm-h200/profile"
+    assert run.profile_out_path == "/data/sf-liger-rmsnorm-h200/profile/profile.nsys-rep"
+    assert run.profile_out_artifact == "profile.nsys-rep"
+
+
+def test_liger_perkernel_run_profile_mode_ncu_uses_ncu_rep_extension():
+    """Native rune --profile-mode=ncu writes binary .ncu-rep, not the legacy .ncu.csv."""
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="ncu")
+    assert run.profile_out_path == "/data/sf-liger-rmsnorm-a100/profile/profile.ncu-rep"
 
 
 def test_liger_perkernel_run_profile_mode_rejects_unknown():
@@ -187,15 +248,17 @@ def test_liger_perkernel_run_profile_mode_rejects_unknown():
         LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="vtune")
 
 
-def test_liger_perkernel_run_profile_mode_rejects_custom_script():
-    with pytest.raises(ValueError, match="default bench script"):
-        run = LigerPerkernelRun(
-            kernel="rmsnorm",
-            arch="a100",
-            profile_mode="ncu",
-            script="experiments/custom.py",
-        )
-        run.to_rune_submit()
+def test_liger_perkernel_run_profile_mode_allows_custom_script():
+    """The 'profile_mode only with default bench script' restriction is gone:
+    rune wraps any cmd at the renderer level, so custom scripts work."""
+    run = LigerPerkernelRun(
+        kernel="rmsnorm",
+        arch="a100",
+        profile_mode="ncu",
+        script="experiments/custom.py",
+    )
+    submit = run.to_rune_submit()
+    assert "experiments/custom.py" in str(submit.script)
 
 
 def test_liger_perkernel_run_no_profile_mode_no_wrapper():
@@ -203,3 +266,253 @@ def test_liger_perkernel_run_no_profile_mode_no_wrapper():
     submit = run.to_rune_submit()
     assert "infra/rune/scripts/swordfish-bench.sh" in str(submit.script)
     assert run.profile_out_path is None
+    assert run.profile_out_dir is None
+
+
+# --- retrieval semantics ---
+
+
+def _mock_subprocess_run(stdout: bytes, returncode: int = 0, stderr: bytes = b""):
+    """Build a CompletedProcess-like return value for subprocess.run mocks."""
+
+    class P:
+        pass
+
+    p = P()
+    p.returncode = returncode
+    p.stdout = stdout
+    p.stderr = stderr
+    return p
+
+
+def test_fetch_via_rune_submit_get_returns_bytes_unchanged(monkeypatch):
+    """Binary roundtrip: NULs and 0xFF must survive verbatim."""
+    raw = b"\x00\xff\x01\x02NCUREP\x7f\x80\xfe\xff" * 16
+
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return _mock_subprocess_run(stdout=raw)
+
+    monkeypatch.setattr("swordfish.dispatch.results.subprocess.run", fake_run)
+    monkeypatch.setattr("swordfish.dispatch.results.shutil.which", lambda _: "/usr/local/bin/rune")
+
+    out = fetch_via_rune_submit_get(name="j1")
+    assert out == raw
+    # text=True must NOT be passed (would corrupt binary)
+    assert "text" not in captured["kwargs"] or captured["kwargs"]["text"] is False
+
+
+def test_fetch_via_rune_submit_get_passes_path_pvc_artifact_overrides(monkeypatch):
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        return _mock_subprocess_run(stdout=b"ok")
+
+    monkeypatch.setattr("swordfish.dispatch.results.subprocess.run", fake_run)
+    monkeypatch.setattr("swordfish.dispatch.results.shutil.which", lambda _: "/usr/local/bin/rune")
+
+    fetch_via_rune_submit_get(
+        name="j1",
+        path="/data/j1/profile",
+        pvc="training-nfs",
+        artifact="profile.ncu-rep",
+        context="ctx",
+    )
+    args = captured["args"]
+    assert "--path" in args and args[args.index("--path") + 1] == "/data/j1/profile"
+    assert "--pvc" in args and args[args.index("--pvc") + 1] == "training-nfs"
+    assert "--artifact" in args and args[args.index("--artifact") + 1] == "profile.ncu-rep"
+    assert "--context" in args and args[args.index("--context") + 1] == "ctx"
+    assert "--output" in args and args[args.index("--output") + 1] == "raw"
+
+
+def test_fetch_via_rune_submit_get_raises_typed_error_on_missing_annotations(monkeypatch):
+    monkeypatch.setattr(
+        "swordfish.dispatch.results.subprocess.run",
+        lambda *a, **kw: _mock_subprocess_run(
+            stdout=b"",
+            returncode=1,
+            stderr=b"job ray/legacy-job has no airun.aks.io/result-path; resubmit with --output, or pass --path",
+        ),
+    )
+    monkeypatch.setattr("swordfish.dispatch.results.shutil.which", lambda _: "/usr/local/bin/rune")
+
+    with pytest.raises(RuneSubmitGetMissingAnnotationsError):
+        fetch_via_rune_submit_get(name="legacy-job")
+
+
+def test_fetch_via_rune_submit_get_other_errors_raise_base_class(monkeypatch):
+    """Auth/missing-job/etc. errors must NOT be confused with missing-annotations."""
+    from swordfish.dispatch import ResultFetchError
+
+    monkeypatch.setattr(
+        "swordfish.dispatch.results.subprocess.run",
+        lambda *a, **kw: _mock_subprocess_run(
+            stdout=b"",
+            returncode=1,
+            stderr=b'Error from server (NotFound): jobs.batch "ghost" not found',
+        ),
+    )
+    monkeypatch.setattr("swordfish.dispatch.results.shutil.which", lambda _: "/usr/local/bin/rune")
+
+    with pytest.raises(ResultFetchError) as excinfo:
+        fetch_via_rune_submit_get(name="ghost")
+    # And NOT the subclass — caller should propagate, not fall back.
+    assert not isinstance(excinfo.value, RuneSubmitGetMissingAnnotationsError)
+
+
+def test_liger_perkernel_run_fetch_result_uses_rune_submit_get_by_default(monkeypatch, tmp_path):
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
+    payload = b'{"hello":"world"}'
+
+    rune_called = {"count": 0}
+
+    def fake_rune_get(*, name, **kwargs):
+        rune_called["count"] += 1
+        rune_called["kwargs"] = kwargs
+        rune_called["name"] = name
+        return payload
+
+    def fake_kubectl_cp(**kwargs):
+        raise AssertionError("kubectl-cp must not be called when rune-get succeeds")
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_result", fake_kubectl_cp)
+
+    target = tmp_path / "out.json"
+    result = run.fetch_result(local_path=target)
+    assert rune_called["count"] == 1
+    assert rune_called["name"] == run.resolved_name
+    assert target.read_bytes() == payload
+    assert result.local_path == target
+
+
+def test_liger_perkernel_run_fetch_result_falls_back_when_annotations_missing(
+    monkeypatch, tmp_path
+):
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
+
+    def fake_rune_get(**kwargs):
+        raise RuneSubmitGetMissingAnnotationsError("legacy job")
+
+    kubectl_called = {"count": 0}
+
+    def fake_kubectl_cp(**kwargs):
+        kubectl_called["count"] += 1
+        kubectl_called["kwargs"] = kwargs
+        from swordfish.dispatch.results import FetchedResult
+
+        target = Path(kwargs["local_path"])
+        target.write_bytes(b'{"legacy":1}')
+        return FetchedResult(
+            name=kwargs["job_name"],
+            pod="legacy-pod",
+            remote_path=kwargs["remote_path"],
+            local_path=target,
+        )
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_result", fake_kubectl_cp)
+
+    target = tmp_path / "legacy.json"
+    result = run.fetch_result(local_path=target)
+    assert kubectl_called["count"] == 1
+    assert result.pod == "legacy-pod"
+    assert target.read_bytes() == b'{"legacy":1}'
+
+
+def test_liger_perkernel_run_fetch_result_does_not_fall_back_on_other_errors(monkeypatch, tmp_path):
+    """Auth/missing-job errors must propagate, not silently retry kubectl-cp."""
+    from swordfish.dispatch import ResultFetchError
+
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
+
+    def fake_rune_get(**kwargs):
+        raise ResultFetchError("rune submit get failed: NotFound")
+
+    def fake_kubectl_cp(**kwargs):
+        raise AssertionError("must not fall back to kubectl-cp on non-annotation errors")
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_result", fake_kubectl_cp)
+
+    with pytest.raises(ResultFetchError, match="NotFound"):
+        run.fetch_result(local_path=tmp_path / "x.json")
+
+
+def test_liger_perkernel_run_fetch_result_explicit_pod_skips_rune(monkeypatch, tmp_path):
+    """Caller-specified pod should bypass rune-submit-get entirely."""
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100")
+
+    def fake_rune_get(**kwargs):
+        raise AssertionError("rune-submit-get must not be called when pod= is set")
+
+    kubectl_called = {"count": 0}
+
+    def fake_kubectl_cp(**kwargs):
+        kubectl_called["count"] += 1
+        kubectl_called["pod"] = kwargs.get("pod")
+        from swordfish.dispatch.results import FetchedResult
+
+        target = Path(kwargs["local_path"])
+        target.write_bytes(b"{}")
+        return FetchedResult(
+            name=kwargs["job_name"],
+            pod=kwargs.get("pod") or "auto-pod",
+            remote_path=kwargs["remote_path"],
+            local_path=target,
+        )
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_result", fake_kubectl_cp)
+
+    run.fetch_result(local_path=tmp_path / "x.json", pod="my-debug-pod")
+    assert kubectl_called["count"] == 1
+    assert kubectl_called["pod"] == "my-debug-pod"
+
+
+def test_liger_perkernel_run_fetch_result_traces_use_explicit_path_pvc_artifact(
+    monkeypatch, tmp_path
+):
+    """Trace fetch must use --path/--pvc/--artifact overrides because the
+    profile artifact lives at /data/<name>/profile/, NOT at result-path."""
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="ncu")
+
+    rune_calls: list[dict] = []
+    payload_json = b'{"x":1}'
+    payload_trace = b"\x00NCUREP\xff" * 64
+
+    def fake_rune_get(**kwargs):
+        rune_calls.append(kwargs)
+        # First call (no path/pvc) → JSON. Second call (with path) → trace.
+        if "path" in kwargs and kwargs["path"]:
+            return payload_trace
+        return payload_json
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    monkeypatch.setattr(
+        "swordfish.dispatch.results.fetch_result",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("kubectl must not be used")),
+    )
+
+    target = tmp_path / "out.json"
+    run.fetch_result(local_path=target, include_traces=True)
+
+    assert len(rune_calls) == 2
+    json_call, trace_call = rune_calls
+    # JSON call: no overrides
+    assert json_call.get("path") is None
+    assert json_call.get("pvc") is None
+    assert json_call.get("artifact") is None
+    # Trace call: explicit overrides pointing at rune's hardcoded location
+    assert trace_call["path"] == "/data/sf-liger-rmsnorm-a100/profile"
+    assert trace_call["pvc"] == DEFAULT_PVC
+    assert trace_call["artifact"] == "profile.ncu-rep"
+    # Local files
+    assert target.read_bytes() == payload_json
+    trace_local = target.with_suffix(".ncu-rep")
+    assert trace_local.read_bytes() == payload_trace

@@ -6,73 +6,43 @@ runtime CLI used to dispatch jobs to the `voice-agent-flex` cluster.
 The shape is:
 
 ```
-  rune submit <name> --profile <swordfish-bench-arch> --script scripts/swordfish-bench.sh
+  rune submit <name> --profile <swordfish-bench-arch> --script scripts/swordfish-bench.sh \
+                     --output <abs-path-on-PVC>
                                 |                              |
                                 |                              +-- runs inside the pod
-                                +-- defines cluster wiring (queue/DRA/selectors/PVC/SYS_ADMIN)
+                                +-- defines cluster wiring (queue/DRA/selectors/PVC)
                                     on top of the swordfish-bench image
 ```
 
 `infra/airun/airun-gemm.voice-agent-flex.json` remains the source of truth for
-the cluster routing values (context, namespace, queue, ResourceClaimTemplate,
-node selectors, tolerations, NCU permission window). The rune profiles here
-mirror that JSON so dispatching via either path lands on the same pod shape.
+the **Plan B** path (`make airun-apply`) used for A100 NCU runs that need
+SYS_ADMIN. Profiles here mirror the same routing values so dispatching via
+either path lands on the same kind of pod.
 
 [rune]: https://github.com/azure-management-and-platforms/aks-ai-runtime/
 
-## Status — read this first
+## Status
 
 | What | Status |
 | --- | --- |
 | `infra/rune/image/Dockerfile` + `build.sh` | **Working.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI publishes to `ghcr.io/chokevin/swordfish-bench`. |
 | `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint, on-the-fly liger install self-heal. |
-| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles extending `ai-train-gpu-l`, queue=`kernel-mode-training`, image=`swordfish-bench:latest`. `rune profile show` resolves cleanly with parent's GPU/DRA/scheduling preserved (after re-declaring the parent's `resources.gpu/dra/requests` in each child to work around V0 rune's lack of deep-merge — see "PVC and merge gotchas" below). |
-| `make rune-install-profiles` | **Working.** Symlinks profiles + airun-core into `~/.config/rune/profiles/`. |
-| `Makefile` targets `rune-submit-*` | **Working invocation.** |
-| `rune submit --dry-run=client` GPU + DRA | **Working** for our profiles (DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct). |
-| `rune submit` PVC mount (`spec.resources.persistence`) | **NOT YET — V0 limitation.** The persistence array is a schema-valid hint but V0 rune `submit` does not translate it to volumeMounts/volumes. The `--volume` flag is in the binary but not yet exposed on `submit` (only `--pvc` on `shell`). For full PVC-mounted runs today, use Plan B (`make airun-render` + `make airun-apply`) which renders volumes explicitly from `infra/airun/airun-gemm.voice-agent-flex.json`. |
+| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles extending `ai-train-gpu-l`, queue=`kernel-mode-training`, image=`swordfish-bench:latest`, PVC `training-nfs` mounted at `/data` (rune storage contract). Deep-merge of `spec.resources` and `spec.runtime` from the parent now happens in rune itself, so the pack only declares deltas. |
+| `make rune-install-profiles` | **Working.** Symlinks the pack into `~/.config/rune/profiles/`. The airun-core parents are now embedded in the rune binary; no symlink needed. |
+| Makefile targets `rune-submit-*` | **Working invocation.** Each target sets `--output` so `rune submit get` can fetch results. |
+| `rune submit --dry-run=client` GPU + DRA + PVC | **Working** — DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct, PVC mounted at `/data` with hot `/mnt` scratch added by rune. |
+| `rune submit --profile-mode ncu\|nsys` | **Working** — output lands at `/data/<job-name>/profile/profile.{ncu-rep\|nsys-rep}`; image must have `ncu` / `nsys` on PATH (the swordfish-bench image does). |
+| `rune submit --output /data/...` + `rune submit get NAME` | **Working** — annotations recorded; `rune submit get NAME --output raw` cats the file via a one-shot helper Pod. Use `--artifact NAME` for items inside a directory output. |
 
-## PVC and merge gotchas (V0 rune)
+## A100 + Nsight Compute caveat
 
-Two V0 quirks that bit our first profile drafts; documenting so the next
-time we touch the profile we don't repeat them:
+The canonical airun-core profiles do not expose container `SYS_ADMIN` through the
+Profile spec, which Nsight Compute requires on A100 to read GPU performance
+counters. For A100 NCU runs, fall back to `make airun-apply` (which renders a
+raw Kueue Job and adds the cap explicitly via
+`infra/airun/airun-gemm.voice-agent-flex.json`).
 
-### `spec.resources` is replaced wholesale, not deep-merged
-
-If a child profile sets *any* field under `spec.resources` (e.g.
-`persistence`), V0 rune's resolver replaces the entire `resources`
-block, dropping the parent's `gpu`/`dra`/`requests` blocks. Workaround:
-re-declare the parent's whole `resources` body in the child, then append
-the override.
-
-Our pack does this by repeating `gpu.size: l`, `gpu.memoryGiBMin: 60`,
-`dra.{deviceClass, claimTemplate: full-gpu}`, and
-`requests.{cpu: "16", memory: 64Gi}` from `ai-train-gpu-l` before
-adding `persistence`. The redundancy is intentional — it survives V0's
-shallow merge. V1 webhook resolution is documented to deep-merge, at
-which point the duplicates can be removed.
-
-### `spec.resources.persistence` is not honored by `rune submit` on V0
-
-V0 `rune submit` recognizes `spec.resources.gpu`, `spec.resources.dra`,
-and `spec.resources.requests` but **silently ignores
-`spec.resources.persistence`**. The rendered Job has no volumeMounts and
-no PVC volume. The binary contains a `--volume name=pvc:claimName` flag
-internally, but it is not exposed on `submit` (only `--pvc` on `shell`,
-which mounts the named PVC at `/workspace`).
-
-Hardcoded default in the rune binary for finetune workflows: `blob-training`
-PVC, expected to be pre-provisioned in the target namespace.
-
-For swordfish today, this means:
-- `rune submit` produces a Job that admits to Kueue but cannot read or
-  write `/data-nfs` at runtime. The benchmarks that need the PVC will
-  fail.
-- Plan B (`make airun-render` + `make airun-apply`) renders explicit
-  volumes/volumeMounts from `infra/airun/airun-gemm.voice-agent-flex.json`
-  and is the dispatch path to use until V1 rune lands.
-- `/data-nfs` mount expectations in `infra/rune/scripts/swordfish-bench.sh`
-  are honest but currently only met under Plan B.
+H100 NVL and H200 NCU work with no extra privileges and run fine through `rune`.
 
 ## Image: `ghcr.io/chokevin/swordfish-bench`
 
@@ -89,7 +59,7 @@ Built by CI on push to `infra/rune/image/**`. Manual triggers via
 
 The image deliberately does **not** carry the swordfish source tree — by
 convention the working copy lives on the `training-nfs` PVC at
-`/data-nfs/swordfish/src/current` so live edits land in the next pod
+`/data/swordfish/src/current` so live edits land in the next pod
 without a rebuild. The in-pod script `cd`s there at startup.
 
 ### Building locally (optional)
@@ -126,47 +96,84 @@ which extend the airun-core `ai-train-gpu-l`:
 Today the three profiles are functionally identical at the rune resolver
 level — Kueue routes to whichever ResourceFlavor in
 `team-kernel-mode-reserved-cq` has capacity. Per-arch routing via
-`spec.resources.dra.claimTemplate` is the next iteration once the V1
-rune webhook lands; until then, treat the arch suffix as a label hint.
+`spec.resources.dra.claimTemplate` is the next iteration once arch-specific
+flavors land; until then, treat the arch suffix as a label hint.
 
 ## Installing the profiles into rune's search path
 
 Rune searches for profiles in (in order):
 
-1. `$HOME/.config/rune/profiles`
-2. `$HOME/.airun/profiles`
-3. `applications/airun-zero/profiles` (canonical, in-repo)
+1. `$RUNE_PROFILES_DIR` (if set)
+2. `$XDG_CONFIG_HOME/rune/profiles` (if set)
+3. `$HOME/.config/rune/profiles`
+4. `$HOME/.airun/profiles`
+5. The in-tree fallback `applications/airun-zero/profiles` (for ai2 dev work)
+6. **Embedded `core/*`** (built into the rune binary; supplies `ai-train-gpu-l` etc.)
 
-To make these profiles discoverable on a workstation:
+To make the swordfish pack discoverable on a workstation:
 
 ```bash
 make rune-install-profiles      # symlinks infra/rune/profiles -> ~/.config/rune/profiles/
-                                # also copies the airun-core profiles so extends: resolves
 ```
 
-After install, `rune profile list` should show three swordfish-bench
-profiles plus the eight airun-core profiles they inherit from. If it
-still says "no profiles found" the YAMLs are failing schema validation —
-re-check `apiVersion: airun.aks.io/v1alpha1` and `kind: Profile` at the
-top of each doc.
+After install, `rune profile list` should show the three swordfish-bench
+profiles plus the embedded core profiles they inherit from. To validate a
+profile against the cluster:
+
+```bash
+rune profile doctor swordfish-bench-a100 --context voice-agent-flex-admin -n ray
+```
+
+## Day-to-day flows
+
+```bash
+# preview the rendered Job manifest (no cluster contact)
+rune submit my-bench --profile swordfish-bench-a100 \
+  --script infra/rune/scripts/swordfish-bench.sh \
+  --output /data/swordfish/week1/my-bench.json \
+  --dry-run=client
+
+# real submission
+rune submit my-bench --profile swordfish-bench-a100 \
+  --script infra/rune/scripts/swordfish-bench.sh \
+  --output /data/swordfish/week1/my-bench.json \
+  --env SWORDFISH_ARCH_LABEL=a100 \
+  -n ray
+
+# fetch the result JSON written to /data on the PVC
+rune submit get my-bench -n ray --output raw > my-bench.json
+
+# wrap the entrypoint in NCU; artifact at /data/my-bench/profile/profile.ncu-rep
+rune submit my-bench-ncu --profile swordfish-bench-h100 \
+  --script infra/rune/scripts/swordfish-bench.sh \
+  --output /data/swordfish/week1/my-bench-ncu.json \
+  --profile-mode ncu \
+  -n ray
+
+# fetch the .ncu-rep file (the recorded result-path is the JSON; pass --path
+# explicitly because the trace lives at rune's hardcoded /data/<name>/profile/)
+rune submit get my-bench-ncu -n ray \
+  --path /data/my-bench-ncu/profile --pvc training-nfs \
+  --artifact profile.ncu-rep --output raw > my-bench-ncu.ncu-rep
+```
+
+The Python SDK in `swordfish/dispatch/` wraps all of this: see
+`swordfish/dispatch/runs.py` (`LigerPerkernelRun`) for the typed-dataclass
+shape that compiles to the equivalent `rune submit` invocation.
 
 ## Plan B: dispatch via the airun render path (no rune profile required)
 
-If the rune profile schema becomes a blocker, the existing
-`swordfish.runner render-airun-gemm` command writes a Kueue `Job` YAML
-directly from `infra/airun/airun-gemm.voice-agent-flex.json` and is what the
-strict completion gate documents. Use that path until the rune profile
-schema is sorted:
+If the rune profile path becomes a blocker (the A100 SYS_ADMIN case is the
+remaining one), the existing `swordfish.runner render-airun-gemm` command writes
+a Kueue `Job` YAML directly from `infra/airun/airun-gemm.voice-agent-flex.json`
+and is what the strict completion gate documents. Plan B mounts the same
+`training-nfs` PVC at `/data-nfs` for backward compatibility with previously
+written results.
 
 ```bash
 make airun-render
 make airun-apply
 ```
-
-Note: the airun JSON still pins `nvcr.io/nvidia/pytorch:25.03-py3` for
-backward compatibility with the Week 1 GEMM matrix; the in-pod script's
-on-the-fly `pip install liger-kernel` covers the Liger gap until that
-config is updated to the new image.
 
 ## Why both rune and `swordfish.runner render-airun-gemm`?
 
@@ -174,7 +181,8 @@ config is updated to the new image.
 common denominator and is what the dashboard's strict completion gate
 documents. `rune submit` is a thinner UX on top of the same Kueue stack with
 profile-based defaults, post-admission status (`rune status`), log streaming
-(`rune logs`), cost reporting (`rune cost`), and cancellation (`rune cancel`).
+(`rune logs`), cost reporting (`rune cost`), result fetch (`rune submit get`),
+and cancellation (`rune cancel`).
 
-Use `render-airun-gemm` when reviewing the exact YAML; use `rune submit` for
-day-to-day dispatch.
+Use `render-airun-gemm` when reviewing the exact YAML or when you need the
+A100 SYS_ADMIN profile; use `rune submit` for day-to-day dispatch.

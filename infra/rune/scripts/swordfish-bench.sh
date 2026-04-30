@@ -15,6 +15,14 @@
 # editable). PYTHONPATH/imports resolve without a PVC mount or pip-install
 # preflight. The optional /data volume (training-nfs) is for result JSONs.
 #
+# NOTE on profiling: rune now natively supports `--profile-mode ncu|nsys`
+# which wraps the entrypoint at the renderer level and writes to
+# `$RUNE_PROFILE_OUT` (= /data/<job-name>/profile/profile.{ncu-rep|nsys-rep}).
+# That is the day-to-day path. The SWORDFISH_PROFILE env-var path below is
+# kept as a back-compat / advanced-override for when the caller wants the
+# legacy ncu CSV format with section overrides; pass `--profile-mode` to
+# rune for the binary .ncu-rep/.nsys-rep, or set SWORDFISH_PROFILE here.
+#
 # Profile-supplied environment variables consumed here:
 #   RUNE_DATA_DIR        — V1 storage contract; durable mount (default /data).
 #                           Result JSONs land under $RUNE_DATA_DIR/swordfish/...
@@ -22,6 +30,7 @@
 #                           when the caller does not pass one.
 #   SWORDFISH_PROFILE    — when set, wraps the python invocation in a
 #                           profiler. Values: ncu | nsys | none (default).
+#                           Prefer rune's `--profile-mode` for new flows.
 #   SWORDFISH_PROFILE_OUT — explicit path for profile output. When unset the
 #                           script derives it from the --out flag in $@:
 #                             ncu  -> ${out_json%.json}.ncu.csv

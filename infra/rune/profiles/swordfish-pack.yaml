@@ -1,17 +1,13 @@
 # swordfish-pack — kernel-mode benchmark profiles
 #
-# Tenant overlay on top of airun core (see applications/airun-zero/profiles/core/).
-# Routes through the user-owned kernel-mode-training LocalQueue
-# (team-kernel-mode-reserved-cq) on voice-agent-flex.
+# Tenant overlay on top of airun core. Each profile extends ai-train-gpu-l
+# (now embedded in the rune binary — no symlink needed). All three profiles
+# share image, queue, persistence, and DRA claim; they differ only in the
+# arch label so dashboards / `rune profile list` can tell them apart.
 #
-# Inheritance: V1 webhook resolves spec.extends; V0 the rune CLI merges
-# client-side before rendering the Job.
-#
-# All three swordfish-bench-* profiles use the same image
-# (ghcr.io/chokevin/swordfish-bench:latest, baked with liger-kernel) and the
-# same kernel-mode-training queue. They differ only in gpu.size and the
-# memoryGiBMin floor that the airun capability resolver uses to pick a per-
-# cluster DRA claim template.
+# rune resolves spec.extends with deep-merge of spec.resources and spec.runtime
+# (see applications/rune/internal/profile/loader.go), so we only need to declare
+# the deltas. The parent ai-train-gpu-l supplies gpu/dra/requests defaults.
 #
 # A100 + Nsight Compute caveat: the canonical airun core profiles do not
 # expose container SYS_ADMIN through the Profile spec, which Nsight Compute
@@ -36,21 +32,9 @@ spec:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
   resources:
-    # Note: V0 rune does not deep-merge spec.resources from parent; setting any
-    # resources field here replaces the parent's wholesale. Re-declare the
-    # parent's gpu/dra/requests so they survive the override.
-    gpu:
-      size: l
-      memoryGiBMin: 60
-    dra:
-      deviceClass: gpu.nvidia.com
-      claimTemplate: full-gpu
-    requests:
-      cpu: "16"
-      memory: 64Gi
     persistence:
       - pvcName: training-nfs
-        mountPath: /data-nfs
+        mountPath: /data
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest
     imagePullPolicy: IfNotPresent
@@ -72,21 +56,9 @@ spec:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
   resources:
-    # Note: V0 rune does not deep-merge spec.resources from parent; setting any
-    # resources field here replaces the parent's wholesale. Re-declare the
-    # parent's gpu/dra/requests so they survive the override.
-    gpu:
-      size: l
-      memoryGiBMin: 60
-    dra:
-      deviceClass: gpu.nvidia.com
-      claimTemplate: full-gpu
-    requests:
-      cpu: "16"
-      memory: 64Gi
     persistence:
       - pvcName: training-nfs
-        mountPath: /data-nfs
+        mountPath: /data
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest
     imagePullPolicy: IfNotPresent
@@ -108,21 +80,9 @@ spec:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
   resources:
-    # Note: V0 rune does not deep-merge spec.resources from parent; setting any
-    # resources field here replaces the parent's wholesale. Re-declare the
-    # parent's gpu/dra/requests so they survive the override.
-    gpu:
-      size: l
-      memoryGiBMin: 60
-    dra:
-      deviceClass: gpu.nvidia.com
-      claimTemplate: full-gpu
-    requests:
-      cpu: "16"
-      memory: 64Gi
     persistence:
       - pvcName: training-nfs
-        mountPath: /data-nfs
+        mountPath: /data
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest
     imagePullPolicy: IfNotPresent

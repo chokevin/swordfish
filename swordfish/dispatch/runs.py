@@ -7,10 +7,7 @@ needed.
 
 from __future__ import annotations
 
-import os
 import re
-import shlex
-import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
@@ -26,7 +23,6 @@ DEFAULT_PVC = "training-nfs"
 DEFAULT_PRESET = "azure.kernel-mode.training.l"
 DEFAULT_BENCH_SCRIPT = Path("infra/rune/scripts/swordfish-bench.sh")
 DEFAULT_RESULT_ROOT = "/data/swordfish/week1"
-IN_POD_BENCH_SCRIPT = "/work/swordfish/infra/rune/scripts/swordfish-bench.sh"
 
 ARCH_TO_PRESET = {
     "a100": "azure.kernel-mode.training.l",
@@ -37,7 +33,10 @@ ARCH_TO_PRESET = {
 LIGER_KERNELS = ("rmsnorm", "swiglu", "rope", "fused_linear_ce")
 LIGER_KERNELS_IMPLEMENTED = ("rmsnorm", "swiglu")
 PROFILE_MODES = ("ncu", "nsys")
-PROFILE_EXTENSIONS = {"ncu": "ncu.csv", "nsys": "nsys-rep"}
+# Rune's --profile-mode=ncu produces an .ncu-rep binary report (NOT the .ncu.csv
+# format the legacy SWORDFISH_PROFILE script-side path produces). Downstream
+# tooling that expects CSV needs to call `ncu --import` to convert.
+PROFILE_EXTENSIONS = {"ncu": "ncu-rep", "nsys": "nsys-rep"}
 
 _NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
@@ -80,6 +79,7 @@ class LigerPerkernelRun:
     preset: str | None = None  # falls back to ARCH_TO_PRESET[arch]
     profile: str | None = None
     extra_args: list[str] = field(default_factory=list)
+    container_env: dict[str, str] = field(default_factory=dict)
     rune_bin: str = "rune"
     profile_mode: str | None = None  # ncu | nsys | None
 
@@ -113,11 +113,36 @@ class LigerPerkernelRun:
         return f"{self.result_root}/liger-perkernel/{self.kernel}-{self.arch}.json"
 
     @property
+    def profile_out_dir(self) -> str | None:
+        """The PVC directory rune writes the profile artifact into.
+
+        rune's renderer hardcodes `/data/<job-name>/profile/profile.<ext>` (see
+        applications/rune/internal/submit/render.go:applyProfileMode). Returns
+        the directory for use as `rune submit get --path ...`.
+        """
+        if not self.profile_mode:
+            return None
+        # If result_root is ever overridden away from /data/..., the profile
+        # artifact still lands under /data/<name>/ because rune uses
+        # storage.DurableRoot, not the --output path. The profile is fetched
+        # via explicit --path so this divergence is fine.
+        return f"/data/{self.resolved_name}/profile"
+
+    @property
     def profile_out_path(self) -> str | None:
+        """The full PVC path of the profile artifact (`<dir>/profile.<ext>`)."""
         if not self.profile_mode:
             return None
         ext = PROFILE_EXTENSIONS[self.profile_mode]
-        return f"{self.result_root}/liger-perkernel/{self.kernel}-{self.arch}.{ext}"
+        return f"{self.profile_out_dir}/profile.{ext}"
+
+    @property
+    def profile_out_artifact(self) -> str | None:
+        """The artifact filename inside `profile_out_dir`, for `--artifact NAME`."""
+        if not self.profile_mode:
+            return None
+        ext = PROFILE_EXTENSIONS[self.profile_mode]
+        return f"profile.{ext}"
 
     @property
     def forwarded_args(self) -> list[str]:
@@ -149,50 +174,20 @@ class LigerPerkernelRun:
             self.out_path,
         ]
 
-    def _render_profile_wrapper(self) -> Path:
-        """Generate a tempfile bash wrapper that exports SWORDFISH_PROFILE then
-        execs the in-pod bench script. Used when profile_mode is set so the
-        bench script wraps the python invocation in ncu/nsys."""
-        assert self.profile_mode is not None
-        out_path = self.profile_out_path or ""
-        contents = (
-            "#!/usr/bin/env bash\n"
-            "set -euo pipefail\n"
-            f"export SWORDFISH_PROFILE={shlex.quote(self.profile_mode)}\n"
-            f"export SWORDFISH_PROFILE_OUT={shlex.quote(out_path)}\n"
-            f'exec bash {shlex.quote(IN_POD_BENCH_SCRIPT)} "$@"\n'
-        )
-        fd, tmp_path = tempfile.mkstemp(prefix=f"sf-rune-{self.profile_mode}-", suffix=".sh")
-        with os.fdopen(fd, "w") as f:
-            f.write(contents)
-        os.chmod(tmp_path, 0o755)
-        return Path(tmp_path)
-
     def to_rune_submit(self) -> RuneSubmit:
-        # When profile_mode is set, the only supported flow is the bash
-        # entrypoint (because the wrapper execs into the in-pod bench
-        # script). Custom Python scripts under profile mode are out of scope
-        # for now — the user can do their own ncu/nsys wrapping inside.
-        if self.profile_mode is not None:
-            if Path(self.script).resolve() != Path(DEFAULT_BENCH_SCRIPT).resolve():
-                raise ValueError(
-                    "profile_mode is only supported with the default bench "
-                    "script; for custom scripts, wrap the python call yourself"
-                )
-            script_path: str | Path = self._render_profile_wrapper()
-        else:
-            script_path = self.script
-
         kwargs: dict = dict(
             name=self.resolved_name,
             image=self.image,
-            script=script_path,
+            script=self.script,
             namespace=self.namespace,
             context=self.context,
             volumes=[f"data=pvc:{self.pvc}"],
             extra_args=list(self.extra_args),
             forwarded_args=self.forwarded_args,
+            container_env=dict(self.container_env),
             rune_bin=self.rune_bin,
+            profile_mode=self.profile_mode,
+            output=self.out_path,
         )
         if self.profile:
             kwargs["profile"] = self.profile
@@ -240,56 +235,99 @@ class LigerPerkernelRun:
         pod: str | None = None,
         pod_label_selector: str | None = None,
         kubectl_bin: str = "kubectl",
+        rune_bin: str | None = None,
         include_traces: bool = False,
     ) -> FetchedResult:
         """Copy this run's result JSON back from the cluster PVC.
 
-        Uses kubectl cp via the benchmark pod (if still around) or any pod
-        with the training-nfs PVC mounted. Best-effort convenience until
-        swordfish promotes to a level-2 managed eval.
+        Default path: shells out to `rune submit get NAME -o raw`, which uses
+        the `airun.aks.io/result-{path,pvc}` annotations recorded by
+        `rune submit --output ...`. Falls back to `kubectl cp` only when:
+
+        1. rune reports the Job has no result-path annotation (legacy jobs
+           submitted before swordfish was migrated to `--output`), OR
+        2. the caller explicitly passes `pod=` or `pod_label_selector=`
+           (debugging / non-rune-managed pods).
+
+        All other failures (auth, missing artifact, helper-pod failure)
+        propagate as-is — silent kubectl-cp fallback would mask real bugs.
 
         With include_traces=True, also fetches the profiler artifact
-        (`.ncu.csv` for profile_mode='ncu', `.nsys-rep` for 'nsys') next to
-        the result JSON.
+        (`.ncu-rep` for profile_mode='ncu', `.nsys-rep` for 'nsys'). The
+        trace lives at rune's hardcoded `/data/<name>/profile/profile.<ext>`
+        (NOT at the recorded result-path), so it's fetched via explicit
+        `--path/--pvc/--artifact` overrides. Local target keeps the
+        kernel/arch-named filename so downstream tooling stays consistent.
         """
-        from swordfish.dispatch.results import fetch_result as _fetch
+        from swordfish.dispatch.results import (
+            RuneSubmitGetMissingAnnotationsError,
+            fetch_result as _kubectl_cp_fetch,
+            fetch_via_rune_submit_get,
+        )
 
         target = (
             Path(local_path)
             if local_path
             else Path("runs/airun/week1") / Path(self.out_path).relative_to("/data/swordfish/week1")
         )
-        result = _fetch(
-            job_name=self.resolved_name,
-            remote_path=self.out_path,
-            local_path=target,
-            namespace=self.namespace,
-            context=self.context,
-            pod=pod,
-            pod_label_selector=pod_label_selector,
-            kubectl_bin=kubectl_bin,
-        )
+        target.parent.mkdir(parents=True, exist_ok=True)
 
-        if include_traces and self.profile_mode and self.profile_out_path:
-            trace_local = target.with_suffix("." + PROFILE_EXTENSIONS[self.profile_mode])
+        rune = rune_bin or self.rune_bin
+        explicit_pod_override = pod is not None or pod_label_selector is not None
+
+        if explicit_pod_override:
+            # Caller wants a specific pod (debugging, scratch helpers etc.).
+            # Skip rune-submit-get entirely.
+            result = _kubectl_cp_fetch(
+                job_name=self.resolved_name,
+                remote_path=self.out_path,
+                local_path=target,
+                namespace=self.namespace,
+                context=self.context,
+                pod=pod,
+                pod_label_selector=pod_label_selector,
+                kubectl_bin=kubectl_bin,
+            )
+        else:
             try:
-                _fetch(
-                    job_name=self.resolved_name,
-                    remote_path=self.profile_out_path,
-                    local_path=trace_local,
+                payload = fetch_via_rune_submit_get(
+                    name=self.resolved_name,
                     namespace=self.namespace,
                     context=self.context,
-                    pod=pod or result.pod,
-                    pod_label_selector=pod_label_selector,
+                    rune_bin=rune,
+                )
+            except RuneSubmitGetMissingAnnotationsError:
+                # Legacy job (pre-`--output` migration). Fall back to kubectl-cp.
+                result = _kubectl_cp_fetch(
+                    job_name=self.resolved_name,
+                    remote_path=self.out_path,
+                    local_path=target,
+                    namespace=self.namespace,
+                    context=self.context,
                     kubectl_bin=kubectl_bin,
                 )
-            except Exception as e:  # noqa: BLE001
-                import sys
-
-                print(
-                    f"warning: trace fetch failed ({self.profile_mode} -> {trace_local}): {e}",
-                    file=sys.stderr,
+            else:
+                target.write_bytes(payload)
+                result = FetchedResult(
+                    name=self.resolved_name,
+                    pod="<rune submit get>",
+                    remote_path=self.out_path,
+                    local_path=target,
                 )
+
+        if include_traces and self.profile_mode and self.profile_out_dir:
+            ext = PROFILE_EXTENSIONS[self.profile_mode]
+            trace_local = target.with_suffix(f".{ext}")
+            trace_payload = fetch_via_rune_submit_get(
+                name=self.resolved_name,
+                namespace=self.namespace,
+                context=self.context,
+                path=self.profile_out_dir,
+                pvc=self.pvc,
+                artifact=self.profile_out_artifact,
+                rune_bin=rune,
+            )
+            trace_local.write_bytes(trace_payload)
 
         return result
 
