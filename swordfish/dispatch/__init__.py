@@ -15,6 +15,15 @@ the same and the implementation switches to `rune eval` under the hood.
 
 from __future__ import annotations
 
+from swordfish.dispatch.image import (
+    ImageBuildError,
+    build_and_push_dev_image,
+)
+from swordfish.dispatch.results import (
+    FetchedResult,
+    ResultFetchError,
+    fetch_result,
+)
 from swordfish.dispatch.rune import (
     RuneCommandError,
     RuneSubmit,
@@ -28,15 +37,26 @@ from swordfish.dispatch.runs import (
     LigerPerkernelMatrix,
     LigerPerkernelRun,
 )
+from swordfish.dispatch.topology import (
+    find_topology_policy,
+    topology_policy_env,
+)
 
 __all__ = [
     "DEFAULT_IMAGE",
     "DEFAULT_NAMESPACE",
     "DEFAULT_PRESET",
     "DEFAULT_PVC",
+    "FetchedResult",
+    "ImageBuildError",
     "LigerPerkernelMatrix",
     "LigerPerkernelRun",
+    "ResultFetchError",
     "RuneCommandError",
     "RuneSubmit",
     "RuneSubmitResult",
+    "build_and_push_dev_image",
+    "fetch_result",
+    "find_topology_policy",
+    "topology_policy_env",
 ]

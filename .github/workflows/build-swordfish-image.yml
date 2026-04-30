@@ -13,11 +13,19 @@ on:
     branches: [main]
     paths:
       - "infra/rune/image/**"
+      - "swordfish/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".dockerignore"
       - ".github/workflows/build-swordfish-image.yml"
   pull_request:
     branches: [main]
     paths:
       - "infra/rune/image/**"
+      - "swordfish/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".dockerignore"
       - ".github/workflows/build-swordfish-image.yml"
   workflow_dispatch:
     inputs:
@@ -80,12 +88,14 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./infra/rune/image
+          context: .
+          file: infra/rune/image/Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             ${{ inputs.liger_version && format('LIGER_VERSION={0}', inputs.liger_version) || '' }}
             ${{ inputs.liger_ref && format('LIGER_REF={0}', inputs.liger_ref) || '' }}
+            SWORDFISH_SHA=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

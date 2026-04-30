@@ -12,21 +12,19 @@
 # The Ray-flavored cluster images do not ship this stack in a known-good
 # combination, so we build on the NVIDIA pytorch base directly.
 #
-# What this image adds on top of the base:
-#   * liger-kernel — the Triton-fused kernel library that is the W1 first
-#     upstream touchpoint. Baked in so cold-start does not pay pip install
-#     for every job.
-#   * uv — the project manager swordfish uses for `uv run`.
-#   * gh — used by future Friday-publish flows that file a Discussion or PR
-#     to linkedin/Liger-Kernel from inside the runner.
-#   * git, jq, ca-certificates — the usual cluster-job toolbox.
+# What this image adds on top of the base, in increasing rebuild frequency:
+#   1. (rare)  liger-kernel — the Triton-fused kernel library; the W1 first
+#              upstream touchpoint. Baked so cold-start does not pay pip
+#              install for every job.
+#   2. (rare)  uv, gh, git, jq, ca-certificates — research toolbox.
+#   3. (often) the swordfish source tree itself, installed editable via
+#              `pip install -e . --no-deps`. Researchers iterate on Python
+#              files in experiments/ without rebuilding this layer; only when
+#              the swordfish/ package itself changes does this layer rebuild.
 #
-# What it does NOT add:
-#   * The swordfish source tree itself. By convention the swordfish working
-#     copy lives on the training-nfs PVC at /data-nfs/swordfish/src/current
-#     so live edits do not need a rebuild. The in-pod entrypoint
-#     infra/rune/scripts/swordfish-bench.sh `cd`s there and runs
-#     `python -m swordfish.runner`.
+# Build context is the swordfish repo root so swordfish/ + pyproject.toml +
+# uv.lock are reachable. .dockerignore at the repo root keeps the context
+# small.
 
 FROM nvcr.io/nvidia/pytorch:25.03-py3
 
@@ -69,19 +67,34 @@ RUN if [ -n "${LIGER_REF}" ]; then \
  && python -c "from liger_kernel.transformers.rms_norm import LigerRMSNorm; print('LigerRMSNorm OK')" \
  && python -c "from liger_kernel.transformers.swiglu import LigerSwiGLUMLP; print('LigerSwiGLUMLP OK')"
 
+# Bake the swordfish source. We copy the package + project files only (not the
+# whole repo — see .dockerignore at repo root) and install editable so import
+# paths resolve cleanly. --no-deps because torch/triton/numpy are already in
+# the base image and we do not want pip to substitute its own versions.
+WORKDIR /work/swordfish
+COPY pyproject.toml uv.lock README.md ./
+COPY swordfish/ ./swordfish/
+RUN pip install --no-cache-dir --no-deps -e . \
+ && python -c "import swordfish.runner; print('swordfish.runner OK')"
+
+# Provenance: the SHA the source was built from. Stamped into the image at
+# build time and surfaced inside the pod so result JSONs can record it.
+ARG SWORDFISH_SHA=local
+ENV SWORDFISH_SHA=${SWORDFISH_SHA}
+
 # Sanity surface for `kubectl exec ... -- env`-style smoke tests.
 RUN nvcc --version \
  && nsys --version \
  && ncu --version \
  && gh --version \
- && uv --version
+ && uv --version \
+ && python -c "from swordfish.runner.liger_perkernel import KERNEL_NAMES; print('liger-perkernel kernels:', KERNEL_NAMES)"
 
-# Default working dir mirrors the airun convention; the in-pod entrypoint cd's
-# here at startup. The actual source is mounted from training-nfs at runtime.
-WORKDIR /data-nfs/swordfish/src/current
+# Default working dir is the baked source tree. The in-pod entrypoint script
+# does not need to cd anywhere; rune submit already inherits this.
+WORKDIR /work/swordfish
 
 # No ENTRYPOINT — rune submit + airun render-airun-gemm both pass an explicit
-# command (bash infra/rune/scripts/swordfish-bench.sh ...). Leaving the image
-# entrypoint open keeps the image reusable for `rune shell`-style interactive
-# work too.
+# command. Leaving the image entrypoint open keeps the image reusable for
+# `rune shell`-style interactive work too.
 CMD ["bash"]

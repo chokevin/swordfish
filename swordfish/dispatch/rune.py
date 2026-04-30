@@ -110,10 +110,22 @@ class RuneSubmit:
         *,
         dry_run: str | None = None,
         check: bool = True,
+        auto_topology_policy: bool = True,
     ) -> RuneSubmitResult:
-        """Run rune submit. Returns the rendered YAML on dry_run='client', else None."""
+        """Run rune submit. Returns the rendered YAML on dry_run='client', else None.
+
+        When auto_topology_policy is True (default), the SDK looks for the
+        airun-zero azure-topology-policy.yaml in common locations and injects
+        $RUNE_TOPOLOGY_POLICY automatically — preset-based dispatch fails
+        otherwise. Set False to opt out (e.g. when the env var is set
+        intentionally to a non-default policy).
+        """
+        from swordfish.dispatch.topology import topology_policy_env
+
         args = self.to_args(dry_run=dry_run)
         env = {**os.environ, **self.env}
+        if auto_topology_policy:
+            env.update(topology_policy_env())
         proc = subprocess.run(
             args,
             text=True,

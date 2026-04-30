@@ -8,10 +8,11 @@ needed.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
+from swordfish.dispatch.results import FetchedResult
 from swordfish.dispatch.rune import RuneSubmit, RuneSubmitResult
 
 
@@ -153,8 +154,67 @@ class LigerPerkernelRun:
     def to_command(self, *, dry_run: str | None = None) -> str:
         return self.to_rune_submit().to_command(dry_run=dry_run)
 
-    def submit(self, *, dry_run: str | None = None, check: bool = True) -> RuneSubmitResult:
-        return self.to_rune_submit().submit(dry_run=dry_run, check=check)
+    def submit(
+        self,
+        *,
+        dry_run: str | None = None,
+        check: bool = True,
+        local_image: bool = False,
+        push_local: bool = True,
+        container_cmd: str = "podman",
+        platform: str | None = None,
+    ) -> RuneSubmitResult:
+        """Dispatch the run.
+
+        With local_image=True, builds the swordfish-bench image from the
+        local working tree and (by default) pushes it to GHCR with a
+        dev-<sha> tag, then submits with that tag instead of self.image.
+        Use this when iterating on swordfish/ internals; for experiments/
+        edits, the stable :latest image plus --script is the fast path.
+        """
+        run = self
+        if local_image:
+            from swordfish.dispatch.image import build_and_push_dev_image
+
+            new_image = build_and_push_dev_image(
+                push=push_local,
+                container_cmd=container_cmd,
+                platform=platform,
+            )
+            run = replace(self, image=new_image)
+        return run.to_rune_submit().submit(dry_run=dry_run, check=check)
+
+    def fetch_result(
+        self,
+        local_path: str | Path | None = None,
+        *,
+        pod: str | None = None,
+        pod_label_selector: str | None = None,
+        kubectl_bin: str = "kubectl",
+    ) -> FetchedResult:
+        """Copy this run's result JSON back from the cluster PVC.
+
+        Uses kubectl cp via the benchmark pod (if still around) or any pod
+        with the training-nfs PVC mounted. Best-effort convenience until
+        swordfish promotes to a level-2 managed eval.
+        """
+        from swordfish.dispatch.results import fetch_result as _fetch
+
+        target = (
+            Path(local_path)
+            if local_path
+            else Path("runs/airun/week1") / Path(self.out_path).relative_to("/data/swordfish/week1")
+        )
+        return _fetch(
+            job_name=self.resolved_name,
+            remote_path=self.out_path,
+            local_path=target,
+            namespace=self.namespace,
+            context=self.context,
+            pod=pod,
+            pod_label_selector=pod_label_selector,
+            kubectl_bin=kubectl_bin,
+        )
 
 
 @dataclass

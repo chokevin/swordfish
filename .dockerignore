@@ -1,0 +1,27 @@
+# .dockerignore for the swordfish-bench image.
+#
+# Build context is the swordfish repo root so the Dockerfile at
+# infra/rune/image/Dockerfile can COPY swordfish/ + pyproject.toml + uv.lock.
+# Everything else is excluded to keep the context small and rebuild fast.
+
+# Default-deny most of the repo
+*
+
+# Explicit allow-list (swordfish source + project metadata)
+!swordfish/
+!pyproject.toml
+!uv.lock
+!README.md
+
+# Pruning inside the allowed dirs
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.ruff_cache/
+**/.mypy_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
