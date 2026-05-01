@@ -76,14 +76,16 @@ echo "== building ${full_tag} via ${CONTAINER_CMD} (platform=${PLATFORM:-host}) 
 "${CONTAINER_CMD}" build "${log_flag[@]}" "${build_args[@]}" .
 
 echo "== smoke =="
+# nsys is intentionally not checked: the autoresearch-pytorch-ray base does
+# not ship Nsight Systems. SWORDFISH_PROFILE=nsys errors clearly at runtime.
+# Re-add to the base image (and to this smoke list) if nsys becomes load-
+# bearing.
 "${CONTAINER_CMD}" run --rm "${short_tag}" bash -c '
     set -euo pipefail
     python -c "import torch, triton, liger_kernel, swordfish.runner; \
 print(f\"torch={torch.__version__} triton={triton.__version__}\"); \
 print(\"liger + swordfish OK\")"
-    nvcc --version | head -3
     ncu --version | head -1
-    nsys --version | head -1
     echo "SWORDFISH_SHA=$SWORDFISH_SHA"
 '
 

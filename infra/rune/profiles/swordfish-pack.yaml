@@ -75,7 +75,7 @@ spec:
     gpuType: a100
     gpusPerNode: 1
   runtime:
-    image: ghcr.io/chokevin/swordfish-bench:latest
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
   policy:
@@ -125,7 +125,7 @@ spec:
     gpuType: h100
     gpusPerNode: 1
   runtime:
-    image: ghcr.io/chokevin/swordfish-bench:latest
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
   policy:
@@ -175,7 +175,7 @@ spec:
     gpuType: h200
     gpusPerNode: 1
   runtime:
-    image: ghcr.io/chokevin/swordfish-bench:latest
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
   policy:

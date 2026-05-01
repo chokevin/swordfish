@@ -22,7 +22,7 @@ PACK_YAML_PATH = "infra/rune/profiles/swordfish-pack.yaml"
 QUEUE_CLUSTER = "team-kernel-mode-reserved-cq"
 PVC_NAME = "training-nfs"
 PVC_MOUNT = "/data"
-IMAGE = "ghcr.io/chokevin/swordfish-bench:latest"
+IMAGE = "voiceagentcr.azurecr.io/airun/swordfish-bench:dev"
 IMAGE_PULL_POLICY = "IfNotPresent"
 IMAGE_FAMILY = "swordfish-bench"
 

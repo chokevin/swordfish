@@ -20,13 +20,14 @@ The shape is:
 
 | What | Status |
 | --- | --- |
-| `infra/rune/image/Dockerfile` + `build.sh` | **Working.** Builds on `nvcr.io/nvidia/pytorch:25.03-py3`, bakes liger-kernel + uv + gh + git + jq. CI publishes to `ghcr.io/chokevin/swordfish-bench`. |
+| `infra/rune/image/Dockerfile` + `build-acr.sh` | **Working.** Builds on `voiceagentcr.azurecr.io/airun/autoresearch-pytorch-ray:dev` (in-region ACR, prewarmed on every GPU node). Bakes liger-kernel + swordfish source. Canonical build path is `az acr build` (publishes to `voiceagentcr.azurecr.io/airun/swordfish-bench`). The legacy `build.sh` (podman → ghcr.io) still works for local iteration. |
 | `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint, on-the-fly liger install self-heal. |
-| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles extending `ai-train-gpu-l`, queue=`kernel-mode-training`, image=`swordfish-bench:latest`, PVC `training-nfs` mounted at `/data` (rune storage contract). Generated from `swordfish/dispatch/profiles.py` — edit the Python, then `make rune-profiles`. A sync test in `tests/test_dispatch.py` enforces the invariant. Deep-merge of `spec.resources` and `spec.runtime` from the parent now happens in rune itself, so the pack only declares deltas. |
+| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles, queue=`team-kernel-mode-reserved-cq`, image=`voiceagentcr.azurecr.io/airun/swordfish-bench:dev`, PVC `training-nfs` mounted at `/data` (rune storage contract). Self-contained spec (no `extends:` — embedded core profiles were removed in `airun-zero`). Generated from `swordfish/dispatch/profiles.py` — edit the Python, then `make rune-profiles`. A sync test in `tests/test_dispatch.py` enforces the invariant. |
 | `make rune-install-profiles` | **Working.** Verifies the YAML is in sync with the Python source, then symlinks the pack into `~/.config/rune/profiles/`. The core parents are embedded in the rune binary; no extra symlink needed. |
 | Makefile targets `rune-submit-*` | **Working.** Each target shells out to `python -m swordfish.runner submit-bench --workload {gemm,liger-rmsnorm,liger-swiglu} --arch {a100,h100,h200}`; the dispatch SDK builds and invokes the right `rune submit` argv. Each sets `--output` so `rune submit get` can fetch results. |
 | `rune submit --dry-run=client` GPU + DRA + PVC | **Working** — DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct, PVC mounted at `/data` with hot `/mnt` scratch added by rune. |
-| `rune submit --profile-mode ncu\|nsys` | **Working** — output lands at `/data/<job-name>/profile/profile.{ncu-rep\|nsys-rep}`; image must have `ncu` / `nsys` on PATH (the swordfish-bench image does). |
+| `rune submit --profile-mode ncu` | **Working** — output lands at `/data/<job-name>/profile/profile.ncu-rep`; image must have `ncu` on PATH (the swordfish-bench image does — Nsight Compute 2025.1.0.0 is in the autoresearch-pytorch-ray base). |
+| `rune submit --profile-mode nsys` | **Broken in current image** — the `autoresearch-pytorch-ray` base does not ship Nsight Systems. `SWORDFISH_PROFILE=nsys` errors with a clear "nsys not on PATH" message. Re-add nsys to the base (or to our derived layer via apt) if it becomes load-bearing. |
 | `rune submit --output /data/...` + `rune submit get NAME` | **Working** — annotations recorded; `rune submit get NAME --output raw` cats the file via a one-shot helper Pod. Use `--artifact NAME` for items inside a directory output. |
 
 ## A100 + Nsight Compute caveat
@@ -40,18 +41,27 @@ under a kueue-gated allowlist), not swordfish.
 
 H100 NVL and H200 NCU work with no extra privileges and run fine through `rune`.
 
-## Image: `ghcr.io/chokevin/swordfish-bench`
+## Image: `voiceagentcr.azurecr.io/airun/swordfish-bench`
 
-Built by CI on push to `infra/rune/image/**`. Manual triggers via
-`gh workflow run build-swordfish-image.yml` accept `liger_version` and
-`liger_ref` build-arg overrides plus an optional extra `tag`.
+Built locally via `infra/rune/image/build-acr.sh` (uses Azure ACR Tasks —
+remote build on ACR build agents, ~6min vs ~25min on a GH ubuntu runner).
+The legacy `infra/rune/image/build.sh` (podman → ghcr.io) still works for
+Dockerfile iteration if you don't have ACR access.
+
+```bash
+az acr login -n voiceagentcr        # one-time per laptop session
+infra/rune/image/build-acr.sh        # publishes :<sha> + :dev
+```
+
+Manual triggers via `gh workflow run build-swordfish-image.yml` accept
+`liger_version` and `liger_ref` build-arg overrides plus an optional extra
+`tag`. (CI publishes to ghcr.io; the in-cluster path uses the ACR tag.)
 
 | Layer | What | Why |
 | --- | --- | --- |
-| Base | `nvcr.io/nvidia/pytorch:25.03-py3` | torch 2.7+nv25.03, CUDA 12.8, Triton, NCU, Nsys built against each other. The Ray-flavored cluster images do not ship this stack in a known-good combination. Don't reinvent it. |
-| OS | git + jq + gh CLI | gh used by Friday-publish flows that file Discussions/PRs from inside the runner. |
-| Tooling | uv 0.5.7 | swordfish uses `uv run` for dependency management. |
-| Kernel lib | `liger-kernel==0.5.10` (override via `LIGER_VERSION` or `LIGER_REF`) | The Week 1 first upstream touchpoint. Baked so cold-start does not pay pip install for every job. |
+| Base | `voiceagentcr.azurecr.io/airun/autoresearch-pytorch-ray:dev` | In-region ACR, prewarmed on every GPU node by the cluster-wide `baked-image-prewarm-v2` daemonset (see `ai2:applications/airun-zero/deploy/umbrella/airun-core/values.yaml`). Ships torch 2.7+cu128, Triton 3.3.0, NCU 2025.1.0.0, Ray 2.40, transformers 5.5.4, peft, trl, accelerate, datasets, bitsandbytes. Switching to it gets us ~10x faster cold-start (in-region vs ghcr.io) and ~250x layer-dedup win on prewarmed nodes (kubelet skips the ~10GB base-layer download). |
+| Kernel lib | `liger-kernel==0.5.10` (override via `LIGER_VERSION` or `LIGER_REF`) | The Week 1 first upstream touchpoint. Baked so cold-start does not pay pip install for every job. Verified compatible with the base's transformers 5.5.4. |
+| Source | swordfish package, `pip install -e . --no-deps` | Researchers iterate on Python files in experiments/ without rebuilding this layer; only when the swordfish/ package itself changes does this layer rebuild. |
 
 The image deliberately does **not** carry the swordfish source tree — by
 convention the working copy lives on the `training-nfs` PVC at
@@ -60,22 +70,28 @@ without a rebuild. The in-pod script `cd`s there at startup.
 
 ### Building locally (optional)
 
-CI is the canonical builder. Local builds are only needed to iterate on the
-Dockerfile itself.
+`build-acr.sh` is the canonical builder (Azure ACR Tasks: remote, ~6min).
+Local builds via `build.sh` are only needed to iterate on the Dockerfile
+itself — and they push to ghcr.io rather than the ACR location the cluster
+profile expects, so they're for iteration only.
 
 ```bash
-# default: podman, host arch (arm64 on Apple silicon)
+# CANONICAL — remote build via ACR Tasks, publishes to voiceagentcr ACR.
+az acr login -n voiceagentcr
+infra/rune/image/build-acr.sh
+
+# LOCAL ITERATION — podman → ghcr.io (does not match the in-cluster image tag).
 infra/rune/image/build.sh
 
-# force amd64 (slow on arm via QEMU; same arch CI uses)
+# force amd64 local build (slow on arm via QEMU)
 PLATFORM=linux/amd64 infra/rune/image/build.sh
 
-# push (gh auth required)
+# push the local build to ghcr (gh auth required)
 PUSH=1 infra/rune/image/build.sh
 ```
 
 Docker Desktop on macOS often gives the VM only ~3.5GB RAM, which is tight
-for the ~12GB nvcr base. Podman with libkrun is what the swordfish dev box
+for the ~12GB base. Podman with libkrun is what the swordfish dev box
 uses; pass `CONTAINER_CMD=docker` if you prefer.
 
 ## Profiles
