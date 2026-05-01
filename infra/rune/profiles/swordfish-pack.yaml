@@ -4,13 +4,14 @@
 # Regenerate with: make rune-profiles
 #
 # Each profile extends the embedded core profile `ai-train-gpu-l` (built into
-# the rune binary — no symlink needed). All three profiles share image, queue,
-# persistence, and DRA claim; they differ only in the arch label so dashboards
-# and `rune profile list` can tell them apart.
+# the rune binary — no symlink needed). The pack overrides spec.lane and the
+# Kueue local queue per arch so the rune topology validator routes H200 to
+# the kernel-mode-large-memory lane (required for gpuClass=h200-nvlink-141gb)
+# while A100 and H100 continue to use the kernel-mode-training lane.
 #
 # rune resolves spec.extends with deep-merge of spec.resources and spec.runtime
-# (see applications/rune/internal/profile/loader.go), so we only need to declare
-# the deltas. The parent ai-train-gpu-l supplies gpu/dra/requests defaults.
+# (see applications/rune/internal/profile/loader.go), so we only declare the
+# deltas. The parent ai-train-gpu-l supplies gpu/dra/requests defaults.
 #
 # A100 + Nsight Compute caveat: rune profiles cannot currently expose container
 # SYS_ADMIN, which Nsight Compute requires on A100 to read GPU performance
@@ -25,10 +26,11 @@ metadata:
   labels:
     airun.aks.io/catalog: pack
     airun.aks.io/pack: swordfish
-    airun.aks.io/lane: train
+    airun.aks.io/lane: training
     swordfish.dev/arch: a100
 spec:
   extends: ai-train-gpu-l
+  lane: training
   queue:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
@@ -49,10 +51,11 @@ metadata:
   labels:
     airun.aks.io/catalog: pack
     airun.aks.io/pack: swordfish
-    airun.aks.io/lane: train
+    airun.aks.io/lane: training
     swordfish.dev/arch: h100
 spec:
   extends: ai-train-gpu-l
+  lane: training
   queue:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
@@ -73,13 +76,14 @@ metadata:
   labels:
     airun.aks.io/catalog: pack
     airun.aks.io/pack: swordfish
-    airun.aks.io/lane: train
+    airun.aks.io/lane: large-memory
     swordfish.dev/arch: h200
 spec:
   extends: ai-train-gpu-l
+  lane: large-memory
   queue:
     clusterQueue: team-kernel-mode-reserved-cq
-    localQueue: kernel-mode-training
+    localQueue: kernel-mode-large-memory
   resources:
     persistence:
       - pvcName: training-nfs
