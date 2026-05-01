@@ -3,15 +3,30 @@
 # GENERATED FROM swordfish/dispatch/profiles.py — do not edit by hand.
 # Regenerate with: make rune-profiles
 #
-# Each profile extends the embedded core profile `ai-train-gpu-l` (built into
-# the rune binary — no symlink needed). The pack overrides spec.lane and the
-# Kueue local queue per arch so the rune topology validator routes H200 to
-# the kernel-mode-large-memory lane (required for gpuClass=h200-nvlink-141gb)
-# while A100 and H100 continue to use the kernel-mode-training lane.
+# Self-contained: every profile inlines the full spec (no `extends:`). The
+# rune binary's embedded core profiles were removed in the
+# chokevin/airun-zero-into-repo branch, so any pack that depended on
+# `ai-train-gpu-l` as a parent now fails to load. Inlining keeps swordfish
+# resilient to ai2 churn at the cost of having to mirror future parent
+# changes by hand.
 #
-# rune resolves spec.extends with deep-merge of spec.resources and spec.runtime
-# (see applications/rune/internal/profile/loader.go), so we only declare the
-# deltas. The parent ai-train-gpu-l supplies gpu/dra/requests defaults.
+# Per-arch deltas:
+#   * spec.lane          — rune topology validator vocabulary
+#                          (training for A100/H100, large-memory for H200,
+#                          required by the gpuClass=h200-nvlink-141gb check
+#                          in applications/rune/internal/topology/topology.go).
+#   * queue.localQueue   — kernel-mode-training vs kernel-mode-large-memory.
+#   * cost.gpuType       — informational.
+#
+# Shared across all three profiles:
+#   * scheduling.nodeSelector keys on `airun.aks.io/lane=train` (the actual
+#     label on every GPU node in voice-agent-flex today; not the validator's
+#     `lane` value) AND on `nvidia.com/gpu.product` so a100-targeted jobs
+#     can't land on H100/H200 nodes (and vice versa).
+#   * scheduling.tolerations match the lane=train taint.
+#   * resources.dra uses the `full-gpu` claim template (one device per pod;
+#     correct for kernel benches).
+#   * resources.persistence mounts the training-nfs PVC at /data.
 #
 # A100 + Nsight Compute caveat: rune profiles cannot currently expose container
 # SYS_ADMIN, which Nsight Compute requires on A100 to read GPU performance
@@ -29,19 +44,44 @@ metadata:
     airun.aks.io/lane: training
     swordfish.dev/arch: a100
 spec:
-  extends: ai-train-gpu-l
   lane: training
   queue:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
   resources:
+    gpu:
+      size: l
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
     persistence:
       - pvcName: training-nfs
         mountPath: /data
+  cost:
+    gpuType: a100
+    gpusPerNode: 1
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
 
 ---
 apiVersion: airun.aks.io/v1alpha1
@@ -54,19 +94,44 @@ metadata:
     airun.aks.io/lane: training
     swordfish.dev/arch: h100
 spec:
-  extends: ai-train-gpu-l
   lane: training
   queue:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-training
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-H100-NVL
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
   resources:
+    gpu:
+      size: l
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
     persistence:
       - pvcName: training-nfs
         mountPath: /data
+  cost:
+    gpuType: h100
+    gpusPerNode: 1
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
 
 ---
 apiVersion: airun.aks.io/v1alpha1
@@ -79,16 +144,41 @@ metadata:
     airun.aks.io/lane: large-memory
     swordfish.dev/arch: h200
 spec:
-  extends: ai-train-gpu-l
   lane: large-memory
   queue:
     clusterQueue: team-kernel-mode-reserved-cq
     localQueue: kernel-mode-large-memory
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-H200
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
   resources:
+    gpu:
+      size: l
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
     persistence:
       - pvcName: training-nfs
         mountPath: /data
+  cost:
+    gpuType: h200
+    gpusPerNode: 1
   runtime:
     image: ghcr.io/chokevin/swordfish-bench:latest
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true

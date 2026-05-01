@@ -42,6 +42,27 @@ ARCH_TO_PRESET = {
     "h200": "azure.kernel-mode.large-memory.xl",
 }
 
+# Per-arch rune `--gpu-class` injected into every submit. Without this, rune's
+# topology planner picks h200-nvlink-141gb by default for any lane=training/
+# large-memory profile, and Kueue then routes the pod to whichever GPU node
+# has a free DRA claim — usually wrong (e.g. an A100-targeted job lands on
+# H200). The values match the `rune.ai/gpu-class` node labels on
+# voice-agent-flex.
+ARCH_TO_GPU_CLASS = {
+    "a100": "a100-nvlink-80gb",
+    "h100": "h100-standalone-95gb",
+    "h200": "h200-nvlink-141gb",
+}
+
+
+def _inject_gpu_class(arch: str, extra_args: Iterable[str]) -> list[str]:
+    """Prepend `--gpu-class <arch class>` unless the caller already set one."""
+    out = list(extra_args)
+    if "--gpu-class" in out:
+        return out
+    return ["--gpu-class", ARCH_TO_GPU_CLASS[arch], *out]
+
+
 LIGER_KERNELS = ("rmsnorm", "swiglu", "rope", "fused_linear_ce")
 LIGER_KERNELS_IMPLEMENTED = ("rmsnorm", "swiglu")
 PROFILE_MODES = ("ncu", "nsys")
@@ -210,7 +231,7 @@ class LigerPerkernelRun:
             namespace=self.namespace,
             context=self.context,
             volumes=[f"data=pvc:{self.pvc}"],
-            extra_args=list(self.extra_args),
+            extra_args=_inject_gpu_class(self.arch, self.extra_args),
             forwarded_args=self.forwarded_args,
             container_env=dict(self.container_env),
             rune_bin=self.rune_bin,
@@ -462,7 +483,7 @@ class TorchGemmRun:
             namespace=self.namespace,
             context=self.context,
             volumes=[f"data=pvc:{self.pvc}"],
-            extra_args=list(self.extra_args),
+            extra_args=_inject_gpu_class(self.arch, self.extra_args),
             forwarded_args=self.forwarded_args,
             container_env=dict(self.container_env),
             rune_bin=self.rune_bin,
