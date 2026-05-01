@@ -259,6 +259,57 @@ def test_liger_perkernel_run_profile_mode_rejects_unknown():
         LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="vtune")
 
 
+def test_liger_perkernel_run_profile_mode_torch_does_not_pass_to_rune():
+    """torch.profiler is in-process — must NOT pipe through rune's --profile-mode.
+
+    Rune only knows ncu/nsys (external CLI wrappers). Passing --profile-mode=torch
+    to rune would error or be silently ignored. Instead, the dispatch SDK injects
+    SWORDFISH_PROFILE/SWORDFISH_PROFILE_OUT env vars and the bench main wraps
+    itself via swordfish.runner.profile_torch.
+    """
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="torch")
+    submit = run.to_rune_submit()
+    args = submit.to_args()
+    # Rune-side flag must be absent
+    assert "--profile-mode" not in args
+    # Env vars must be injected so the in-pod bash script + python main can opt in
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
+    assert "SWORDFISH_PROFILE=torch" in env_args
+    assert (
+        "SWORDFISH_PROFILE_OUT=/data/sf-liger-rmsnorm-a100/profile/profile.json"
+        in env_args
+    )
+
+
+def test_liger_perkernel_run_profile_mode_torch_uses_json_extension():
+    run = LigerPerkernelRun(kernel="rmsnorm", arch="h200", profile_mode="torch")
+    assert run.profile_out_dir == "/data/sf-liger-rmsnorm-h200/profile"
+    assert run.profile_out_path == "/data/sf-liger-rmsnorm-h200/profile/profile.json"
+    assert run.profile_out_artifact == "profile.json"
+
+
+def test_torch_gemm_run_profile_mode_torch_does_not_pass_to_rune():
+    run = TorchGemmRun(arch="a100", profile_mode="torch")
+    submit = run.to_rune_submit()
+    args = submit.to_args()
+    assert "--profile-mode" not in args
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
+    assert "SWORDFISH_PROFILE=torch" in env_args
+    # GEMM run uses backend in default name
+    assert any("SWORDFISH_PROFILE_OUT=/data/sf-gemm-" in e for e in env_args)
+    assert any(e.endswith("/profile/profile.json") for e in env_args)
+
+
+def test_torch_gemm_run_profile_mode_ncu_still_uses_rune_native():
+    """Sanity: only torch bypasses rune; ncu/nsys still go through --profile-mode."""
+    run = TorchGemmRun(arch="a100", profile_mode="ncu")
+    args = run.to_rune_submit().to_args()
+    assert "--profile-mode" in args
+    assert args[args.index("--profile-mode") + 1] == "ncu"
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
+    assert not any(e.startswith("SWORDFISH_PROFILE=") for e in env_args)
+
+
 def test_liger_perkernel_run_profile_mode_allows_custom_script():
     """The 'profile_mode only with default bench script' restriction is gone:
     rune wraps any cmd at the renderer level, so custom scripts work."""

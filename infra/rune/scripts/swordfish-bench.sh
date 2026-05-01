@@ -29,12 +29,16 @@
 #   SWORDFISH_ARCH_LABEL — a100/h100/h200, used as the default --arch-label
 #                           when the caller does not pass one.
 #   SWORDFISH_PROFILE    — when set, wraps the python invocation in a
-#                           profiler. Values: ncu | nsys | none (default).
-#                           Prefer rune's `--profile-mode` for new flows.
+#                           profiler. Values: ncu | nsys | torch | none
+#                           (default). Prefer rune's `--profile-mode` for
+#                           ncu/nsys; torch.profiler is always set via
+#                           this env var because rune doesn't have native
+#                           support for in-process Python profilers.
 #   SWORDFISH_PROFILE_OUT — explicit path for profile output. When unset the
 #                           script derives it from the --out flag in $@:
-#                             ncu  -> ${out_json%.json}.ncu.csv
-#                             nsys -> ${out_json%.json}.nsys-rep
+#                             ncu   -> ${out_json%.json}.ncu.csv
+#                             nsys  -> ${out_json%.json}.nsys-rep
+#                             torch -> ${out_json%.json}.json (chrome trace)
 #
 # Usage (forwarded by rune):
 #   bash infra/rune/scripts/swordfish-bench.sh \
@@ -110,6 +114,17 @@ case "$PROFILE" in
   none|"")
     exec "${PYTHON_CMD[@]}"
     ;;
+  torch)
+    # In-process torch.profiler — no external wrapper. The python bench
+    # main reads SWORDFISH_PROFILE_OUT and wraps itself via
+    # swordfish.runner.profile_torch.torch_profiler_context. We only need
+    # to ensure the output dir exists before exec'ing.
+    out="${SWORDFISH_PROFILE_OUT:-$(derive_profile_out json "$@")}"
+    mkdir -p "$(dirname "$out")"
+    export SWORDFISH_PROFILE_OUT="$out"
+    echo "torch.profiler -> ${out}"
+    exec "${PYTHON_CMD[@]}"
+    ;;
   ncu)
     if ! command -v ncu >/dev/null 2>&1; then
       echo "SWORDFISH_PROFILE=ncu but ncu is not on PATH" >&2
@@ -146,7 +161,7 @@ case "$PROFILE" in
         "${PYTHON_CMD[@]}"
     ;;
   *)
-    echo "unknown SWORDFISH_PROFILE=${PROFILE}; expected one of: none, ncu, nsys" >&2
+    echo "unknown SWORDFISH_PROFILE=${PROFILE}; expected one of: none, ncu, nsys, torch" >&2
     exit 3
     ;;
 esac

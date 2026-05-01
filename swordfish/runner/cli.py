@@ -26,6 +26,10 @@ from swordfish.runner.matrix import (
     run_gemm_matrix,
     validate_gemm_matrix_results,
 )
+from swordfish.runner.profile_torch import (
+    resolve_torch_profile_out,
+    torch_profiler_context,
+)
 from swordfish.runner.schema import attach_ncu_summary
 from swordfish.runner.status import write_completion_report
 from swordfish.runner.torch_gemm import run_gemm_benchmark, write_result
@@ -38,21 +42,22 @@ from swordfish.transformer.bench import (
 
 def _cmd_run_gemm(args: argparse.Namespace) -> int:
     argv = sys.argv if args.argv is None else args.argv
-    result = run_gemm_benchmark(
-        m=args.m,
-        n=args.n,
-        k=args.k,
-        dtype=args.dtype,
-        repeats=args.repeats,
-        warmup=args.warmup,
-        iters=args.iters,
-        device_name=args.device,
-        allow_cpu=args.allow_cpu,
-        arch_label=args.arch_label,
-        seed=args.seed,
-        ncu_csv=args.ncu_csv,
-        backend=args.backend,
-    )
+    with torch_profiler_context(resolve_torch_profile_out()):
+        result = run_gemm_benchmark(
+            m=args.m,
+            n=args.n,
+            k=args.k,
+            dtype=args.dtype,
+            repeats=args.repeats,
+            warmup=args.warmup,
+            iters=args.iters,
+            device_name=args.device,
+            allow_cpu=args.allow_cpu,
+            arch_label=args.arch_label,
+            seed=args.seed,
+            ncu_csv=args.ncu_csv,
+            backend=args.backend,
+        )
     result["command"] = argv
     write_result(result, args.out)
     print(f"wrote {args.out}", file=sys.stderr)
@@ -61,23 +66,24 @@ def _cmd_run_gemm(args: argparse.Namespace) -> int:
 
 def _cmd_run_liger_perkernel(args: argparse.Namespace) -> int:
     argv = sys.argv if args.argv is None else args.argv
-    result = run_liger_perkernel(
-        kernel=args.kernel,
-        batch=args.batch,
-        seq=args.seq,
-        hidden=args.hidden,
-        intermediate=args.intermediate,
-        eps=args.eps,
-        dtype=args.dtype,
-        repeats=args.repeats,
-        warmup=args.warmup,
-        iters=args.iters,
-        device_name=args.device,
-        allow_cpu=args.allow_cpu,
-        arch_label=args.arch_label,
-        seed=args.seed,
-        ncu_csv=args.ncu_csv,
-    )
+    with torch_profiler_context(resolve_torch_profile_out()):
+        result = run_liger_perkernel(
+            kernel=args.kernel,
+            batch=args.batch,
+            seq=args.seq,
+            hidden=args.hidden,
+            intermediate=args.intermediate,
+            eps=args.eps,
+            dtype=args.dtype,
+            repeats=args.repeats,
+            warmup=args.warmup,
+            iters=args.iters,
+            device_name=args.device,
+            allow_cpu=args.allow_cpu,
+            arch_label=args.arch_label,
+            seed=args.seed,
+            ncu_csv=args.ncu_csv,
+        )
     result["command"] = argv
     write_result(result, args.out)
     print(f"wrote {args.out}", file=sys.stderr)
@@ -537,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument("--arch", choices=["a100", "h100", "h200"], required=True)
     submit.add_argument("--name", default=None, help="override generated job name")
-    submit.add_argument("--profile-mode", choices=["ncu", "nsys"], default=None)
+    submit.add_argument("--profile-mode", choices=["ncu", "nsys", "torch"], default=None)
     submit.add_argument(
         "--dry-run",
         choices=["client", "server"],

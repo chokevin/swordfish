@@ -67,13 +67,52 @@ def _inject_gpu_class(arch: str, extra_args: Iterable[str]) -> list[str]:
 
 LIGER_KERNELS = ("rmsnorm", "swiglu", "rope", "fused_linear_ce")
 LIGER_KERNELS_IMPLEMENTED = ("rmsnorm", "swiglu")
-PROFILE_MODES = ("ncu", "nsys")
+# ncu/nsys are external binary wrappers handled by `rune --profile-mode`.
+# 'torch' is in-process (torch.profiler) and bypasses rune's wrapper —
+# the dispatch SDK injects SWORDFISH_PROFILE/SWORDFISH_PROFILE_OUT env
+# vars and the bench main wraps itself via swordfish.runner.profile_torch.
+PROFILE_MODES = ("ncu", "nsys", "torch")
+RUNE_NATIVE_PROFILE_MODES = ("ncu", "nsys")  # subset rune knows about
 # Rune's --profile-mode=ncu produces an .ncu-rep binary report (NOT the .ncu.csv
 # format the legacy SWORDFISH_PROFILE script-side path produces). Downstream
 # tooling that expects CSV needs to call `ncu --import` to convert.
-PROFILE_EXTENSIONS = {"ncu": "ncu-rep", "nsys": "nsys-rep"}
+PROFILE_EXTENSIONS = {"ncu": "ncu-rep", "nsys": "nsys-rep", "torch": "json"}
 
 _NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+
+
+def _profile_out_dir_for(name: str) -> str:
+    """Where rune's renderer writes profile artifacts (matches LigerPerkernelRun)."""
+    return f"/data/{name}/profile"
+
+
+def _profile_out_path_for(name: str, profile_mode: str) -> str:
+    return f"{_profile_out_dir_for(name)}/profile.{PROFILE_EXTENSIONS[profile_mode]}"
+
+
+def _resolve_torch_profile(
+    profile_mode: str | None,
+    resolved_name: str,
+    container_env: dict[str, str],
+) -> tuple[str | None, dict[str, str]]:
+    """Inject SWORDFISH_PROFILE env vars when profile_mode == 'torch'.
+
+    Returns (rune_native_profile_mode, container_env). For torch mode,
+    rune_native_profile_mode is None (rune doesn't know about 'torch';
+    the bench main wraps itself in-process). For ncu/nsys, the env is
+    untouched and rune handles the wrapping.
+
+    container_env is copied; this function does not mutate the caller's
+    dict.
+    """
+    env = dict(container_env)
+    if profile_mode != "torch":
+        return profile_mode, env
+    env.setdefault("SWORDFISH_PROFILE", "torch")
+    env.setdefault(
+        "SWORDFISH_PROFILE_OUT", _profile_out_path_for(resolved_name, "torch")
+    )
+    return None, env
 
 
 def _normalize_name(raw: str) -> str:
@@ -226,6 +265,9 @@ class LigerPerkernelRun:
         ]
 
     def to_rune_submit(self) -> RuneSubmit:
+        rune_native_mode, container_env = _resolve_torch_profile(
+            self.profile_mode, self.resolved_name, self.container_env
+        )
         kwargs: dict = dict(
             name=self.resolved_name,
             image=self.image,
@@ -235,9 +277,9 @@ class LigerPerkernelRun:
             volumes=[f"data=pvc:{self.pvc}"],
             extra_args=_inject_gpu_class(self.arch, self.extra_args),
             forwarded_args=self.forwarded_args,
-            container_env=dict(self.container_env),
+            container_env=container_env,
             rune_bin=self.rune_bin,
-            profile_mode=self.profile_mode,
+            profile_mode=rune_native_mode,
             output=self.out_path,
         )
         resolved_profile = self.resolved_profile
@@ -478,6 +520,9 @@ class TorchGemmRun:
         ]
 
     def to_rune_submit(self) -> RuneSubmit:
+        rune_native_mode, container_env = _resolve_torch_profile(
+            self.profile_mode, self.resolved_name, self.container_env
+        )
         kwargs: dict = dict(
             name=self.resolved_name,
             image=self.image,
@@ -487,9 +532,9 @@ class TorchGemmRun:
             volumes=[f"data=pvc:{self.pvc}"],
             extra_args=_inject_gpu_class(self.arch, self.extra_args),
             forwarded_args=self.forwarded_args,
-            container_env=dict(self.container_env),
+            container_env=container_env,
             rune_bin=self.rune_bin,
-            profile_mode=self.profile_mode,
+            profile_mode=rune_native_mode,
             output=self.out_path,
         )
         resolved_profile = self.resolved_profile
