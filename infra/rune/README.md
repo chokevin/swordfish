@@ -26,8 +26,8 @@ The shape is:
 | `make rune-install-profiles` | **Working.** Verifies the YAML is in sync with the Python source, then symlinks the pack into `~/.config/rune/profiles/`. The core parents are embedded in the rune binary; no extra symlink needed. |
 | Makefile targets `rune-submit-*` | **Working.** Each target shells out to `python -m swordfish.runner submit-bench --workload {gemm,liger-rmsnorm,liger-swiglu} --arch {a100,h100,h200}`; the dispatch SDK builds and invokes the right `rune submit` argv. Each sets `--output` so `rune submit get` can fetch results. |
 | `rune submit --dry-run=client` GPU + DRA + PVC | **Working** — DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct, PVC mounted at `/data` with hot `/mnt` scratch added by rune. |
-| `rune submit --profile-mode ncu` | **Working** — output lands at `/data/<job-name>/profile/profile.ncu-rep`; image must have `ncu` on PATH (the swordfish-bench image does — Nsight Compute 2025.1.0.0 is in the autoresearch-pytorch-ray base). |
-| `rune submit --profile-mode nsys` | **Broken in current image** — the `autoresearch-pytorch-ray` base does not ship Nsight Systems. `SWORDFISH_PROFILE=nsys` errors with a clear "nsys not on PATH" message. Re-add nsys to the base (or to our derived layer via apt) if it becomes load-bearing. |
+| `rune submit --profile-mode ncu` | **Working** — output lands at `/data/<job-name>/profile/profile.ncu-rep`; image must have `ncu` on PATH (the swordfish-bench image does — Nsight Compute 2025.1.0.0 from the autoresearch-pytorch-ray base). |
+| `rune submit --profile-mode nsys` | **Working** — output lands at `/data/<job-name>/profile/profile.nsys-rep`; image must have `nsys` on PATH (the swordfish-bench image installs Nsight Systems 2024.6.2 via `cuda-nsight-systems-12-8` apt package). |
 | `rune submit --output /data/...` + `rune submit get NAME` | **Working** — annotations recorded; `rune submit get NAME --output raw` cats the file via a one-shot helper Pod. Use `--artifact NAME` for items inside a directory output. |
 
 ## A100 + Nsight Compute caveat
@@ -60,6 +60,7 @@ Manual triggers via `gh workflow run build-swordfish-image.yml` accept
 | Layer | What | Why |
 | --- | --- | --- |
 | Base | `voiceagentcr.azurecr.io/airun/autoresearch-pytorch-ray:dev` | In-region ACR, prewarmed on every GPU node by the cluster-wide `baked-image-prewarm-v2` daemonset (see `ai2:applications/airun-zero/deploy/umbrella/airun-core/values.yaml`). Ships torch 2.7+cu128, Triton 3.3.0, NCU 2025.1.0.0, Ray 2.40, transformers 5.5.4, peft, trl, accelerate, datasets, bitsandbytes. Switching to it gets us ~10x faster cold-start (in-region vs ghcr.io) and ~250x layer-dedup win on prewarmed nodes (kubelet skips the ~10GB base-layer download). |
+| Profiler | `cuda-nsight-systems-12-8` (nsys 2024.6.2) | The base ships ncu but not nsys. Pulled from the NVIDIA CUDA apt repo the base already configures. Pinned to 12-8 to track the base's CUDA 12.8 toolchain. |
 | Kernel lib | `liger-kernel==0.5.10` (override via `LIGER_VERSION` or `LIGER_REF`) | The Week 1 first upstream touchpoint. Baked so cold-start does not pay pip install for every job. Verified compatible with the base's transformers 5.5.4. |
 | Source | swordfish package, `pip install -e . --no-deps` | Researchers iterate on Python files in experiments/ without rebuilding this layer; only when the swordfish/ package itself changes does this layer rebuild. |
 

@@ -1,8 +1,9 @@
 """Typed swordfish benchmark runs that compile to `rune submit` invocations.
 
 The defaults are tuned for the kernel-mode-training queue on voice-agent-flex
-and the `ghcr.io/chokevin/swordfish-bench:latest` image. Override per run as
-needed.
+and the `voiceagentcr.azurecr.io/airun/swordfish-bench:dev` image (sourced
+from `swordfish.dispatch.profiles.IMAGE` to keep the dispatch SDK and the
+profile pack in sync). Override per run as needed.
 """
 
 from __future__ import annotations
@@ -12,13 +13,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
+from swordfish.dispatch.profiles import IMAGE as PROFILE_PACK_IMAGE
 from swordfish.dispatch.results import FetchedResult
 from swordfish.dispatch.rune import RuneSubmit, RuneSubmitResult
 
 
 # Defaults — change these in one place, not at every call site.
 DEFAULT_NAMESPACE = "ray"
-DEFAULT_IMAGE = "ghcr.io/chokevin/swordfish-bench:latest"
+DEFAULT_IMAGE = PROFILE_PACK_IMAGE
 DEFAULT_PVC = "training-nfs"
 DEFAULT_PRESET = "azure.kernel-mode.training.l"
 DEFAULT_BENCH_SCRIPT = Path("infra/rune/scripts/swordfish-bench.sh")

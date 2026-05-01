@@ -29,9 +29,10 @@
 #   ray           2.40.0
 #   transformers  5.5.4         (liger 0.5.10 import verified compatible)
 #   bitsandbytes, peft, trl, accelerate, datasets, evaluate, hf_transfer
-#   nsys          MISSING       — SWORDFISH_PROFILE=nsys errors clearly.
-#                                  Re-add via apt if nsys ever becomes
-#                                  load-bearing.
+#
+# What we add via apt on top:
+#   cuda-nsight-systems-12-8 (nsys 2024.6.2) — for --profile-mode nsys.
+#   The base ships ncu but not nsys; this layer is ~250MB compressed.
 #
 # What this image adds on top of the base, in increasing rebuild frequency:
 #   1. (rare)  liger-kernel — the Triton-fused kernel library; the W1 first
@@ -59,6 +60,19 @@ USER root
 ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1
+
+# Nsight Systems CLI for `--profile-mode nsys` (the autoresearch-pytorch-ray
+# base ships Nsight Compute but not Nsight Systems). The cuda-nsight-systems
+# meta-package is in the NVIDIA CUDA apt repo that the base already configures
+# at /etc/apt/sources.list.d/cuda-ubuntu2204-x86_64.list. update-alternatives
+# wires `/usr/local/bin/nsys` automatically.
+#
+# Pinned to 12-8 to track the base's CUDA 12.8 toolchain — bump this in
+# lockstep if the base ever moves to a different CUDA major.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends cuda-nsight-systems-12-8 \
+ && rm -rf /var/lib/apt/lists/* \
+ && nsys --version
 
 # liger-kernel: pinned via build arg so reproducible. Default tracks the
 # stable PyPI release. Bump LIGER_VERSION (or override LIGER_REF to a git ref)
@@ -94,6 +108,7 @@ ENV SWORDFISH_SHA=${SWORDFISH_SHA}
 # the autoresearch-pytorch-ray base via the CUDA toolkit; skip if missing in
 # a future base bump.
 RUN ncu --version | head -1 \
+ && nsys --version | head -1 \
  && python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
  && python -c "from swordfish.runner.liger_perkernel import KERNEL_NAMES; print('liger-perkernel kernels:', KERNEL_NAMES)"
 
