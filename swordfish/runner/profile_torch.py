@@ -81,8 +81,7 @@ def torch_profiler_context(out_path: Path | None) -> Iterator[None]:
         from torch.profiler import ProfilerActivity, profile
     except ImportError as exc:  # pragma: no cover — torch always present in image
         print(
-            f"[swordfish-profile] torch.profiler unavailable ({exc}); "
-            "running without profile",
+            f"[swordfish-profile] torch.profiler unavailable ({exc}); running without profile",
             file=sys.stderr,
         )
         yield
@@ -98,8 +97,7 @@ def torch_profiler_context(out_path: Path | None) -> Iterator[None]:
         pass
 
     print(
-        f"[swordfish-profile] torch.profiler enabled (activities={activities}, "
-        f"out={out_path})",
+        f"[swordfish-profile] torch.profiler enabled (activities={activities}, out={out_path})",
         file=sys.stderr,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)

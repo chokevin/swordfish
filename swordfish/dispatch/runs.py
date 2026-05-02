@@ -109,9 +109,7 @@ def _resolve_torch_profile(
     if profile_mode != "torch":
         return profile_mode, env
     env.setdefault("SWORDFISH_PROFILE", "torch")
-    env.setdefault(
-        "SWORDFISH_PROFILE_OUT", _profile_out_path_for(resolved_name, "torch")
-    )
+    env.setdefault("SWORDFISH_PROFILE_OUT", _profile_out_path_for(resolved_name, "torch"))
     return None, env
 
 

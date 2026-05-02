@@ -101,3 +101,36 @@ make completion-report
 The report writes `docs/dashboard/completion-report.md` by default, includes the
 same strict matrix gate used by `make validate-results`, and summarizes the
 indexed artifacts found under `RESULT_DIR`.
+
+## Inspecting a finished run locally (Mac)
+
+The day-to-day kernel-tuning loop is: edit kernel → submit to cluster → fetch
+artifacts → open the trace in `ncu-ui` / `nsys-ui` on the Mac. The `inspect-run`
+subcommand collapses fetch-and-open into one step.
+
+```bash
+# Submit with a profile mode (only ncu / nsys produce a binary trace; torch
+# produces a chrome-trace JSON via swordfish.runner.profile_torch).
+uv run python -m swordfish.runner submit-bench \
+  --workload liger-rmsnorm --arch h100 --profile-mode ncu \
+  --name sf-liger-rmsnorm-h100-tune-001
+
+# ... wait for the job to finish ...
+
+# Pull the result JSON + the .ncu-rep into runs/inspect/<name>/ and open the
+# trace in ncu-ui (file association on macOS):
+uv run python -m swordfish.runner inspect-run \
+  sf-liger-rmsnorm-h100-tune-001 --profile-mode ncu
+```
+
+`inspect-run` is idempotent: re-running with the same name reuses cached files
+unless `--overwrite` is passed. Use `--no-open` to fetch without launching the
+GUI (useful in CI or when iterating on the artifact path). Without
+`--profile-mode`, it fetches only the result JSON.
+
+The `ncu-ui` and `nsys-ui` Mac clients are free downloads from
+[developer.nvidia.com/tools-overview](https://developer.nvidia.com/tools-overview).
+Once installed, double-clicking a `.ncu-rep` (or `open file.ncu-rep`) launches
+the full Speed-of-Light dashboard with occupancy, source-attributed SASS, and
+baseline comparison sets — the same view kernel engineers use to drive Liger /
+Triton kernel work.

@@ -293,6 +293,53 @@ def _cmd_submit_bench(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_inspect_run(args: argparse.Namespace) -> int:
+    """Fetch a finished rune job's artifacts and open the trace locally.
+
+    The day-to-day inspection loop on a Mac:
+      $ python -m swordfish.runner inspect-run NAME --profile-mode ncu
+      ... fetches NAME.json + NAME.ncu-rep into runs/inspect/NAME/ ...
+      ... opens NAME.ncu-rep with ncu-ui (via macOS `open`) ...
+
+    Idempotent: re-running with the same name skips re-fetch unless
+    --overwrite is passed. Use --no-open to fetch without launching the GUI.
+    """
+    from swordfish.dispatch import fetch_run_artifacts
+
+    local_dir = args.local_dir or Path("runs/inspect") / args.name
+    fetched = fetch_run_artifacts(
+        name=args.name,
+        profile_mode=args.profile_mode,
+        local_dir=local_dir,
+        namespace=args.namespace,
+        context=args.context,
+        pvc=args.pvc,
+        overwrite=args.overwrite,
+    )
+
+    print(f"result json:      {fetched.result_json}", file=sys.stderr)
+    if fetched.profile_artifact:
+        print(f"profile artifact: {fetched.profile_artifact}", file=sys.stderr)
+
+    if args.open and fetched.profile_artifact:
+        # macOS `open` triggers the .ncu-rep / .nsys-rep file association
+        # (ncu-ui / nsys-ui) when those Mac clients are installed; otherwise
+        # falls back to whatever the user has registered (or no-op + stderr
+        # message). On Linux this would be `xdg-open`; we punt on that
+        # because the developer loop is Mac-first today.
+        if sys.platform != "darwin":
+            print(
+                f"--open requested but platform is {sys.platform!r}; "
+                f"open {fetched.profile_artifact} manually",
+                file=sys.stderr,
+            )
+        else:
+            import subprocess
+
+            subprocess.run(["open", str(fetched.profile_artifact)], check=False)
+    return 0
+
+
 def _cmd_generate_rune_profiles(args: argparse.Namespace) -> int:
     rendered = render_pack_yaml()
     out: Path = args.out
@@ -585,6 +632,53 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     submit.set_defaults(func=_cmd_submit_bench)
+
+    inspect = sub.add_parser(
+        "inspect-run",
+        help="fetch a finished rune job's artifacts and open the trace locally "
+        "(macOS opens .ncu-rep with ncu-ui, .nsys-rep with nsys-ui)",
+    )
+    inspect.add_argument("name", help="rune job name (the value printed by `submit-bench`)")
+    inspect.add_argument(
+        "--profile-mode",
+        choices=["ncu", "nsys", "torch"],
+        default=None,
+        help="profile mode the job was submitted with; required to fetch the trace",
+    )
+    inspect.add_argument(
+        "--local-dir",
+        type=Path,
+        default=None,
+        help="cache directory for fetched artifacts (default: runs/inspect/<name>/)",
+    )
+    inspect.add_argument(
+        "--namespace",
+        default="ray",
+        help="kubernetes namespace the job ran in (default: ray)",
+    )
+    inspect.add_argument(
+        "--context",
+        default=None,
+        help="kubectl context (default: current)",
+    )
+    inspect.add_argument(
+        "--pvc",
+        default=None,
+        help="override the PVC name when fetching the profile artifact "
+        "(default: use the recorded annotation)",
+    )
+    inspect.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="re-fetch even when local copies already exist",
+    )
+    inspect.add_argument(
+        "--no-open",
+        dest="open",
+        action="store_false",
+        help="do not auto-open the trace after fetch (default: open on macOS)",
+    )
+    inspect.set_defaults(func=_cmd_inspect_run, open=True)
 
     profiles_cmd = sub.add_parser(
         "generate-rune-profiles",

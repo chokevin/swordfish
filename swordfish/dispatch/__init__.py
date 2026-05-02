@@ -21,9 +21,11 @@ from swordfish.dispatch.image import (
 )
 from swordfish.dispatch.results import (
     FetchedResult,
+    FetchedRunArtifacts,
     ResultFetchError,
     RuneSubmitGetMissingAnnotationsError,
     fetch_result,
+    fetch_run_artifacts,
     fetch_via_rune_submit_get,
 )
 from swordfish.dispatch.rune import (
@@ -51,6 +53,7 @@ __all__ = [
     "DEFAULT_PRESET",
     "DEFAULT_PVC",
     "FetchedResult",
+    "FetchedRunArtifacts",
     "ImageBuildError",
     "LigerPerkernelMatrix",
     "LigerPerkernelRun",
@@ -62,6 +65,7 @@ __all__ = [
     "TorchGemmRun",
     "build_and_push_dev_image",
     "fetch_result",
+    "fetch_run_artifacts",
     "fetch_via_rune_submit_get",
     "find_topology_policy",
     "topology_policy_env",

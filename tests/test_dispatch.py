@@ -275,10 +275,7 @@ def test_liger_perkernel_run_profile_mode_torch_does_not_pass_to_rune():
     # Env vars must be injected so the in-pod bash script + python main can opt in
     env_args = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
     assert "SWORDFISH_PROFILE=torch" in env_args
-    assert (
-        "SWORDFISH_PROFILE_OUT=/data/sf-liger-rmsnorm-a100/profile/profile.json"
-        in env_args
-    )
+    assert "SWORDFISH_PROFILE_OUT=/data/sf-liger-rmsnorm-a100/profile/profile.json" in env_args
 
 
 def test_liger_perkernel_run_profile_mode_torch_uses_json_extension():
@@ -581,6 +578,117 @@ def test_liger_perkernel_run_fetch_result_traces_use_explicit_path_pvc_artifact(
 
 
 # ---------------------------------------------------------------------------
+# fetch_run_artifacts (name-only inspection helper)
+# ---------------------------------------------------------------------------
+
+
+def _patch_rune_get_returning(monkeypatch, payloads: dict[str, bytes]):
+    """Make fetch_via_rune_submit_get return payloads keyed by 'has overrides'.
+
+    payloads keys: 'json' (no path/pvc/artifact) and 'trace' (with overrides).
+    Records each call's kwargs in returned list for assertion.
+    """
+    calls: list[dict] = []
+
+    def fake_rune_get(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("path"):
+            return payloads["trace"]
+        return payloads["json"]
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    return calls
+
+
+def test_fetch_run_artifacts_json_only_when_profile_mode_unset(monkeypatch, tmp_path):
+    from swordfish.dispatch import fetch_run_artifacts
+
+    calls = _patch_rune_get_returning(monkeypatch, {"json": b'{"k":1}', "trace": b"NA"})
+
+    fetched = fetch_run_artifacts(name="job1", local_dir=tmp_path)
+
+    assert len(calls) == 1, "no profile_mode → only one rune call (json)"
+    assert calls[0].get("path") is None
+    assert fetched.result_json == tmp_path / "job1.json"
+    assert fetched.profile_artifact is None
+    assert fetched.parsed_json == {"k": 1}
+
+
+def test_fetch_run_artifacts_pulls_ncu_rep_with_explicit_path_and_artifact(monkeypatch, tmp_path):
+    from swordfish.dispatch import fetch_run_artifacts
+
+    payloads = {"json": b'{"ok":true}', "trace": b"\x00NCUREP\xff" * 32}
+    calls = _patch_rune_get_returning(monkeypatch, payloads)
+
+    fetched = fetch_run_artifacts(
+        name="sf-liger-rmsnorm-h100",
+        profile_mode="ncu",
+        local_dir=tmp_path,
+        pvc="training-nfs",
+    )
+
+    assert len(calls) == 2
+    json_call, trace_call = calls
+    assert json_call.get("path") is None and json_call.get("artifact") is None
+    # Profile fetch uses the rune-hardcoded /data/<name>/profile path:
+    assert trace_call["path"] == "/data/sf-liger-rmsnorm-h100/profile"
+    assert trace_call["pvc"] == "training-nfs"
+    assert trace_call["artifact"] == "profile.ncu-rep"
+
+    assert fetched.result_json.read_bytes() == payloads["json"]
+    assert fetched.profile_artifact is not None
+    assert fetched.profile_artifact.name == "sf-liger-rmsnorm-h100.ncu-rep"
+    assert fetched.profile_artifact.read_bytes() == payloads["trace"]
+    assert fetched.profile_mode == "ncu"
+
+
+def test_fetch_run_artifacts_skips_refetch_when_files_exist(monkeypatch, tmp_path):
+    from swordfish.dispatch import fetch_run_artifacts
+
+    payloads = {"json": b'{"first":true}', "trace": b"NCUFIRST"}
+    calls = _patch_rune_get_returning(monkeypatch, payloads)
+
+    fetch_run_artifacts(name="j", profile_mode="ncu", local_dir=tmp_path)
+    assert len(calls) == 2
+
+    # Second call: nothing fetched, files reused
+    fetch_run_artifacts(name="j", profile_mode="ncu", local_dir=tmp_path)
+    assert len(calls) == 2, "cached files must short-circuit"
+
+    # overwrite=True forces re-fetch
+    fetch_run_artifacts(name="j", profile_mode="ncu", local_dir=tmp_path, overwrite=True)
+    assert len(calls) == 4
+
+
+def test_fetch_run_artifacts_uses_nsys_extension_for_nsys_mode(monkeypatch, tmp_path):
+    from swordfish.dispatch import fetch_run_artifacts
+
+    calls = _patch_rune_get_returning(monkeypatch, {"json": b"{}", "trace": b"NSYSREP"})
+    fetched = fetch_run_artifacts(name="j", profile_mode="nsys", local_dir=tmp_path)
+    assert calls[1]["artifact"] == "profile.nsys-rep"
+    assert fetched.profile_artifact is not None
+    assert fetched.profile_artifact.name == "j.nsys-rep"
+
+
+def test_fetch_run_artifacts_rejects_unknown_profile_mode(tmp_path):
+    from swordfish.dispatch import fetch_run_artifacts
+
+    with pytest.raises(ValueError, match="profile_mode"):
+        fetch_run_artifacts(name="j", profile_mode="bogus", local_dir=tmp_path)
+
+
+def test_fetch_run_artifacts_propagates_missing_annotations_error(monkeypatch, tmp_path):
+    from swordfish.dispatch import fetch_run_artifacts
+
+    def fake_rune_get(**kwargs):
+        raise RuneSubmitGetMissingAnnotationsError("legacy job has no result-path")
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    with pytest.raises(RuneSubmitGetMissingAnnotationsError):
+        fetch_run_artifacts(name="legacy", local_dir=tmp_path)
+
+
+# ---------------------------------------------------------------------------
 # TorchGemmRun
 # ---------------------------------------------------------------------------
 
@@ -810,3 +918,142 @@ def test_generate_rune_profiles_writes_when_no_check(tmp_path):
     rc = cli.main(["generate-rune-profiles", "--out", str(target)])
     assert rc == 0
     assert target.read_text() == render_pack_yaml()
+
+
+# ---------------------------------------------------------------------------
+# inspect-run CLI
+# ---------------------------------------------------------------------------
+
+
+def _patch_inspect_helpers(monkeypatch, payloads):
+    """Stub the rune fetch and macOS `open` so inspect-run can run on a Mac
+    with no rune binary installed.
+
+    payloads maps 'json' / 'trace' to bytes returned by fetch_via_rune_submit_get.
+    Returns (rune_calls, open_calls) lists for assertion.
+    """
+    rune_calls: list[dict] = []
+    open_calls: list[list[str]] = []
+
+    def fake_rune_get(**kwargs):
+        rune_calls.append(kwargs)
+        return payloads["trace"] if kwargs.get("path") else payloads["json"]
+
+    def fake_subprocess_run(args, **kwargs):
+        open_calls.append(list(args))
+
+        class P:
+            returncode = 0
+
+        return P()
+
+    monkeypatch.setattr("swordfish.dispatch.results.fetch_via_rune_submit_get", fake_rune_get)
+    monkeypatch.setattr("subprocess.run", fake_subprocess_run)
+    return rune_calls, open_calls
+
+
+def test_inspect_run_cli_fetches_json_only_when_no_profile_mode(monkeypatch, tmp_path):
+    from swordfish.runner import cli
+
+    rune_calls, open_calls = _patch_inspect_helpers(
+        monkeypatch, {"json": b'{"x":1}', "trace": b"NOPE"}
+    )
+
+    rc = cli.main(["inspect-run", "myjob", "--local-dir", str(tmp_path), "--no-open"])
+
+    assert rc == 0
+    assert len(rune_calls) == 1
+    assert (tmp_path / "myjob.json").read_bytes() == b'{"x":1}'
+    # No profile artifact, no open call regardless of --open
+    assert open_calls == []
+
+
+def test_inspect_run_cli_fetches_ncu_rep_and_opens_on_macos(monkeypatch, tmp_path):
+    from swordfish.runner import cli
+
+    payloads = {"json": b'{"k":1}', "trace": b"\x00NCUREP\xff" * 8}
+    rune_calls, open_calls = _patch_inspect_helpers(monkeypatch, payloads)
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    rc = cli.main(
+        [
+            "inspect-run",
+            "sf-liger-rmsnorm-h100",
+            "--profile-mode",
+            "ncu",
+            "--local-dir",
+            str(tmp_path),
+            "--pvc",
+            "training-nfs",
+        ]
+    )
+
+    assert rc == 0
+    assert len(rune_calls) == 2
+    json_call, trace_call = rune_calls
+    assert json_call.get("path") is None
+    assert trace_call["path"] == "/data/sf-liger-rmsnorm-h100/profile"
+    assert trace_call["pvc"] == "training-nfs"
+    assert trace_call["artifact"] == "profile.ncu-rep"
+
+    trace_local = tmp_path / "sf-liger-rmsnorm-h100.ncu-rep"
+    assert trace_local.read_bytes() == payloads["trace"]
+    assert open_calls == [["open", str(trace_local)]]
+
+
+def test_inspect_run_cli_no_open_flag_skips_subprocess(monkeypatch, tmp_path):
+    from swordfish.runner import cli
+
+    rune_calls, open_calls = _patch_inspect_helpers(monkeypatch, {"json": b"{}", "trace": b"X"})
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    rc = cli.main(
+        [
+            "inspect-run",
+            "j",
+            "--profile-mode",
+            "ncu",
+            "--local-dir",
+            str(tmp_path),
+            "--no-open",
+        ]
+    )
+
+    assert rc == 0
+    assert open_calls == [], "--no-open must NOT shell out to `open`"
+
+
+def test_inspect_run_cli_skips_open_on_non_darwin(monkeypatch, tmp_path, capsys):
+    from swordfish.runner import cli
+
+    rune_calls, open_calls = _patch_inspect_helpers(monkeypatch, {"json": b"{}", "trace": b"X"})
+    monkeypatch.setattr("sys.platform", "linux")
+
+    rc = cli.main(
+        [
+            "inspect-run",
+            "j",
+            "--profile-mode",
+            "ncu",
+            "--local-dir",
+            str(tmp_path),
+        ]
+    )
+
+    assert rc == 0
+    assert open_calls == [], "non-Mac platforms must not invoke `open`"
+    err = capsys.readouterr().err
+    assert "open" in err.lower()  # printed a hint instead
+
+
+def test_inspect_run_cli_default_local_dir_is_runs_inspect_name(monkeypatch, tmp_path):
+    """Without --local-dir, defaults to runs/inspect/<name>/ relative to cwd."""
+    from swordfish.runner import cli
+
+    rune_calls, open_calls = _patch_inspect_helpers(monkeypatch, {"json": b"{}", "trace": b""})
+    monkeypatch.chdir(tmp_path)
+
+    rc = cli.main(["inspect-run", "myjob", "--no-open"])
+
+    assert rc == 0
+    assert (tmp_path / "runs" / "inspect" / "myjob" / "myjob.json").exists()

@@ -50,6 +50,107 @@ class FetchedResult:
         return json.loads(self.local_path.read_text())
 
 
+def fetch_run_artifacts(
+    *,
+    name: str,
+    profile_mode: str | None = None,
+    local_dir: Path | str,
+    namespace: str = "ray",
+    context: str | None = None,
+    pvc: str | None = None,
+    rune_bin: str = "rune",
+    profile_dir: str | None = None,
+    overwrite: bool = False,
+) -> "FetchedRunArtifacts":
+    """Pull every artifact for one rune job into a local cache directory.
+
+    The day-to-day inspection helper. Given a job NAME and (optionally) the
+    profile mode it was submitted with, fetches:
+
+      1. The result JSON via plain `rune submit get NAME -o raw` (uses the
+         `airun.aks.io/result-{path,pvc}` annotations recorded by `--output`).
+      2. If `profile_mode` is set, the matching binary trace
+         (`profile.ncu-rep` / `profile.nsys-rep` / `profile.json`) via
+         explicit `--path /data/<name>/profile --artifact profile.<ext>`.
+         The PVC defaults to the recorded annotation; pass `pvc=` to override.
+
+    Returns a `FetchedRunArtifacts` describing where each file landed.
+
+    Skips re-fetch when the local file exists unless `overwrite=True`. This
+    keeps the inspection loop snappy when iterating on the same job.
+
+    Raises `ResultFetchError` (or `RuneSubmitGetMissingAnnotationsError`) if
+    rune can't find the job's result-path annotation — caller resubmits with
+    `rune submit --output PATH` or passes the path/pvc explicitly via the
+    `LigerPerkernelRun.fetch_result` path instead.
+    """
+    if profile_mode is not None and profile_mode not in ("ncu", "nsys", "torch"):
+        raise ValueError(
+            f"profile_mode {profile_mode!r} not in ('ncu','nsys','torch'); "
+            "leave None to skip profile fetch"
+        )
+
+    out_dir = Path(local_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    json_local = out_dir / f"{name}.json"
+    if overwrite or not json_local.exists():
+        json_bytes = fetch_via_rune_submit_get(
+            name=name,
+            namespace=namespace,
+            context=context,
+            rune_bin=rune_bin,
+        )
+        json_local.write_bytes(json_bytes)
+
+    profile_local: Path | None = None
+    if profile_mode is not None:
+        ext = _PROFILE_EXTENSIONS[profile_mode]
+        profile_local = out_dir / f"{name}.{ext}"
+        if overwrite or not profile_local.exists():
+            path = profile_dir or f"/data/{name}/profile"
+            artifact = f"profile.{ext}"
+            trace_bytes = fetch_via_rune_submit_get(
+                name=name,
+                namespace=namespace,
+                context=context,
+                path=path,
+                pvc=pvc,
+                artifact=artifact,
+                rune_bin=rune_bin,
+            )
+            profile_local.write_bytes(trace_bytes)
+
+    return FetchedRunArtifacts(
+        name=name,
+        local_dir=out_dir,
+        result_json=json_local,
+        profile_artifact=profile_local,
+        profile_mode=profile_mode,
+    )
+
+
+@dataclass(frozen=True)
+class FetchedRunArtifacts:
+    """Local-disk handle to everything `fetch_run_artifacts` pulled down."""
+
+    name: str
+    local_dir: Path
+    result_json: Path
+    profile_artifact: Path | None
+    profile_mode: str | None
+
+    @property
+    def parsed_json(self) -> dict:
+        return json.loads(self.result_json.read_text())
+
+
+# Mirrors swordfish.dispatch.runs.PROFILE_EXTENSIONS — duplicated here to keep
+# this module free of a circular import (runs.py already imports FetchedResult
+# from this file).
+_PROFILE_EXTENSIONS = {"ncu": "ncu-rep", "nsys": "nsys-rep", "torch": "json"}
+
+
 def fetch_via_rune_submit_get(
     *,
     name: str,

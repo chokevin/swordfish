@@ -185,7 +185,7 @@ def _render_one(profile: ProfileSpec) -> str:
         f"      deviceClass: {DRA_DEVICE_CLASS}\n"
         f"      claimTemplate: {DRA_CLAIM_TEMPLATE}\n"
         "    requests:\n"
-        f"      cpu: \"{CPU_REQUEST}\"\n"
+        f'      cpu: "{CPU_REQUEST}"\n'
         f"      memory: {MEMORY_REQUEST}\n"
         "    persistence:\n"
         f"      - pvcName: {PVC_NAME}\n"
