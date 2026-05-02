@@ -167,6 +167,29 @@ def _parse_float(raw: str) -> float | None:
         return None
 
 
+# Friendly metric names → canonical engine names. Rune's default ncu invocation
+# (no `--section`) emits human-readable metric names like "Duration"; the
+# legacy SWORDFISH_PROFILE=ncu path (with explicit `--section LaunchStats
+# Occupancy SpeedOfLight MemoryWorkloadAnalysis`) emits engine names. Map the
+# friendly form into the engine form so the rest of the parser and the display
+# table are naming-convention agnostic.
+_FRIENDLY_TO_ENGINE_METRIC: dict[str, str] = {
+    "Duration": "gpu__time_duration.sum",
+    "Compute (SM) Throughput": "sm__throughput.avg.pct_of_peak_sustained_elapsed",
+    "Memory Throughput": "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
+    "DRAM Throughput": "dram__throughput.avg.pct_of_peak_sustained_elapsed",
+}
+
+# Time units NCU may emit for Duration; values normalized to nanoseconds so
+# downstream code can treat gpu__time_duration.sum uniformly.
+_TIME_UNIT_TO_NS: dict[str, float] = {
+    "ns": 1.0,
+    "us": 1e3,
+    "ms": 1e6,
+    "s": 1e9,
+}
+
+
 def parse_ncu_csv_full(path: Path) -> NcuSummary:
     """Parse an NCU CSV export into per-kernel + per-metric statistics.
 
@@ -216,7 +239,11 @@ def parse_ncu_csv_full(path: Path) -> NcuSummary:
                 f"non-numeric value {row.get('Metric Value')!r}"
             )
             continue
-        invocations[kname][inv_id][metric] = (unit, value)
+        canonical = _FRIENDLY_TO_ENGINE_METRIC.get(metric, metric)
+        if canonical == "gpu__time_duration.sum" and unit in _TIME_UNIT_TO_NS:
+            value = value * _TIME_UNIT_TO_NS[unit]
+            unit = "ns"
+        invocations[kname][inv_id][canonical] = (unit, value)
         block_grid.setdefault(kname, (row.get("Block Size") or "", row.get("Grid Size") or ""))
 
     kernels: list[KernelStats] = []
@@ -350,14 +377,49 @@ def _import_ncu_report() -> Any:
 
     Raises NcuReportUnavailableError with install instructions on failure.
     """
+    import importlib.machinery
     import importlib.util
+    import sys
 
     override = os.environ.get("NCU_REPORT_PYTHON_DIR")
 
+    def _find_native_companion(d: Path) -> Path | None:
+        """Locate the SWIG `_ncu_report` extension in the same dir as ncu_report.py.
+
+        On Mac it's `_ncu_report.so`; on Linux it may carry a CPython suffix
+        like `_ncu_report.cpython-311-x86_64-linux-gnu.so`. We accept any.
+        """
+        for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+            cand = d / f"_ncu_report{suffix}"
+            if cand.is_file():
+                return cand
+        # Fallback to a glob over `_ncu_report*.so` for unusual layouts.
+        for cand in d.glob("_ncu_report*"):
+            if cand.suffix in {".so", ".pyd", ".dylib"}:
+                return cand
+        return None
+
     def _try_load_from_dir(d: str) -> Any | None:
-        py = Path(d) / "ncu_report.py"
+        dir_path = Path(d)
+        py = dir_path / "ncu_report.py"
         if not py.is_file():
             return None
+
+        # The SWIG-generated ncu_report.py wrapper does `import _ncu_report`.
+        # When loaded via spec_from_file_location, the companion .so isn't on
+        # sys.path, so we pre-register it in sys.modules ourselves.
+        native = _find_native_companion(dir_path)
+        if native is not None and "_ncu_report" not in sys.modules:
+            ext_spec = importlib.util.spec_from_file_location("_ncu_report", native)
+            if ext_spec is not None and ext_spec.loader is not None:
+                try:
+                    ext_mod = importlib.util.module_from_spec(ext_spec)
+                    sys.modules["_ncu_report"] = ext_mod
+                    ext_spec.loader.exec_module(ext_mod)
+                except Exception:  # pragma: no cover — only when .so is broken
+                    sys.modules.pop("_ncu_report", None)
+                    return None
+
         spec = importlib.util.spec_from_file_location("ncu_report", py)
         if spec is None or spec.loader is None:
             return None

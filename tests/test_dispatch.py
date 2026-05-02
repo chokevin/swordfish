@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -1102,6 +1103,48 @@ def test_inspect_run_cli_auto_prints_ncu_summary_when_csv_companion_present(
     captured = capsys.readouterr()
     assert "NCU summary:" in captured.out
     assert "my_kernel" in captured.out
+
+
+def test_parse_ncu_csv_full_handles_friendly_metric_names_from_default_ncu():
+    """The cluster-side `convert-ncu` runs `ncu --import REP --csv --page details`
+    against a .ncu-rep produced by rune's default ncu invocation (no `--section`).
+    That path emits human-readable metric names like "Duration" (us) and
+    "Compute (SM) Throughput" (%) instead of engine names like
+    `gpu__time_duration.sum` (ns) and
+    `sm__throughput.avg.pct_of_peak_sustained_elapsed` (%). The parser must
+    canonicalize these so total_time, mean/max time, and the SM%/MEM%/DRAM%
+    display columns are populated regardless of which capture path was used.
+    """
+    from swordfish.runner.ncu_summary import parse_ncu_csv_full
+
+    csv_text = "\n".join(
+        [
+            '"ID","Kernel Name","Block Size","Grid Size",'
+            '"Metric Name","Metric Unit","Metric Value"',
+            # Duration in us → must be normalized to 500_000 ns.
+            '"0","my_kernel","(1,1,1)","(1,1,1)","Duration","us","500"',
+            '"0","my_kernel","(1,1,1)","(1,1,1)","Compute (SM) Throughput","%","42.0"',
+            '"0","my_kernel","(1,1,1)","(1,1,1)","Memory Throughput","%","17.5"',
+            '"0","my_kernel","(1,1,1)","(1,1,1)","DRAM Throughput","%","8.25"',
+        ]
+    )
+    p = Path(tempfile.mkdtemp()) / "friendly.ncu.csv"
+    p.write_text(csv_text)
+
+    summary = parse_ncu_csv_full(p)
+
+    assert summary.unique_kernels == 1
+    assert summary.total_invocations == 1
+    # 500 us -> 500_000 ns
+    assert summary.total_time_ns == 500_000.0
+    k = summary.kernels[0]
+    assert k.short_name == "my_kernel"
+    sm = k.metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"]
+    mem = k.metrics["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"]
+    dram = k.metrics["dram__throughput.avg.pct_of_peak_sustained_elapsed"]
+    assert sm.mean == 42.0
+    assert mem.mean == 17.5
+    assert dram.mean == 8.25
 
 
 def test_inspect_run_cli_prints_install_hint_when_only_ncu_rep_is_fetched(

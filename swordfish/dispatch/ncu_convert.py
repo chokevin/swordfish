@@ -78,7 +78,11 @@ spec:
             exit 2
           fi
           echo "converting $REP_PATH -> $CSV_PATH"
-          ncu --import "$REP_PATH" --csv --log-file "$CSV_PATH" --page raw
+          # `--page details` produces the long-form CSV (one row per
+          # kernel×section×metric) that swordfish.runner.ncu_summary.parse_ncu_csv_full
+          # expects. `--page raw` produces a wide-form CSV that our parser
+          # can't read; do not use it here.
+          ncu --import "$REP_PATH" --csv --log-file "$CSV_PATH" --page details
           echo "done; $(wc -c < "$CSV_PATH") bytes written"
       env:
         - name: REP_PATH
