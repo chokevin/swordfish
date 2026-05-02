@@ -1107,9 +1107,9 @@ def test_inspect_run_cli_auto_prints_ncu_summary_when_csv_companion_present(
 def test_inspect_run_cli_prints_install_hint_when_only_ncu_rep_is_fetched(
     monkeypatch, tmp_path, capsys
 ):
-    """When --profile-mode=ncu fetches only the .ncu-rep (the common case
-    today, since cluster-side conversion hasn't shipped yet), inspect-run
-    prints a stderr hint pointing the user at `ncu --import` + ncu-summary
+    """When --profile-mode=ncu fetches only the .ncu-rep AND we can't parse
+    it locally (e.g., ncu_report module missing OR file corrupted), inspect-run
+    prints a stderr hint pointing the user at `brew install` + ncu-summary
     instead of silently skipping the readable summary path.
     """
     from swordfish.runner import cli
@@ -1117,6 +1117,16 @@ def test_inspect_run_cli_prints_install_hint_when_only_ncu_rep_is_fetched(
     payloads = {"json": b"{}", "trace": b"\x00NCUREP\xff"}
     _patch_inspect_helpers(monkeypatch, payloads)
     monkeypatch.setattr("sys.platform", "darwin")
+    # Force the parser to raise NcuReportUnavailableError so we exercise the
+    # hint path deterministically (otherwise the test depends on whether
+    # ncu_report is installed on the dev box).
+    from swordfish.runner import ncu_summary as nsum
+
+    def _raise_unavailable(_path):
+        raise nsum.NcuReportUnavailableError("test: simulating missing module")
+
+    monkeypatch.setattr(nsum, "summarize_ncu_file", _raise_unavailable)
+    monkeypatch.setattr(cli, "summarize_ncu_file", _raise_unavailable, raising=False)
 
     rc = cli.main(
         [
@@ -1132,4 +1142,264 @@ def test_inspect_run_cli_prints_install_hint_when_only_ncu_rep_is_fetched(
 
     assert rc == 0
     err = capsys.readouterr().err
-    assert "ncu --import" in err and "ncu-summary" in err
+    assert "brew install" in err and "ncu-summary" in err
+
+
+# -----------------------------------------------------------------------------
+# Cluster-side .ncu-rep -> .ncu-summary.csv converter (swordfish.dispatch.ncu_convert)
+# -----------------------------------------------------------------------------
+
+
+def _patch_kubectl(monkeypatch, scripted_responses):
+    """Stub subprocess.run so the converter sees a sequence of canned kubectl
+    responses without ever hitting a real cluster.
+
+    scripted_responses is a list of dicts:
+      [{"argv_substr": "apply",          "rc": 0, "stdout": "...", "stderr": ""},
+       {"argv_substr": "get pod",        "rc": 0, "stdout": "{json}", "stderr": ""},
+       ...]
+    Returned in order; if the call doesn't match argv_substr we still return
+    the next entry but the test assertion will pick up the mismatch.
+
+    Returns the list of (argv, input) tuples actually called for inspection.
+    """
+    calls: list[tuple[list[str], str | None]] = []
+    iterator = iter(scripted_responses)
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs.get("input")))
+        try:
+            resp = next(iterator)
+        except StopIteration:
+            resp = {"rc": 0, "stdout": "", "stderr": ""}
+
+        class P:
+            returncode = resp["rc"]
+            stdout = resp.get("stdout", "")
+            stderr = resp.get("stderr", "")
+
+        return P()
+
+    # Patch BOTH the global subprocess.run and the alias used inside ncu_convert.
+    monkeypatch.setattr("subprocess.run", fake_run)
+    return calls
+
+
+def test_submit_ncu_convert_happy_path_creates_pod_and_waits_for_succeeded(monkeypatch):
+    from swordfish.dispatch import submit_ncu_convert
+
+    # Make the function think kubectl exists.
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/local/bin/kubectl")
+    # Make the pod-name suffix deterministic for assertion.
+    monkeypatch.setattr("time.time", lambda: 1234567890)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+
+    scripted = [
+        # apply -f -
+        {"rc": 0, "stdout": "pod/sf-ncu-convert-myjob-67890 created\n", "stderr": ""},
+        # get pod ... -o json (Succeeded)
+        {"rc": 0, "stdout": '{"status":{"phase":"Succeeded"}}', "stderr": ""},
+        # delete pod ... --wait=false
+        {"rc": 0, "stdout": "pod deleted", "stderr": ""},
+    ]
+    calls = _patch_kubectl(monkeypatch, scripted)
+
+    result = submit_ncu_convert(
+        job_name="myjob",
+        namespace="ray",
+        pvc="training-nfs",
+        timeout_seconds=10,
+        poll_interval_seconds=0.0,
+    )
+
+    assert result.pod_name.startswith("sf-ncu-convert-myjob-")
+    assert result.rep_path == "/data/myjob/profile/profile.ncu-rep"
+    assert result.csv_path == "/data/myjob/profile/profile.ncu-summary.csv"
+
+    # Apply was called with stdin containing the rendered Pod YAML.
+    apply_argv, apply_stdin = calls[0]
+    assert "apply" in apply_argv
+    assert apply_stdin is not None
+    assert "kind: Pod" in apply_stdin
+    assert "claimName: training-nfs" in apply_stdin
+    assert "/data/myjob/profile/profile.ncu-rep" in apply_stdin
+    assert "/data/myjob/profile/profile.ncu-summary.csv" in apply_stdin
+
+    # Cleanup happened on success.
+    assert any("delete" in argv for argv, _ in calls)
+
+
+def test_submit_ncu_convert_raises_when_kubectl_apply_fails(monkeypatch):
+    from swordfish.dispatch import NcuConvertError, submit_ncu_convert
+
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/local/bin/kubectl")
+    scripted = [
+        {"rc": 1, "stdout": "", "stderr": "Error from server (NotFound): pvc not found"},
+    ]
+    _patch_kubectl(monkeypatch, scripted)
+
+    with pytest.raises(NcuConvertError) as excinfo:
+        submit_ncu_convert(job_name="myjob", timeout_seconds=5, poll_interval_seconds=0.0)
+    assert "kubectl apply failed" in str(excinfo.value)
+    assert "pvc not found" in str(excinfo.value)
+
+
+def test_submit_ncu_convert_raises_on_pod_failed_and_includes_logs(monkeypatch):
+    from swordfish.dispatch import NcuConvertError, submit_ncu_convert
+
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/local/bin/kubectl")
+    monkeypatch.setattr("time.time", lambda: 100)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+
+    scripted = [
+        # apply ok
+        {"rc": 0, "stdout": "pod created", "stderr": ""},
+        # get pod -> Failed
+        {"rc": 0, "stdout": '{"status":{"phase":"Failed"}}', "stderr": ""},
+        # logs
+        {"rc": 0, "stdout": "ncu: failed to import: file truncated\n", "stderr": ""},
+        # delete (cleanup)
+        {"rc": 0, "stdout": "pod deleted", "stderr": ""},
+    ]
+    _patch_kubectl(monkeypatch, scripted)
+
+    with pytest.raises(NcuConvertError) as excinfo:
+        submit_ncu_convert(job_name="myjob", timeout_seconds=10, poll_interval_seconds=0.0)
+    msg = str(excinfo.value)
+    assert "did not succeed" in msg
+    assert "file truncated" in msg
+
+
+def test_submit_ncu_convert_times_out_when_pod_never_terminal(monkeypatch):
+    from swordfish.dispatch import NcuConvertError, submit_ncu_convert
+
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/local/bin/kubectl")
+    monkeypatch.setattr("time.time", lambda: 100)
+    # Deterministic clock: monotonic returns 0, then 999 (past timeout).
+    times = iter([0.0, 0.0, 999.0, 999.0])
+    monkeypatch.setattr("time.monotonic", lambda: next(times, 999.0))
+    monkeypatch.setattr("time.sleep", lambda _: None)
+
+    scripted = [
+        # apply ok
+        {"rc": 0, "stdout": "pod created", "stderr": ""},
+        # get pod -> Pending (never terminal)
+        {"rc": 0, "stdout": '{"status":{"phase":"Pending"}}', "stderr": ""},
+        # logs probe after timeout
+        {"rc": 0, "stdout": "still pulling image", "stderr": ""},
+        # delete
+        {"rc": 0, "stdout": "pod deleted", "stderr": ""},
+    ]
+    _patch_kubectl(monkeypatch, scripted)
+
+    with pytest.raises(NcuConvertError) as excinfo:
+        submit_ncu_convert(job_name="myjob", timeout_seconds=5, poll_interval_seconds=0.0)
+    assert "did not reach Succeeded" in str(excinfo.value) or "did not succeed" in str(
+        excinfo.value
+    )
+
+
+def test_submit_ncu_convert_honors_explicit_rep_and_csv_paths(monkeypatch):
+    from swordfish.dispatch import submit_ncu_convert
+
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/local/bin/kubectl")
+    monkeypatch.setattr("time.time", lambda: 100)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+
+    scripted = [
+        {"rc": 0, "stdout": "pod created", "stderr": ""},
+        {"rc": 0, "stdout": '{"status":{"phase":"Succeeded"}}', "stderr": ""},
+        {"rc": 0, "stdout": "pod deleted", "stderr": ""},
+    ]
+    calls = _patch_kubectl(monkeypatch, scripted)
+
+    result = submit_ncu_convert(
+        job_name="myjob",
+        rep_path="/mnt/scratch/old.ncu-rep",
+        csv_path="/data/exports/old.csv",
+        timeout_seconds=5,
+        poll_interval_seconds=0.0,
+    )
+
+    assert result.rep_path == "/mnt/scratch/old.ncu-rep"
+    assert result.csv_path == "/data/exports/old.csv"
+    apply_stdin = calls[0][1]
+    assert "/mnt/scratch/old.ncu-rep" in apply_stdin
+    assert "/data/exports/old.csv" in apply_stdin
+
+
+def test_submit_ncu_convert_skips_cleanup_when_disabled(monkeypatch):
+    from swordfish.dispatch import submit_ncu_convert
+
+    monkeypatch.setattr("shutil.which", lambda _b: "/usr/local/bin/kubectl")
+    monkeypatch.setattr("time.time", lambda: 100)
+    monkeypatch.setattr("time.monotonic", lambda: 0.0)
+
+    scripted = [
+        {"rc": 0, "stdout": "pod created", "stderr": ""},
+        {"rc": 0, "stdout": '{"status":{"phase":"Succeeded"}}', "stderr": ""},
+    ]
+    calls = _patch_kubectl(monkeypatch, scripted)
+
+    submit_ncu_convert(
+        job_name="myjob",
+        cleanup=False,
+        timeout_seconds=5,
+        poll_interval_seconds=0.0,
+    )
+
+    assert all("delete" not in argv for argv, _ in calls)
+
+
+def test_submit_ncu_convert_raises_when_kubectl_not_on_path(monkeypatch):
+    from swordfish.dispatch import NcuConvertError, submit_ncu_convert
+
+    monkeypatch.setattr("shutil.which", lambda _b: None)
+    with pytest.raises(NcuConvertError) as excinfo:
+        submit_ncu_convert(job_name="myjob")
+    assert "kubectl" in str(excinfo.value).lower()
+
+
+def test_convert_ncu_cli_subcommand_invokes_submit(monkeypatch, capsys):
+    """The `convert-ncu` CLI subcommand wires args to submit_ncu_convert and
+    pretty-prints the result to stderr.
+    """
+    from swordfish.runner import cli
+
+    captured_kwargs: dict = {}
+
+    def fake_submit(**kwargs):
+        captured_kwargs.update(kwargs)
+        from swordfish.dispatch.ncu_convert import NcuConvertResult
+
+        return NcuConvertResult(
+            pod_name="sf-ncu-convert-myjob-12345",
+            rep_path="/data/myjob/profile/profile.ncu-rep",
+            csv_path="/data/myjob/profile/profile.ncu-summary.csv",
+            elapsed_seconds=12.3,
+        )
+
+    monkeypatch.setattr("swordfish.dispatch.submit_ncu_convert", fake_submit)
+    monkeypatch.setattr("swordfish.dispatch.ncu_convert.submit_ncu_convert", fake_submit)
+
+    rc = cli.main(
+        [
+            "convert-ncu",
+            "myjob",
+            "--namespace",
+            "ray",
+            "--pvc",
+            "custom-pvc",
+            "--image",
+            "ghcr.io/me/img:latest",
+        ]
+    )
+
+    assert rc == 0
+    assert captured_kwargs["job_name"] == "myjob"
+    assert captured_kwargs["namespace"] == "ray"
+    assert captured_kwargs["pvc"] == "custom-pvc"
+    assert captured_kwargs["image"] == "ghcr.io/me/img:latest"
+    err = capsys.readouterr().err
+    assert "sf-ncu-convert-myjob-12345" in err
+    assert "12.3s" in err

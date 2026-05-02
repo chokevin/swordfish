@@ -305,6 +305,7 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
     --overwrite is passed. Use --no-open to fetch without launching the GUI.
     """
     from swordfish.dispatch import fetch_run_artifacts
+    from swordfish.dispatch.results import ResultFetchError
 
     local_dir = args.local_dir or Path("runs/inspect") / args.name
     fetched = fetch_run_artifacts(
@@ -321,32 +322,116 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
     if fetched.profile_artifact:
         print(f"profile artifact: {fetched.profile_artifact}", file=sys.stderr)
 
-    # If a fetched .ncu.csv is sitting next to the .ncu-rep, auto-print the
-    # per-kernel summary on stdout. The .ncu-rep is binary and only readable
-    # in ncu-ui; the .csv is the agent-readable companion. Today, only legacy
-    # SWORDFISH_PROFILE=ncu jobs emit a CSV — `--profile-mode=ncu` jobs only
-    # emit the .ncu-rep, so users on those jobs need to either install Nsight
-    # Compute locally and run `ncu --import <rep> --csv > <csv>` themselves,
-    # or wait for cluster-side dual-emit (tracked separately).
+    # If a CSV companion or the .ncu-rep itself is in the fetched artifacts,
+    # auto-print the per-kernel summary on stdout. The CSV path is pure
+    # stdlib; the .ncu-rep path needs NVIDIA's ncu_report module (ships with
+    # any Nsight Compute install — Mac: `brew install --cask
+    # nvidia-nsight-compute`). When neither readable form is available, we
+    # print an actionable hint instead of silently skipping.
     if args.profile_mode == "ncu":
+        from .ncu_summary import (
+            NcuReportUnavailableError,
+            format_summary_text,
+            summarize_ncu_file,
+        )
+
+        # Prefer CSV when both are present (it's faster and never fails on
+        # Linux dev boxes that don't have ncu_report installed).
         csv_candidates = sorted(local_dir.glob("*.ncu.csv")) + sorted(
             local_dir.glob("*.ncu-summary.csv")
         )
-        if csv_candidates:
-            from .ncu_summary import format_summary_text, parse_ncu_csv_full
+        rep_candidates = sorted(local_dir.glob("*.ncu-rep")) + sorted(local_dir.glob("*.ncu-repz"))
+        targets = csv_candidates if csv_candidates else rep_candidates
 
-            for csv_path in csv_candidates:
-                summary = parse_ncu_csv_full(csv_path)
-                print(format_summary_text(summary))
-        elif fetched.profile_artifact:
+        printed = False
+        for tgt in targets:
+            try:
+                summary = summarize_ncu_file(tgt)
+            except NcuReportUnavailableError as exc:
+                print(
+                    f"warning: cannot read {tgt.name}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            except Exception as exc:
+                # The binary parser can fail on a corrupted .ncu-rep
+                # (truncated PVC fetch, wrong file extension on a JSON, etc).
+                # Don't crash inspect-run; warn and let the install-hint
+                # path below print the user-facing fallback instructions.
+                print(
+                    f"warning: cannot parse {tgt.name}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            print(format_summary_text(summary))
+            printed = True
+
+        # If we couldn't read any local form AND the caller asked for it,
+        # spin up the cluster-side converter, re-fetch, and try again. This
+        # lets a Linux dev box / CI runner with no nsight install still get
+        # the per-kernel summary on stdout — at the cost of one extra Pod.
+        if (
+            not printed
+            and getattr(args, "convert_ncu", False)
+            and rep_candidates
+            and fetched.profile_artifact
+        ):
+            from swordfish.dispatch import NcuConvertError, submit_ncu_convert
+
             print(
-                "tip: no .ncu.csv companion found in fetched artifacts.\n"
-                "     For an agent-readable summary, install Nsight Compute "
-                "locally and run:\n"
-                f"       ncu --import {fetched.profile_artifact} --csv "
-                f"> {fetched.profile_artifact.with_suffix('.csv')}\n"
+                "no readable summary; submitting cluster-side converter Pod...",
+                file=sys.stderr,
+            )
+            try:
+                conv = submit_ncu_convert(
+                    job_name=args.name,
+                    namespace=args.namespace,
+                    pvc=args.convert_ncu_pvc,
+                    image=args.convert_ncu_image,
+                    context=args.context,
+                )
+                print(
+                    f"converter pod {conv.pod_name} done in {conv.elapsed_seconds:.1f}s; "
+                    f"re-fetching {conv.csv_path}",
+                    file=sys.stderr,
+                )
+                # Pull the freshly-written CSV. The PVC name comes from the
+                # converter args (we just used it). The path is computed by
+                # the converter — pass it through explicitly so we don't
+                # depend on rune annotations for this fetch.
+                from swordfish.dispatch import fetch_via_rune_submit_get
+
+                csv_local = local_dir / f"{args.name}.ncu-summary.csv"
+                csv_bytes = fetch_via_rune_submit_get(
+                    name=args.name,
+                    namespace=args.namespace,
+                    context=args.context,
+                    path=str(Path(conv.csv_path).parent),
+                    pvc=args.convert_ncu_pvc,
+                    artifact=Path(conv.csv_path).name,
+                )
+                csv_local.write_bytes(csv_bytes)
+                print(f"wrote {csv_local}", file=sys.stderr)
+                summary = summarize_ncu_file(csv_local)
+                print(format_summary_text(summary))
+                printed = True
+            except (NcuConvertError, ResultFetchError) as exc:
+                print(
+                    f"warning: cluster-side conversion failed: {exc}",
+                    file=sys.stderr,
+                )
+
+        if not printed and fetched.profile_artifact:
+            print(
+                "tip: install Nsight Compute to read the .ncu-rep directly:\n"
+                "       brew install --cask nvidia-nsight-compute   # Mac\n"
+                "     then re-run inspect-run, or invoke directly:\n"
                 "       uv run python -m swordfish.runner ncu-summary "
-                f"{fetched.profile_artifact.with_suffix('.csv')}",
+                f"{fetched.profile_artifact}\n"
+                "     or convert it on the cluster via:\n"
+                "       uv run python -m swordfish.runner convert-ncu "
+                f"{args.name}\n"
+                "     (or pass --convert-ncu to inspect-run to do it inline)",
                 file=sys.stderr,
             )
 
@@ -370,26 +455,74 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_ncu_summary(args: argparse.Namespace) -> int:
-    """Pretty-print a per-kernel summary of an Nsight Compute CSV file.
+    """Pretty-print a per-kernel summary of an Nsight Compute report.
 
-    Reads NCU's CSV export (one row per kernel-invocation × metric), pivots
-    to per-kernel aggregates, and prints a top-N table sorted by total time.
-    Works on legacy `SWORDFISH_PROFILE=ncu` outputs (e.g. the week-1 fixtures
-    in runs/airun/week1/torch-gemm-{a100,h100,h200}.ncu.csv) and on any CSV
-    produced by `ncu --import file.ncu-rep --csv`.
+    Accepts both NCU CSV exports (`*.ncu.csv`, `ncu --csv` output) AND the
+    binary `.ncu-rep` / `.ncu-repz` reports that `--profile-mode=ncu` jobs
+    produce. Dispatches by file extension. The binary path needs NVIDIA's
+    `ncu_report` Python module — install Nsight Compute (e.g. `brew install
+    --cask nvidia-nsight-compute` on Mac) and it's auto-discovered.
 
     See swordfish.runner.ncu_summary for the parser's rationale and limits.
     """
-    from .ncu_summary import format_summary_text, parse_ncu_csv_full
+    from .ncu_summary import (
+        NcuReportUnavailableError,
+        format_summary_text,
+        summarize_ncu_file,
+    )
 
-    summary = parse_ncu_csv_full(args.csv)
+    try:
+        summary = summarize_ncu_file(args.csv)
+    except NcuReportUnavailableError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except FileNotFoundError:
+        print(f"error: file not found: {args.csv}", file=sys.stderr)
+        return 1
+
     if summary.rows == 0:
         print(
-            f"error: no NCU CSV header found in {args.csv}; is this a valid `ncu --csv` export?",
+            f"error: no kernels found in {args.csv}; "
+            "for a CSV check it's a valid `ncu --csv` export, "
+            "for a .ncu-rep check it isn't an empty profile",
             file=sys.stderr,
         )
         return 1
     print(format_summary_text(summary, top_n=args.top, short_name_width=args.name_width))
+    return 0
+
+
+def _cmd_convert_ncu(args: argparse.Namespace) -> int:
+    """Spin up a CPU-only Pod that runs `ncu --import` to convert a
+    cluster-side `.ncu-rep` into a `.ncu-summary.csv` companion on the PVC.
+
+    Useful when the local dev box / CI runner does NOT have Nsight Compute
+    installed (so `ncu_report` can't read the binary directly). Mac users with
+    `brew install --cask nvidia-nsight-compute` should skip this and just run
+    `inspect-run` — `ncu_report` reads the .ncu-rep in-process.
+    """
+    from swordfish.dispatch import NcuConvertError, submit_ncu_convert
+
+    try:
+        result = submit_ncu_convert(
+            job_name=args.name,
+            namespace=args.namespace,
+            pvc=args.pvc,
+            image=args.image,
+            rep_path=args.rep_path,
+            csv_path=args.csv_path,
+            timeout_seconds=args.timeout_seconds,
+            cleanup=args.cleanup,
+            context=args.context,
+        )
+    except NcuConvertError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"converter pod:    {result.pod_name}", file=sys.stderr)
+    print(f"source .ncu-rep:  {result.rep_path}", file=sys.stderr)
+    print(f"wrote .ncu.csv:   {result.csv_path}", file=sys.stderr)
+    print(f"elapsed:          {result.elapsed_seconds:.1f}s", file=sys.stderr)
     return 0
 
 
@@ -731,15 +864,38 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="do not auto-open the trace after fetch (default: open on macOS)",
     )
+    inspect.add_argument(
+        "--convert-ncu",
+        action="store_true",
+        help="when only .ncu-rep is fetched and it can't be read locally "
+        "(e.g. Linux dev box without Nsight Compute installed), submit a "
+        "CPU-only converter Pod to write a .ncu-summary.csv companion on "
+        "the PVC, then re-fetch and print the summary. Mac users with "
+        "`brew install --cask nvidia-nsight-compute` don't need this.",
+    )
+    inspect.add_argument(
+        "--convert-ncu-image",
+        default="voiceagentcr.azurecr.io/swordfish-bench:latest",
+        help="image to use for the converter Pod (default: swordfish-bench)",
+    )
+    inspect.add_argument(
+        "--convert-ncu-pvc",
+        default="training-nfs",
+        help="PVC name the converter Pod should mount at /data (default: training-nfs)",
+    )
     inspect.set_defaults(func=_cmd_inspect_run, open=True)
 
     ncu_summary = sub.add_parser(
         "ncu-summary",
-        help="pretty-print a per-kernel summary of an Nsight Compute CSV "
-        "(reads `ncu --csv` output; the `.ncu-rep` binary is NOT supported "
-        "directly — convert with `ncu --import file.ncu-rep --csv` first)",
+        help="pretty-print a per-kernel summary of an Nsight Compute report "
+        "(accepts both `*.ncu.csv` from `ncu --csv` and `*.ncu-rep` binary "
+        "via NVIDIA's `ncu_report` Python module)",
     )
-    ncu_summary.add_argument("csv", type=Path, help="path to a .ncu.csv file")
+    ncu_summary.add_argument(
+        "csv",
+        type=Path,
+        help="path to a .ncu.csv, .ncu-summary.csv, or .ncu-rep file",
+    )
     ncu_summary.add_argument(
         "--top",
         type=int,
@@ -753,6 +909,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="width of the kernel-name column in the table (default: 60)",
     )
     ncu_summary.set_defaults(func=_cmd_ncu_summary)
+
+    convert_ncu = sub.add_parser(
+        "convert-ncu",
+        help="spin up a CPU-only Pod that runs `ncu --import` to convert a "
+        "cluster-side `.ncu-rep` into a `.ncu-summary.csv` companion. Useful "
+        "for CI / Linux runners without local Nsight Compute installed.",
+    )
+    convert_ncu.add_argument(
+        "name",
+        help="rune job name whose .ncu-rep at /data/<name>/profile/profile.ncu-rep should be converted",
+    )
+    convert_ncu.add_argument(
+        "--namespace",
+        default="ray",
+        help="kubernetes namespace to launch the converter Pod in (default: ray)",
+    )
+    convert_ncu.add_argument(
+        "--pvc",
+        default="training-nfs",
+        help="PVC name to mount at /data (default: training-nfs)",
+    )
+    convert_ncu.add_argument(
+        "--image",
+        default="voiceagentcr.azurecr.io/swordfish-bench:latest",
+        help="container image with `ncu` baked in (default: swordfish-bench)",
+    )
+    convert_ncu.add_argument(
+        "--rep-path",
+        default=None,
+        help="explicit absolute path to the .ncu-rep inside /data "
+        "(default: /data/<name>/profile/profile.ncu-rep)",
+    )
+    convert_ncu.add_argument(
+        "--csv-path",
+        default=None,
+        help="explicit absolute path to write the CSV "
+        "(default: same dir, extension `.ncu-summary.csv`)",
+    )
+    convert_ncu.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=180,
+        help="how long to wait for the converter Pod to succeed (default: 180s)",
+    )
+    convert_ncu.add_argument(
+        "--no-cleanup",
+        dest="cleanup",
+        action="store_false",
+        help="leave the converter Pod around after success (default: delete)",
+    )
+    convert_ncu.add_argument(
+        "--context",
+        default=None,
+        help="kubectl --context value (default: current)",
+    )
+    convert_ncu.set_defaults(func=_cmd_convert_ncu, cleanup=True)
 
     profiles_cmd = sub.add_parser(
         "generate-rune-profiles",

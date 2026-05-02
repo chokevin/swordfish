@@ -58,6 +58,9 @@ RUNE_ITERS ?= 50
 RUNE_RESULT_DIR ?= /data/swordfish/week1
 RUNE_BENCH_SCRIPT ?= infra/rune/scripts/swordfish-bench.sh
 RUNE_PROFILE_PACK ?= infra/rune/profiles/swordfish-pack.yaml
+RUNE_NAMESPACE ?= ray
+RUNE_PVC ?= training-nfs
+RUNE_IMAGE_REF ?= voiceagentcr.azurecr.io/swordfish-bench:latest
 SUBMIT_BENCH = uv run python -m swordfish.runner submit-bench \
     --result-root $(RUNE_RESULT_DIR) \
     --script $(RUNE_BENCH_SCRIPT)
@@ -66,7 +69,8 @@ SUBMIT_BENCH = uv run python -m swordfish.runner submit-bench \
         rune-install-profiles \
         rune-submit-gemm-a100 rune-submit-gemm-h100 rune-submit-gemm-h200 \
         rune-submit-gemm-matrix \
-        rune-submit-liger-rmsnorm-a100 rune-submit-liger-swiglu-a100
+        rune-submit-liger-rmsnorm-a100 rune-submit-liger-swiglu-a100 \
+        rune-convert-ncu
 
 rune-profiles:
 	uv run python -m swordfish.runner generate-rune-profiles --out $(RUNE_PROFILE_PACK)
@@ -115,3 +119,17 @@ rune-submit-liger-swiglu-a100:
 	$(SUBMIT_BENCH) --workload liger-swiglu --arch a100 \
 	    --name swordfish-liger-swiglu-$(RUNE_RUN_ID)-a100 \
 	    --repeats $(RUNE_REPEATS) --warmup $(RUNE_WARMUP) --iters $(RUNE_ITERS)
+
+# Convert a cluster-side .ncu-rep into a .ncu-summary.csv companion via a
+# CPU-only Pod that runs `ncu --import` against the PVC. Mac developers with
+# Nsight Compute installed don't need this — the runner's ncu_summary path
+# reads .ncu-rep directly. This target is for CI / Linux runners that lack
+# the local install. Usage: `make rune-convert-ncu JOB=sf-gemm-h100-XYZ`.
+rune-convert-ncu:
+	@if [ -z "$(JOB)" ]; then \
+		echo "usage: make rune-convert-ncu JOB=<rune-job-name>"; exit 2; \
+	fi
+	uv run python -m swordfish.runner convert-ncu $(JOB) \
+	    --namespace $(RUNE_NAMESPACE) \
+	    --pvc $(RUNE_PVC) \
+	    --image $(RUNE_IMAGE_REF)

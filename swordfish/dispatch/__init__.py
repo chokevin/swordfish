@@ -19,6 +19,11 @@ from swordfish.dispatch.image import (
     ImageBuildError,
     build_and_push_dev_image,
 )
+from swordfish.dispatch.ncu_convert import (
+    NcuConvertError,
+    NcuConvertResult,
+    submit_ncu_convert,
+)
 from swordfish.dispatch.results import (
     FetchedResult,
     FetchedRunArtifacts,
@@ -57,6 +62,8 @@ __all__ = [
     "ImageBuildError",
     "LigerPerkernelMatrix",
     "LigerPerkernelRun",
+    "NcuConvertError",
+    "NcuConvertResult",
     "ResultFetchError",
     "RuneCommandError",
     "RuneSubmit",
@@ -68,5 +75,6 @@ __all__ = [
     "fetch_run_artifacts",
     "fetch_via_rune_submit_get",
     "find_topology_policy",
+    "submit_ncu_convert",
     "topology_policy_env",
 ]

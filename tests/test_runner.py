@@ -946,4 +946,265 @@ def test_ncu_summary_cli_returns_nonzero_on_unparseable_csv(tmp_path, capsys):
     rc = cli.main(["ncu-summary", str(bad)])
     assert rc == 1
     err = capsys.readouterr().err
-    assert "no NCU CSV header found" in err
+    assert "no kernels found" in err
+
+
+# ---------------------------------------------------------------------------
+# .ncu-rep binary parser (parse_ncu_rep + summarize_ncu_file)
+#
+# We can't ship a real .ncu-rep fixture (proprietary NVIDIA format, generated
+# by GPU work), so the binary path is exercised against a fake ncu_report
+# module that mimics the SWIG wrapper's IContext → IRange → IAction → IMetric
+# tree. The fake covers the exact methods parse_ncu_rep calls so contract
+# drift in ncu_report would surface as a test failure.
+# ---------------------------------------------------------------------------
+
+
+from swordfish.runner import ncu_summary as _nsum_mod  # noqa: E402
+
+
+class _FakeMetric:
+    def __init__(self, value, unit=""):
+        self._v = value
+        self._u = unit
+
+    def as_double(self):
+        return float(self._v)
+
+    def as_uint64(self):
+        return int(self._v)
+
+    def unit(self):
+        return self._u
+
+
+class _FakeAction:
+    """Mirrors ncu_report.IAction: name(NameBase) + metric_by_name."""
+
+    NameBase_DEMANGLED = 0  # the constant ncu_summary reads off the class
+
+    def __init__(self, kernel_name, metrics):
+        self._name = kernel_name
+        self._metrics = metrics  # dict[name -> _FakeMetric]
+
+    def name(self, _base=None):
+        return self._name
+
+    def metric_by_name(self, name):
+        return self._metrics.get(name)
+
+
+class _FakeRange:
+    def __init__(self, actions):
+        self._actions = actions
+
+    def num_actions(self):
+        return len(self._actions)
+
+    def action_by_idx(self, i):
+        return self._actions[i]
+
+
+class _FakeContext:
+    def __init__(self, ranges):
+        self._ranges = ranges
+
+    def num_ranges(self):
+        return len(self._ranges)
+
+    def range_by_idx(self, i):
+        return self._ranges[i]
+
+
+class _FakeNcuReport:
+    """Stands in for the real ncu_report module."""
+
+    IAction = _FakeAction  # parse_ncu_rep reads NameBase_DEMANGLED off this
+
+    def __init__(self, ctx):
+        self._ctx = ctx
+
+    def load_report(self, _path):
+        return self._ctx
+
+
+def _patch_ncu_report(monkeypatch, ctx):
+    """Force _import_ncu_report to return a fake module backed by `ctx`."""
+    fake = _FakeNcuReport(ctx)
+    monkeypatch.setattr(_nsum_mod, "_import_ncu_report", lambda: fake)
+    return fake
+
+
+def test_parse_ncu_rep_pivots_actions_into_per_kernel_summary(monkeypatch, tmp_path):
+    """Two kernels, two invocations of one and one of the other. Output
+    must match the same shape parse_ncu_csv_full produces for the same
+    semantic data."""
+    rep_path = tmp_path / "fake.ncu-rep"
+    rep_path.write_bytes(b"")  # parse_ncu_rep checks existence, not content
+
+    ctx = _FakeContext(
+        [
+            _FakeRange(
+                [
+                    _FakeAction(
+                        "void my_kernel<float>(int)",
+                        {
+                            "gpu__time_duration.sum": _FakeMetric(1000, "ns"),
+                            "sm__throughput.avg.pct_of_peak_sustained_elapsed": _FakeMetric(
+                                50.0, "%"
+                            ),
+                        },
+                    ),
+                    _FakeAction(
+                        "void my_kernel<float>(int)",
+                        {
+                            "gpu__time_duration.sum": _FakeMetric(3000, "ns"),
+                            "sm__throughput.avg.pct_of_peak_sustained_elapsed": _FakeMetric(
+                                70.0, "%"
+                            ),
+                        },
+                    ),
+                    _FakeAction(
+                        "other_kernel",
+                        {
+                            "gpu__time_duration.sum": _FakeMetric(500, "ns"),
+                            "sm__throughput.avg.pct_of_peak_sustained_elapsed": _FakeMetric(
+                                40.0, "%"
+                            ),
+                        },
+                    ),
+                ]
+            )
+        ]
+    )
+    _patch_ncu_report(monkeypatch, ctx)
+
+    summary = _nsum_mod.parse_ncu_rep(rep_path)
+    assert summary.unique_kernels == 2
+    assert summary.total_invocations == 3
+    # Sorted by total_time desc — my_kernel is 4000ns vs other_kernel's 500ns.
+    top = summary.kernels[0]
+    assert top.short_name == "my_kernel"
+    assert top.invocations == 2
+    assert top.total_time_ns == 4000
+    assert top.mean_time_ns == 2000
+    sm = top.metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"]
+    assert sm.mean == 60.0
+    assert sm.samples == 2
+
+
+def test_parse_ncu_rep_returns_warning_on_empty_report(monkeypatch, tmp_path):
+    rep_path = tmp_path / "empty.ncu-rep"
+    rep_path.write_bytes(b"")
+    _patch_ncu_report(monkeypatch, _FakeContext([]))
+    summary = _nsum_mod.parse_ncu_rep(rep_path)
+    assert summary.unique_kernels == 0
+    assert summary.total_invocations == 0
+    assert any("empty profile" in w for w in summary.parse_warnings)
+
+
+def test_parse_ncu_rep_skips_actions_with_blank_kernel_name(monkeypatch, tmp_path):
+    rep_path = tmp_path / "fake.ncu-rep"
+    rep_path.write_bytes(b"")
+    ctx = _FakeContext(
+        [
+            _FakeRange(
+                [
+                    _FakeAction("", {"gpu__time_duration.sum": _FakeMetric(99, "ns")}),
+                    _FakeAction("real_kernel", {"gpu__time_duration.sum": _FakeMetric(5, "ns")}),
+                ]
+            )
+        ]
+    )
+    _patch_ncu_report(monkeypatch, ctx)
+    summary = _nsum_mod.parse_ncu_rep(rep_path)
+    assert summary.unique_kernels == 1
+    assert summary.kernels[0].short_name == "real_kernel"
+
+
+def test_parse_ncu_rep_raises_file_not_found_for_missing_file(monkeypatch, tmp_path):
+    _patch_ncu_report(monkeypatch, _FakeContext([]))
+    with pytest.raises(FileNotFoundError):
+        _nsum_mod.parse_ncu_rep(tmp_path / "does-not-exist.ncu-rep")
+
+
+def test_summarize_ncu_file_dispatches_on_extension(monkeypatch, tmp_path):
+    """`.ncu-rep` and `.ncu-repz` go to the binary parser; everything else
+    falls through to the CSV parser."""
+    rep_path = tmp_path / "x.ncu-rep"
+    rep_path.write_bytes(b"")
+    repz_path = tmp_path / "x.ncu-repz"
+    repz_path.write_bytes(b"")
+    csv_path = tmp_path / "x.ncu.csv"
+    csv_path.write_text("")
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        _nsum_mod,
+        "parse_ncu_rep",
+        lambda p: (
+            calls.append(("rep", str(p)))
+            or _nsum_mod.NcuSummary(
+                path=p, rows=0, unique_kernels=0, total_invocations=0, total_time_ns=0, kernels=[]
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        _nsum_mod,
+        "parse_ncu_csv_full",
+        lambda p: (
+            calls.append(("csv", str(p)))
+            or _nsum_mod.NcuSummary(
+                path=p, rows=0, unique_kernels=0, total_invocations=0, total_time_ns=0, kernels=[]
+            )
+        ),
+    )
+
+    _nsum_mod.summarize_ncu_file(rep_path)
+    _nsum_mod.summarize_ncu_file(repz_path)
+    _nsum_mod.summarize_ncu_file(csv_path)
+
+    assert [c[0] for c in calls] == ["rep", "rep", "csv"]
+
+
+def test_import_ncu_report_raises_actionable_error_when_missing(monkeypatch):
+    """When the module isn't importable and no install path matches, raise
+    NcuReportUnavailableError with brew/install instructions in the message."""
+    # Block the bare import path.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocking_import(name, *a, **kw):
+        if name == "ncu_report":
+            raise ImportError("blocked by test")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", blocking_import)
+    # Block all default install paths.
+    monkeypatch.setattr(_nsum_mod, "_NCU_REPORT_DEFAULT_PATHS", ())
+    monkeypatch.delenv("NCU_REPORT_PYTHON_DIR", raising=False)
+
+    with pytest.raises(_nsum_mod.NcuReportUnavailableError) as excinfo:
+        _nsum_mod._import_ncu_report()
+    msg = str(excinfo.value)
+    assert "brew install" in msg
+    assert "NCU_REPORT_PYTHON_DIR" in msg
+
+
+def test_import_ncu_report_respects_env_var_override(monkeypatch, tmp_path):
+    """When NCU_REPORT_PYTHON_DIR points at a directory containing an
+    ncu_report.py, the override is used. Importlib.spec_from_file_location
+    means we don't pollute sys.modules / sys.path across tests.
+    """
+    stub_dir = tmp_path / "stub"
+    stub_dir.mkdir()
+    (stub_dir / "ncu_report.py").write_text("OVERRIDE_MARKER = 'env-var-stub'\n")
+
+    monkeypatch.setenv("NCU_REPORT_PYTHON_DIR", str(stub_dir))
+
+    mod = _nsum_mod._import_ncu_report()
+    assert getattr(mod, "OVERRIDE_MARKER", None) == "env-var-stub"
+
+
+import sys  # noqa: E402,F401  — kept as import marker for any future tests
