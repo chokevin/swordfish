@@ -364,6 +364,14 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
                 )
                 continue
             print(format_summary_text(summary))
+            if not getattr(args, "no_optimize", False):
+                from .ncu_optimize import (
+                    analyze_ncu_summary,
+                    format_optimization_report,
+                )
+
+                print()
+                print(format_optimization_report(analyze_ncu_summary(summary)))
             printed = True
 
         # If we couldn't read any local form AND the caller asked for it,
@@ -414,6 +422,14 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
                 print(f"wrote {csv_local}", file=sys.stderr)
                 summary = summarize_ncu_file(csv_local)
                 print(format_summary_text(summary))
+                if not getattr(args, "no_optimize", False):
+                    from .ncu_optimize import (
+                        analyze_ncu_summary,
+                        format_optimization_report,
+                    )
+
+                    print()
+                    print(format_optimization_report(analyze_ncu_summary(summary)))
                 printed = True
             except (NcuConvertError, ResultFetchError) as exc:
                 print(
@@ -489,6 +505,15 @@ def _cmd_ncu_summary(args: argparse.Namespace) -> int:
         )
         return 1
     print(format_summary_text(summary, top_n=args.top, short_name_width=args.name_width))
+    if not getattr(args, "no_optimize", False):
+        from .ncu_optimize import analyze_ncu_summary, format_optimization_report
+
+        print()
+        print(
+            format_optimization_report(
+                analyze_ncu_summary(summary, top_kernels=args.optimize_top)
+            )
+        )
     return 0
 
 
@@ -883,6 +908,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="training-nfs",
         help="PVC name the converter Pod should mount at /data (default: training-nfs)",
     )
+    inspect.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="skip the heuristic optimization report (only print the per-kernel table)",
+    )
     inspect.set_defaults(func=_cmd_inspect_run, open=True)
 
     ncu_summary = sub.add_parser(
@@ -907,6 +937,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=60,
         help="width of the kernel-name column in the table (default: 60)",
+    )
+    ncu_summary.add_argument(
+        "--no-optimize",
+        action="store_true",
+        help="skip the heuristic optimization report (only print the per-kernel table)",
+    )
+    ncu_summary.add_argument(
+        "--optimize-top",
+        type=int,
+        default=5,
+        help="how many top kernels (by total time) to give per-kernel advice on (default: 5)",
     )
     ncu_summary.set_defaults(func=_cmd_ncu_summary)
 
