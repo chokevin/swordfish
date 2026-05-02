@@ -321,6 +321,35 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
     if fetched.profile_artifact:
         print(f"profile artifact: {fetched.profile_artifact}", file=sys.stderr)
 
+    # If a fetched .ncu.csv is sitting next to the .ncu-rep, auto-print the
+    # per-kernel summary on stdout. The .ncu-rep is binary and only readable
+    # in ncu-ui; the .csv is the agent-readable companion. Today, only legacy
+    # SWORDFISH_PROFILE=ncu jobs emit a CSV — `--profile-mode=ncu` jobs only
+    # emit the .ncu-rep, so users on those jobs need to either install Nsight
+    # Compute locally and run `ncu --import <rep> --csv > <csv>` themselves,
+    # or wait for cluster-side dual-emit (tracked separately).
+    if args.profile_mode == "ncu":
+        csv_candidates = sorted(local_dir.glob("*.ncu.csv")) + sorted(
+            local_dir.glob("*.ncu-summary.csv")
+        )
+        if csv_candidates:
+            from .ncu_summary import format_summary_text, parse_ncu_csv_full
+
+            for csv_path in csv_candidates:
+                summary = parse_ncu_csv_full(csv_path)
+                print(format_summary_text(summary))
+        elif fetched.profile_artifact:
+            print(
+                "tip: no .ncu.csv companion found in fetched artifacts.\n"
+                "     For an agent-readable summary, install Nsight Compute "
+                "locally and run:\n"
+                f"       ncu --import {fetched.profile_artifact} --csv "
+                f"> {fetched.profile_artifact.with_suffix('.csv')}\n"
+                "       uv run python -m swordfish.runner ncu-summary "
+                f"{fetched.profile_artifact.with_suffix('.csv')}",
+                file=sys.stderr,
+            )
+
     if args.open and fetched.profile_artifact:
         # macOS `open` triggers the .ncu-rep / .nsys-rep file association
         # (ncu-ui / nsys-ui) when those Mac clients are installed; otherwise
@@ -337,6 +366,30 @@ def _cmd_inspect_run(args: argparse.Namespace) -> int:
             import subprocess
 
             subprocess.run(["open", str(fetched.profile_artifact)], check=False)
+    return 0
+
+
+def _cmd_ncu_summary(args: argparse.Namespace) -> int:
+    """Pretty-print a per-kernel summary of an Nsight Compute CSV file.
+
+    Reads NCU's CSV export (one row per kernel-invocation × metric), pivots
+    to per-kernel aggregates, and prints a top-N table sorted by total time.
+    Works on legacy `SWORDFISH_PROFILE=ncu` outputs (e.g. the week-1 fixtures
+    in runs/airun/week1/torch-gemm-{a100,h100,h200}.ncu.csv) and on any CSV
+    produced by `ncu --import file.ncu-rep --csv`.
+
+    See swordfish.runner.ncu_summary for the parser's rationale and limits.
+    """
+    from .ncu_summary import format_summary_text, parse_ncu_csv_full
+
+    summary = parse_ncu_csv_full(args.csv)
+    if summary.rows == 0:
+        print(
+            f"error: no NCU CSV header found in {args.csv}; is this a valid `ncu --csv` export?",
+            file=sys.stderr,
+        )
+        return 1
+    print(format_summary_text(summary, top_n=args.top, short_name_width=args.name_width))
     return 0
 
 
@@ -679,6 +732,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not auto-open the trace after fetch (default: open on macOS)",
     )
     inspect.set_defaults(func=_cmd_inspect_run, open=True)
+
+    ncu_summary = sub.add_parser(
+        "ncu-summary",
+        help="pretty-print a per-kernel summary of an Nsight Compute CSV "
+        "(reads `ncu --csv` output; the `.ncu-rep` binary is NOT supported "
+        "directly — convert with `ncu --import file.ncu-rep --csv` first)",
+    )
+    ncu_summary.add_argument("csv", type=Path, help="path to a .ncu.csv file")
+    ncu_summary.add_argument(
+        "--top",
+        type=int,
+        default=10,
+        help="show top N kernels by total time (default: 10)",
+    )
+    ncu_summary.add_argument(
+        "--name-width",
+        type=int,
+        default=60,
+        help="width of the kernel-name column in the table (default: 60)",
+    )
+    ncu_summary.set_defaults(func=_cmd_ncu_summary)
 
     profiles_cmd = sub.add_parser(
         "generate-rune-profiles",

@@ -1057,3 +1057,79 @@ def test_inspect_run_cli_default_local_dir_is_runs_inspect_name(monkeypatch, tmp
 
     assert rc == 0
     assert (tmp_path / "runs" / "inspect" / "myjob" / "myjob.json").exists()
+
+
+def test_inspect_run_cli_auto_prints_ncu_summary_when_csv_companion_present(
+    monkeypatch, tmp_path, capsys
+):
+    """If a `.ncu.csv` lands in local_dir alongside the fetched .ncu-rep,
+    inspect-run auto-prints the per-kernel summary to stdout. This is the
+    happy path once cluster-side dual-emit (or local `ncu --import`) lands.
+    """
+    from swordfish.runner import cli
+
+    payloads = {"json": b'{"k":1}', "trace": b"\x00NCUREP\xff"}
+    _patch_inspect_helpers(monkeypatch, payloads)
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    # Pre-seed a CSV companion in the local_dir as if a prior step had
+    # converted .ncu-rep → .ncu.csv. inspect-run must pick it up.
+    csv_companion = tmp_path / "smoke.ncu.csv"
+    csv_companion.write_text(
+        "\n".join(
+            [
+                '"ID","Kernel Name","Block Size","Grid Size",'
+                '"Metric Name","Metric Unit","Metric Value"',
+                '"0","my_kernel","(1,1,1)","(1,1,1)","gpu__time_duration.sum","ns","500"',
+                '"0","my_kernel","(1,1,1)","(1,1,1)","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","42.0"',
+            ]
+        )
+    )
+
+    rc = cli.main(
+        [
+            "inspect-run",
+            "myjob",
+            "--profile-mode",
+            "ncu",
+            "--local-dir",
+            str(tmp_path),
+            "--no-open",
+        ]
+    )
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "NCU summary:" in captured.out
+    assert "my_kernel" in captured.out
+
+
+def test_inspect_run_cli_prints_install_hint_when_only_ncu_rep_is_fetched(
+    monkeypatch, tmp_path, capsys
+):
+    """When --profile-mode=ncu fetches only the .ncu-rep (the common case
+    today, since cluster-side conversion hasn't shipped yet), inspect-run
+    prints a stderr hint pointing the user at `ncu --import` + ncu-summary
+    instead of silently skipping the readable summary path.
+    """
+    from swordfish.runner import cli
+
+    payloads = {"json": b"{}", "trace": b"\x00NCUREP\xff"}
+    _patch_inspect_helpers(monkeypatch, payloads)
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    rc = cli.main(
+        [
+            "inspect-run",
+            "myjob",
+            "--profile-mode",
+            "ncu",
+            "--local-dir",
+            str(tmp_path),
+            "--no-open",
+        ]
+    )
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "ncu --import" in err and "ncu-summary" in err

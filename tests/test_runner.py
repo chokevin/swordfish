@@ -719,3 +719,231 @@ def test_validate_training_result_protocol_reports_missing_fields():
     assert any("env" in e for e in errors)
     assert any("metrics" in e for e in errors)
     assert any("correctness" in e for e in errors)
+
+
+# ---------------------------------------------------------------------------
+# ncu_summary: rich per-kernel parsing of NCU CSV exports
+#
+# The legacy schema.parse_ncu_csv returns 4 aggregate metrics. ncu_summary
+# returns per-kernel detail (top-N by time, per-metric distribution stats).
+# The week-1 GEMM CSV fixtures are the canonical ground truth: 1236 rows =
+# 309 invocations × 4 metrics, with 9 unique kernels per arch.
+# ---------------------------------------------------------------------------
+
+
+from pathlib import Path  # noqa: E402  — placed near the ncu_summary block for locality
+
+from swordfish.runner.ncu_summary import (  # noqa: E402
+    _percentile,
+    _short_name,
+    format_summary_text,
+    parse_ncu_csv_full,
+)
+
+
+_FIXTURES_DIR = Path(__file__).parent.parent / "runs" / "airun" / "week1"
+
+
+def test_short_name_strips_void_return_type_and_template_args():
+    raw = (
+        "void at::native::vectorized_elementwise_kernel<2, "
+        "at::native::AbsFunctor<float>, at::detail::Array<char *, 2>>"
+        "(int, T2, T3)"
+    )
+    assert _short_name(raw) == "at::native::vectorized_elementwise_kernel"
+
+
+def test_short_name_strips_unnamed_namespace_inserts():
+    raw = (
+        "void at::<unnamed>::distribution_elementwise_grid_stride_kernel<float, 4>"
+        "(long, at::PhiloxCudaState, T3, T4)"
+    )
+    assert _short_name(raw) == "at::distribution_elementwise_grid_stride_kernel"
+
+
+def test_short_name_passes_through_cublas_kernel_names():
+    """cuBLAS / cuDNN kernels have no template params and should round-trip."""
+    raw = "nvjet_hsh_128x256_64x4_2x1_v_bz_coopA_NNN"
+    assert _short_name(raw) == raw
+
+
+def test_short_name_falls_back_to_truncated_prefix_on_garbage():
+    # No matchable identifier and no parens — exercise the fallback.
+    raw = "<<<unparseable>>>"
+    out = _short_name(raw)
+    assert out  # non-empty
+    assert len(out) <= 80
+
+
+def test_percentile_handles_single_element_and_endpoints():
+    assert _percentile([42.0], 50) == 42.0
+    assert _percentile([1.0, 2.0, 3.0], 0) == 1.0
+    assert _percentile([1.0, 2.0, 3.0], 100) == 3.0
+
+
+def test_percentile_linear_interpolation_matches_numpy_default():
+    # Standard inclusive percentile: p50 of [1,2,3,4] = 2.5
+    assert _percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.5
+
+
+def test_parse_ncu_csv_full_against_h100_gemm_fixture():
+    """The H100 GEMM fixture: 9 kernels, 309 invocations, 1236 metric rows.
+
+    cuBLAS-via-nvjet should dominate (~99% of time) at ~90% SM throughput.
+    These numbers are stable across re-runs of the bench in week 1.
+    """
+    summary = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv")
+    assert summary.rows == 1236
+    assert summary.unique_kernels == 9
+    assert summary.total_invocations == 309
+    assert summary.total_time_ns > 0
+    # Top kernel must be the cuBLAS H100 SXM5 SGEMM and ~99% of time.
+    top = summary.kernels[0]
+    assert top.short_name.startswith("nvjet_hsh_")
+    assert top.invocations == 300
+    pct_top = top.total_time_ns / summary.total_time_ns
+    assert pct_top > 0.99, f"expected nvjet to dominate; got {pct_top:.2%}"
+    # Per-metric SoL means must be in the right ballpark.
+    sm = top.metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"]
+    assert 80 < sm.mean < 100
+    assert sm.samples == 300
+
+
+def test_parse_ncu_csv_full_against_a100_gemm_fixture():
+    """A100 GEMM: dominated by `ampere_fp16_s16816gemm_*` (cuBLAS pre-Hopper)."""
+    summary = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-a100.ncu.csv")
+    assert summary.rows == 1236
+    top = summary.kernels[0]
+    assert "ampere" in top.short_name and "gemm" in top.short_name
+    assert top.invocations == 300
+
+
+def test_parse_ncu_csv_full_against_h200_gemm_fixture_uses_different_nvjet_variant():
+    """H200 picks a different cuBLAS tile shape than H100 (256x128 vs 128x256).
+
+    This test exists because catching that difference is exactly the kind of
+    insight the tool is supposed to enable.
+    """
+    h100 = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv")
+    h200 = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h200.ncu.csv")
+    h100_top = h100.kernels[0].short_name
+    h200_top = h200.kernels[0].short_name
+    assert h100_top.startswith("nvjet_hsh_") and h200_top.startswith("nvjet_hsh_")
+    assert h100_top != h200_top, "expected H200 to pick a different cuBLAS variant than H100"
+
+
+def test_parse_ncu_csv_full_returns_empty_summary_on_no_header(tmp_path):
+    csv_path = tmp_path / "broken.csv"
+    csv_path.write_text("==PROF== permission denied\nERR_NVGPUCTRPERM\n")
+    summary = parse_ncu_csv_full(csv_path)
+    assert summary.rows == 0
+    assert summary.kernels == []
+    assert summary.parse_warnings == ["no header row found in CSV"]
+
+
+def test_parse_ncu_csv_full_records_warnings_for_non_numeric_metric_values(tmp_path):
+    csv_path = tmp_path / "fuzz.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                '"ID","Kernel Name","Block Size","Grid Size",'
+                '"Metric Name","Metric Unit","Metric Value"',
+                '"0","kern_a","(1,1,1)","(1,1,1)","gpu__time_duration.sum","ns","100"',
+                '"0","kern_a","(1,1,1)","(1,1,1)","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","n/a"',
+                '"0","kern_a","(1,1,1)","(1,1,1)","dram__throughput.avg.pct_of_peak_sustained_elapsed","%","not-a-number"',
+            ]
+        )
+    )
+    summary = parse_ncu_csv_full(csv_path)
+    assert summary.unique_kernels == 1
+    # n/a is a known sentinel and is silently skipped (no warning).
+    # "not-a-number" is unparseable and IS a warning.
+    assert any("not-a-number" in w for w in summary.parse_warnings)
+    assert summary.kernels[0].total_time_ns == 100
+
+
+def test_parse_ncu_csv_full_pivots_multiple_invocations_into_one_kernel_row(tmp_path):
+    """Two invocations of the same kernel collapse to one KernelStats row
+    with samples=2 and the right mean/max."""
+    csv_path = tmp_path / "two-invs.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                '"ID","Kernel Name","Block Size","Grid Size",'
+                '"Metric Name","Metric Unit","Metric Value"',
+                '"0","kern_x","(256,1,1)","(8,1,1)","gpu__time_duration.sum","ns","1000"',
+                '"0","kern_x","(256,1,1)","(8,1,1)","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","50.0"',
+                '"1","kern_x","(256,1,1)","(8,1,1)","gpu__time_duration.sum","ns","3000"',
+                '"1","kern_x","(256,1,1)","(8,1,1)","sm__throughput.avg.pct_of_peak_sustained_elapsed","%","70.0"',
+            ]
+        )
+    )
+    summary = parse_ncu_csv_full(csv_path)
+    assert summary.unique_kernels == 1
+    k = summary.kernels[0]
+    assert k.invocations == 2
+    assert k.total_time_ns == 4000
+    assert k.mean_time_ns == 2000
+    assert k.max_time_ns == 3000
+    sm = k.metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"]
+    assert sm.mean == 60.0
+    assert sm.max == 70.0
+
+
+def test_format_summary_text_renders_top_n_table_and_truncation_notice():
+    summary = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv")
+    out = format_summary_text(summary, top_n=3)
+    # Header lines.
+    assert "NCU summary:" in out
+    assert "rows=1236" in out
+    assert "unique_kernels=9" in out
+    # Column header.
+    assert "kernel" in out and "SM%" in out and "DRAM%" in out
+    # Top kernel rendered.
+    assert "nvjet_hsh_" in out
+    # Truncation notice for the 6 kernels not shown.
+    assert "6 more kernels not shown" in out
+
+
+def test_format_summary_text_handles_empty_summary_gracefully(tmp_path):
+    csv_path = tmp_path / "empty.csv"
+    csv_path.write_text("")  # no header at all
+    summary = parse_ncu_csv_full(csv_path)
+    out = format_summary_text(summary, top_n=10)
+    assert "rows=0" in out
+    assert "unique_kernels=0" in out
+
+
+# ---------------------------------------------------------------------------
+# ncu-summary CLI
+# ---------------------------------------------------------------------------
+
+
+def test_ncu_summary_cli_prints_table_and_returns_zero(capsys):
+    from swordfish.runner import cli
+
+    rc = cli.main(
+        [
+            "ncu-summary",
+            str(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv"),
+            "--top",
+            "5",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NCU summary:" in out
+    assert "nvjet_hsh_" in out
+    # --top 5 means 4 kernels not shown (9 total).
+    assert "4 more kernels not shown" in out
+
+
+def test_ncu_summary_cli_returns_nonzero_on_unparseable_csv(tmp_path, capsys):
+    from swordfish.runner import cli
+
+    bad = tmp_path / "bad.csv"
+    bad.write_text("==PROF== permission denied\nERR_NVGPUCTRPERM\n")
+    rc = cli.main(["ncu-summary", str(bad)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no NCU CSV header found" in err

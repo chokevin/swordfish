@@ -134,3 +134,38 @@ Once installed, double-clicking a `.ncu-rep` (or `open file.ncu-rep`) launches
 the full Speed-of-Light dashboard with occupancy, source-attributed SASS, and
 baseline comparison sets — the same view kernel engineers use to drive Liger /
 Triton kernel work.
+
+### Reading kernel-level detail without ncu-ui (`ncu-summary`)
+
+The `.ncu-rep` binary format is proprietary and only readable with NVIDIA's
+`ncu-ui`. For agent-friendly inspection (or quick CLI scanning), there's a
+companion subcommand that summarizes the *CSV* form of an NCU profile:
+
+```bash
+# Convert a fetched .ncu-rep to CSV (requires Nsight Compute installed locally
+# OR you can have the cluster do it — see swordfish-bench.sh's legacy ncu mode):
+ncu --import runs/inspect/<name>/<name>.ncu-rep --csv \
+  > runs/inspect/<name>/<name>.ncu.csv
+
+# Then summarize per-kernel:
+uv run python -m swordfish.runner ncu-summary \
+  runs/inspect/<name>/<name>.ncu.csv --top 10
+```
+
+The output is a sorted per-kernel table: invocations, total/mean/max time,
+% of wall, and the headline Speed-of-Light metrics (SM%, MEM%, DRAM%). It's
+the agent-readable substitute for the ncu-ui kernel list.
+
+The week-1 GEMM CSVs are checked in as canonical examples — try
+`ncu-summary runs/airun/week1/torch-gemm-h100.ncu.csv` for a feel.
+
+When `inspect-run --profile-mode ncu` finds a `.ncu.csv` companion file in the
+local cache directory (e.g. one you converted manually with `ncu --import`, or
+one the cluster wrote alongside the .ncu-rep), it auto-prints the same
+per-kernel summary on stdout. Otherwise it prints a stderr hint pointing you
+at the conversion command above.
+
+**What `ncu-summary` is NOT a substitute for:** source-line attribution, SASS
+view, occupancy widget, the full Speed-of-Light radial chart, or any of the
+metrics not in NCU's default `--csv` output set. For those, `ncu-ui` against
+the original `.ncu-rep` remains the right tool.
