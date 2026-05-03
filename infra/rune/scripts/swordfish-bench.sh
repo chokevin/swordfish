@@ -182,12 +182,26 @@ case "$PROFILE" in
     out="${SWORDFISH_PROFILE_OUT:-$(derive_profile_out nsys-rep "$@")}"
     out="${out%.nsys-rep}"
     mkdir -p "$(dirname "$out")"
+    nsys_capture_args=()
+    case "${NSYS_CAPTURE_RANGE:-}" in
+      "")
+        ;;
+      cudaProfilerApi)
+        nsys_capture_args+=(--capture-range=cudaProfilerApi)
+        nsys_capture_args+=(--capture-range-end="${NSYS_CAPTURE_RANGE_END:-stop}")
+        ;;
+      *)
+        echo "unsupported NSYS_CAPTURE_RANGE=${NSYS_CAPTURE_RANGE}; expected cudaProfilerApi" >&2
+        exit 3
+        ;;
+    esac
     echo "wrapping in nsys -> ${out}.nsys-rep"
     exec nsys profile \
         --output "$out" \
         --trace cuda,nvtx,osrt \
         --stats true \
         --force-overwrite true \
+        "${nsys_capture_args[@]}" \
         "${PYTHON_CMD[@]}"
     ;;
   *)

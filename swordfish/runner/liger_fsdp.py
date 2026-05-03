@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from importlib import metadata
+from collections.abc import Iterator
 from typing import Any, Literal
 
 import torch
@@ -261,6 +263,36 @@ def _peak_memory_gb(device: torch.device) -> float | None:
     return torch.cuda.max_memory_reserved(device) / (1024**3)
 
 
+@contextmanager
+def _nvtx_range(name: str, *, device: torch.device) -> Iterator[None]:
+    if device.type != "cuda":
+        yield
+        return
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
+def _cuda_profiler_capture(*, device: torch.device, enabled: bool) -> Iterator[None]:
+    if not enabled or device.type != "cuda":
+        yield
+        return
+    _sync(device)
+    start_result = torch.cuda.cudart().cudaProfilerStart()
+    if start_result not in (0, None):
+        raise RuntimeError(f"cudaProfilerStart failed with {start_result!r}")
+    try:
+        yield
+    finally:
+        _sync(device)
+        stop_result = torch.cuda.cudart().cudaProfilerStop()
+        if stop_result not in (0, None):
+            raise RuntimeError(f"cudaProfilerStop failed with {stop_result!r}")
+
+
 def run_liger_fsdp_step(
     *,
     mode: LigerMode,
@@ -279,6 +311,7 @@ def run_liger_fsdp_step(
     lr: float = 3e-4,
     weight_decay: float = 0.1,
     gradient_checkpointing: bool = True,
+    profile_steady_state: bool = False,
 ) -> dict[str, Any] | None:
     """Run one baseline or Liger-patched training-step benchmark.
 
@@ -350,13 +383,22 @@ def run_liger_fsdp_step(
 
         last_loss: list[torch.Tensor] = []
 
-        def step_once() -> torch.Tensor:
-            optimizer.zero_grad(set_to_none=True)
-            output = model(inputs)
-            logits = output.logits if hasattr(output, "logits") else output
-            loss = F.cross_entropy(logits.float().view(-1, spec.vocab_size), targets.view(-1))
-            loss.backward()
-            optimizer.step()
+        def step_once(*, phase: Literal["warmup", "measure"]) -> torch.Tensor:
+            with _nvtx_range(f"swordfish.fsdp.{phase}.step", device=state.device):
+                with _nvtx_range("swordfish.fsdp.zero_grad", device=state.device):
+                    optimizer.zero_grad(set_to_none=True)
+                with _nvtx_range("swordfish.fsdp.forward", device=state.device):
+                    output = model(inputs)
+                    logits = output.logits if hasattr(output, "logits") else output
+                with _nvtx_range("swordfish.fsdp.loss", device=state.device):
+                    loss = F.cross_entropy(
+                        logits.float().view(-1, spec.vocab_size),
+                        targets.view(-1),
+                    )
+                with _nvtx_range("swordfish.fsdp.backward", device=state.device):
+                    loss.backward()
+                with _nvtx_range("swordfish.fsdp.optimizer", device=state.device):
+                    optimizer.step()
             detached = loss.detach()
             if last_loss:
                 last_loss[0] = detached
@@ -368,14 +410,20 @@ def run_liger_fsdp_step(
             torch.cuda.reset_peak_memory_stats(state.device)
 
         samples_ms: list[float] = []
-        for _ in range(repeats):
-            for _ in range(warmup):
-                step_once()
+        for repeat_idx in range(repeats):
+            with _nvtx_range(f"swordfish.fsdp.repeat_{repeat_idx}.warmup", device=state.device):
+                for _ in range(warmup):
+                    step_once(phase="warmup")
             _sync(state.device)
-            start = time.perf_counter()
-            for _ in range(iters):
-                step_once()
-            _sync(state.device)
+            with _cuda_profiler_capture(device=state.device, enabled=profile_steady_state):
+                with _nvtx_range(
+                    f"swordfish.fsdp.repeat_{repeat_idx}.steady_state",
+                    device=state.device,
+                ):
+                    start = time.perf_counter()
+                    for _ in range(iters):
+                        step_once(phase="measure")
+                    _sync(state.device)
             sample = (time.perf_counter() - start) * 1000.0 / iters
             samples_ms.append(_max_across_ranks(sample, device=state.device))
 
@@ -452,6 +500,18 @@ def run_liger_fsdp_step(
                 "weight_decay": weight_decay,
                 "gradient_checkpointing": gradient_checkpointing,
                 "gradient_checkpointing_use_reentrant": (False if gradient_checkpointing else None),
+                "profile": {
+                    "nvtx_ranges": True,
+                    "steady_state_cuda_profiler_api": profile_steady_state,
+                    "steady_state_range": "swordfish.fsdp.repeat_<n>.steady_state",
+                    "step_phases": [
+                        "zero_grad",
+                        "forward",
+                        "loss",
+                        "backward",
+                        "optimizer",
+                    ],
+                },
                 "distributed_strategy": distributed_strategy,
                 "liger": {
                     "applied": mode == "liger",

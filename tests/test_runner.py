@@ -230,6 +230,15 @@ def test_liger_fsdp_reference_train_step_cpu_smoke():
     assert result["config"]["shape"]["global_batch_size"] == 1
     assert result["config"]["shape"]["world_size"] == 1
     assert result["config"]["liger"]["applied"] is False
+    assert result["config"]["profile"]["nvtx_ranges"] is True
+    assert result["config"]["profile"]["steady_state_cuda_profiler_api"] is False
+    assert result["config"]["profile"]["step_phases"] == [
+        "zero_grad",
+        "forward",
+        "loss",
+        "backward",
+        "optimizer",
+    ]
     assert result["correctness"]["finite_loss"] is True
     assert result["metrics"]["tokens_per_second"] > 0
     assert "baseline" in result["metrics"]["modes"]

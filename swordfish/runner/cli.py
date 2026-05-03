@@ -118,6 +118,7 @@ def _cmd_run_liger_fsdp_step(args: argparse.Namespace) -> int:
             lr=args.lr,
             weight_decay=args.weight_decay,
             gradient_checkpointing=args.gradient_checkpointing,
+            profile_steady_state=args.profile_steady_state,
         )
     if result is None:
         return 0
@@ -331,6 +332,7 @@ def _build_submit_run(args: argparse.Namespace):
             name=args.name,
             profile_mode=args.profile_mode,
             gradient_checkpointing=args.gradient_checkpointing,
+            profile_steady_state=args.profile_steady_state,
             **common,
         )
     kernel = "rmsnorm" if args.workload == "liger-rmsnorm" else "swiglu"
@@ -785,6 +787,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=1,
         help="consumed by infra/rune/scripts/swordfish-bench.sh to launch torchrun",
     )
+    fsdp.add_argument(
+        "--profile-steady-state",
+        action="store_true",
+        help=(
+            "bracket only measured iterations with cudaProfilerStart/Stop and NVTX "
+            "steady-state ranges for profiler capture"
+        ),
+    )
     fsdp.add_argument("--out", type=Path, required=True)
     fsdp.set_defaults(func=_cmd_run_liger_fsdp_step)
 
@@ -1037,6 +1047,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=8,
         help="liger-fsdp only: torchrun workers per node",
+    )
+    submit.add_argument(
+        "--profile-steady-state",
+        action="store_true",
+        help=(
+            "liger-fsdp only: bracket measured iterations with cudaProfilerStart/Stop; "
+            "when combined with --profile-mode nsys, capture excludes setup/warmup"
+        ),
     )
     submit.add_argument(
         "--backend",

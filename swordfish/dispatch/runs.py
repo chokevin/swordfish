@@ -617,6 +617,7 @@ class LigerFsdpRun:
     iters: int = 5
     nproc_per_node: int = 8
     gradient_checkpointing: bool = True
+    profile_steady_state: bool = False
     name: str | None = None
     namespace: str = DEFAULT_NAMESPACE
     context: str | None = None
@@ -728,11 +729,17 @@ class LigerFsdpRun:
         ]
         if not self.gradient_checkpointing:
             args.append("--no-gradient-checkpointing")
+        if self.profile_steady_state:
+            args.append("--profile-steady-state")
         return args
 
     def to_rune_submit(self) -> RuneSubmit:
+        env = dict(self.container_env)
+        if self.profile_steady_state and self.profile_mode == "nsys":
+            env.setdefault("NSYS_CAPTURE_RANGE", "cudaProfilerApi")
+            env.setdefault("NSYS_CAPTURE_RANGE_END", "stop")
         rune_native_mode, container_env = _resolve_torch_profile(
-            self.profile_mode, self.resolved_name, self.container_env
+            self.profile_mode, self.resolved_name, env
         )
         kwargs: dict = dict(
             name=self.resolved_name,

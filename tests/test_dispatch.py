@@ -414,6 +414,22 @@ def test_liger_fsdp_run_profile_mode_ncu_uses_a100_ncu_profile():
     assert "--profile-mode" in submit.to_args()
 
 
+def test_liger_fsdp_run_profile_steady_state_sets_runner_and_nsys_capture_env():
+    run = LigerFsdpRun(
+        arch="a100",
+        mode="baseline",
+        profile_mode="nsys",
+        profile_steady_state=True,
+    )
+    submit = run.to_rune_submit()
+    args = submit.to_args()
+
+    assert "--profile-steady-state" in run.forwarded_args
+    env_args = [args[i + 1] for i, arg in enumerate(args) if arg == "--env"]
+    assert "NSYS_CAPTURE_RANGE=cudaProfilerApi" in env_args
+    assert "NSYS_CAPTURE_RANGE_END=stop" in env_args
+
+
 # ---------------------------------------------------------------------------
 # experiment registry
 # ---------------------------------------------------------------------------
