@@ -10,6 +10,10 @@ from pathlib import Path
 from swordfish.dispatch import (
     LigerPerkernelRun,
     TorchGemmRun,
+    build_run_for_experiment,
+    format_experiment_explain,
+    format_experiment_table,
+    list_experiments,
 )
 from swordfish.dispatch.profiles import PACK_YAML_PATH, render_pack_yaml
 from swordfish.quant.marlin_triton import run_w4a16_benchmark, write_w4a16_result
@@ -20,6 +24,10 @@ from swordfish.runner.liger_perkernel import (
     DEFAULT_DTYPE as LIGER_DEFAULT_DTYPE,
     KERNEL_NAMES as LIGER_KERNEL_NAMES,
     run_liger_perkernel,
+)
+from swordfish.runner.liger_fsdp import (
+    MODEL_PRESETS as LIGER_FSDP_MODEL_PRESETS,
+    run_liger_fsdp_step,
 )
 from swordfish.runner.matrix import (
     DEFAULT_ARCH_LABELS,
@@ -84,6 +92,35 @@ def _cmd_run_liger_perkernel(args: argparse.Namespace) -> int:
             seed=args.seed,
             ncu_csv=args.ncu_csv,
         )
+    result["command"] = argv
+    write_result(result, args.out)
+    print(f"wrote {args.out}", file=sys.stderr)
+    return 0
+
+
+def _cmd_run_liger_fsdp_step(args: argparse.Namespace) -> int:
+    argv = sys.argv if args.argv is None else args.argv
+    with torch_profiler_context(resolve_torch_profile_out()):
+        result = run_liger_fsdp_step(
+            mode=args.liger_mode,
+            model_source=args.model_source,
+            model_preset=args.model_preset,
+            micro_batch_size=args.micro_batch_size,
+            seq_len=args.seq_len,
+            dtype=args.dtype,
+            repeats=args.repeats,
+            warmup=args.warmup,
+            iters=args.iters,
+            device_name=args.device,
+            allow_cpu=args.allow_cpu,
+            arch_label=args.arch_label,
+            seed=args.seed,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            gradient_checkpointing=args.gradient_checkpointing,
+        )
+    if result is None:
+        return 0
     result["command"] = argv
     write_result(result, args.out)
     print(f"wrote {args.out}", file=sys.stderr)
@@ -255,6 +292,9 @@ def _build_submit_run(args: argparse.Namespace):
         common["result_root"] = args.result_root
     if getattr(args, "script", None):
         common["script"] = args.script
+    repeats = args.repeats if args.repeats is not None else 5
+    warmup = args.warmup if args.warmup is not None else 10
+    iters = args.iters if args.iters is not None else 50
     if args.workload == "gemm":
         return TorchGemmRun(
             arch=args.arch,
@@ -263,11 +303,34 @@ def _build_submit_run(args: argparse.Namespace):
             n=args.n,
             k=args.k,
             dtype=args.dtype or "fp16",
-            repeats=args.repeats,
-            warmup=args.warmup,
-            iters=args.iters,
+            repeats=repeats,
+            warmup=warmup,
+            iters=iters,
             name=args.name,
             profile_mode=args.profile_mode,
+            **common,
+        )
+    if args.workload == "liger-fsdp":
+        repeats = args.repeats if args.repeats is not None else 3
+        warmup = args.warmup if args.warmup is not None else 1
+        iters = args.iters if args.iters is not None else 5
+        from swordfish.dispatch import LigerFsdpRun
+
+        return LigerFsdpRun(
+            arch=args.arch,
+            mode=args.liger_mode,
+            model_source=args.model_source,
+            model_preset=args.model_preset,
+            micro_batch_size=args.micro_batch_size,
+            seq_len=args.seq_len,
+            dtype=args.dtype or "bf16",
+            repeats=repeats,
+            warmup=warmup,
+            iters=iters,
+            nproc_per_node=args.nproc_per_node,
+            name=args.name,
+            profile_mode=args.profile_mode,
+            gradient_checkpointing=args.gradient_checkpointing,
             **common,
         )
     kernel = "rmsnorm" if args.workload == "liger-rmsnorm" else "swiglu"
@@ -275,9 +338,9 @@ def _build_submit_run(args: argparse.Namespace):
         kernel=kernel,
         arch=args.arch,
         dtype=args.dtype or "bf16",
-        repeats=args.repeats,
-        warmup=args.warmup,
-        iters=args.iters,
+        repeats=repeats,
+        warmup=warmup,
+        iters=iters,
         name=args.name,
         profile_mode=args.profile_mode,
         **common,
@@ -286,6 +349,60 @@ def _build_submit_run(args: argparse.Namespace):
 
 def _cmd_submit_bench(args: argparse.Namespace) -> int:
     run = _build_submit_run(args)
+    result = run.submit(dry_run=args.dry_run)
+    print(result.name, file=sys.stderr)
+    if args.print_yaml and result.rendered_yaml:
+        print(result.rendered_yaml)
+    return 0
+
+
+def _experiment_overrides(args: argparse.Namespace) -> dict[str, object]:
+    keys = (
+        "backend",
+        "m",
+        "n",
+        "k",
+        "dtype",
+        "repeats",
+        "warmup",
+        "iters",
+        "model_source",
+        "model_preset",
+        "micro_batch_size",
+        "seq_len",
+        "gradient_checkpointing",
+        "nproc_per_node",
+        "name",
+        "profile_mode",
+        "result_root",
+        "script",
+    )
+    out: dict[str, object] = {}
+    for key in keys:
+        value = getattr(args, key, None)
+        if value is not None:
+            out[key] = value
+    if getattr(args, "liger_mode", None) is not None:
+        out["mode"] = args.liger_mode
+    return out
+
+
+def _cmd_list_experiments(args: argparse.Namespace) -> int:
+    print(format_experiment_table())
+    return 0
+
+
+def _cmd_explain_experiment(args: argparse.Namespace) -> int:
+    print(format_experiment_explain(args.experiment, args.arch))
+    return 0
+
+
+def _cmd_submit_experiment(args: argparse.Namespace) -> int:
+    run = build_run_for_experiment(
+        args.experiment,
+        args.arch,
+        _experiment_overrides(args),
+    )
     result = run.submit(dry_run=args.dry_run)
     print(result.name, file=sys.stderr)
     if args.print_yaml and result.rendered_yaml:
@@ -510,9 +627,7 @@ def _cmd_ncu_summary(args: argparse.Namespace) -> int:
 
         print()
         print(
-            format_optimization_report(
-                analyze_ncu_summary(summary, top_kernels=args.optimize_top)
-            )
+            format_optimization_report(analyze_ncu_summary(summary, top_kernels=args.optimize_top))
         )
     return 0
 
@@ -630,6 +745,48 @@ def build_parser() -> argparse.ArgumentParser:
     liger.add_argument("--ncu-csv", type=Path, default=None)
     liger.add_argument("--out", type=Path, required=True)
     liger.set_defaults(func=_cmd_run_liger_perkernel)
+
+    fsdp = sub.add_parser(
+        "liger-fsdp-step",
+        help="run one Llama train-step reproduction row (baseline or Liger-patched)",
+    )
+    fsdp.add_argument("--liger-mode", choices=["baseline", "liger"], default="baseline")
+    fsdp.add_argument(
+        "--model-source", choices=["reference", "transformers"], default="transformers"
+    )
+    fsdp.add_argument(
+        "--model-preset", choices=sorted(LIGER_FSDP_MODEL_PRESETS), default="llama3-8b"
+    )
+    fsdp.add_argument("--micro-batch-size", type=int, default=1)
+    fsdp.add_argument("--seq-len", type=int, default=2048)
+    fsdp.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="bf16")
+    fsdp.add_argument("--repeats", type=int, default=3)
+    fsdp.add_argument("--warmup", type=int, default=1)
+    fsdp.add_argument("--iters", type=int, default=5)
+    fsdp.add_argument("--device", default="auto")
+    fsdp.add_argument(
+        "--allow-cpu",
+        action="store_true",
+        help="allow CPU smoke tests; real FSDP reproduction still requires CUDA",
+    )
+    fsdp.add_argument("--arch-label", choices=["a100", "h100", "h200"], default=None)
+    fsdp.add_argument("--seed", type=int, default=0)
+    fsdp.add_argument("--lr", type=float, default=3e-4)
+    fsdp.add_argument("--weight-decay", type=float, default=0.1)
+    fsdp.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable model gradient checkpointing (default: enabled)",
+    )
+    fsdp.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=1,
+        help="consumed by infra/rune/scripts/swordfish-bench.sh to launch torchrun",
+    )
+    fsdp.add_argument("--out", type=Path, required=True)
+    fsdp.set_defaults(func=_cmd_run_liger_fsdp_step)
 
     attach = sub.add_parser("attach-ncu", help="attach Nsight Compute CSV summary to a JSON result")
     attach.add_argument("--result", type=Path, required=True)
@@ -796,7 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument(
         "--workload",
-        choices=["gemm", "liger-rmsnorm", "liger-swiglu"],
+        choices=["gemm", "liger-rmsnorm", "liger-swiglu", "liger-fsdp"],
         required=True,
     )
     submit.add_argument("--arch", choices=["a100", "h100", "h200"], required=True)
@@ -821,9 +978,66 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="GEMM dtype (default fp16) or liger dtype (default bf16)",
     )
-    submit.add_argument("--repeats", type=int, default=5)
-    submit.add_argument("--warmup", type=int, default=10)
-    submit.add_argument("--iters", type=int, default=50)
+    submit.add_argument(
+        "--repeats",
+        type=int,
+        default=None,
+        help="default: 5 for GEMM/per-kernel, 3 for liger-fsdp",
+    )
+    submit.add_argument(
+        "--warmup",
+        type=int,
+        default=None,
+        help="default: 10 for GEMM/per-kernel, 1 for liger-fsdp",
+    )
+    submit.add_argument(
+        "--iters",
+        type=int,
+        default=None,
+        help="default: 50 for GEMM/per-kernel, 5 for liger-fsdp",
+    )
+    submit.add_argument(
+        "--liger-mode",
+        choices=["baseline", "liger"],
+        default="baseline",
+        help="liger-fsdp only: baseline or Liger-patched row",
+    )
+    submit.add_argument(
+        "--model-source",
+        choices=["reference", "transformers"],
+        default="transformers",
+        help="liger-fsdp only: model implementation source",
+    )
+    submit.add_argument(
+        "--model-preset",
+        choices=sorted(LIGER_FSDP_MODEL_PRESETS),
+        default="llama3-8b",
+        help="liger-fsdp only: model shape preset",
+    )
+    submit.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=1,
+        help="liger-fsdp only: per-rank batch size",
+    )
+    submit.add_argument(
+        "--seq-len",
+        type=int,
+        default=2048,
+        help="liger-fsdp only: sequence length",
+    )
+    submit.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="liger-fsdp only: enable model gradient checkpointing",
+    )
+    submit.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=8,
+        help="liger-fsdp only: torchrun workers per node",
+    )
     submit.add_argument(
         "--backend",
         choices=available_gemm_backends(),
@@ -843,6 +1057,112 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     submit.set_defaults(func=_cmd_submit_bench)
+
+    experiment_names = [spec.name for spec in list_experiments()]
+
+    list_exp = sub.add_parser(
+        "list-experiments",
+        help="list repo-approved experiment intents and their profile families",
+    )
+    list_exp.set_defaults(func=_cmd_list_experiments)
+
+    explain_exp = sub.add_parser(
+        "explain-experiment",
+        help="show which generated Rune profile and queue an experiment resolves to",
+    )
+    explain_exp.add_argument("experiment", choices=experiment_names)
+    explain_exp.add_argument("--arch", choices=["a100", "h100", "h200"], required=True)
+    explain_exp.set_defaults(func=_cmd_explain_experiment)
+
+    submit_exp = sub.add_parser(
+        "submit-experiment",
+        help="dispatch by experiment intent; placement resolves through repo-approved profiles",
+    )
+    submit_exp.add_argument("experiment", choices=experiment_names)
+    submit_exp.add_argument("--arch", choices=["a100", "h100", "h200"], required=True)
+    submit_exp.add_argument("--name", default=None, help="override generated job name")
+    submit_exp.add_argument("--profile-mode", choices=["ncu", "nsys", "torch"], default=None)
+    submit_exp.add_argument(
+        "--dry-run",
+        choices=["client", "server"],
+        default=None,
+        help="render-only without submitting (client = local, server = api dry-run)",
+    )
+    submit_exp.add_argument(
+        "--print-yaml",
+        action="store_true",
+        help="print the rendered Job manifest after submit/dry-run",
+    )
+    submit_exp.add_argument("--m", type=int, default=None, help="gemm only")
+    submit_exp.add_argument("--n", type=int, default=None, help="gemm only")
+    submit_exp.add_argument("--k", type=int, default=None, help="gemm only")
+    submit_exp.add_argument(
+        "--dtype",
+        default=None,
+        help="override experiment default dtype",
+    )
+    submit_exp.add_argument("--repeats", type=int, default=None)
+    submit_exp.add_argument("--warmup", type=int, default=None)
+    submit_exp.add_argument("--iters", type=int, default=None)
+    submit_exp.add_argument(
+        "--liger-mode",
+        choices=["baseline", "liger"],
+        default=None,
+        help="liger-fsdp only: baseline or Liger-patched row",
+    )
+    submit_exp.add_argument(
+        "--model-source",
+        choices=["reference", "transformers"],
+        default=None,
+        help="liger-fsdp only: model implementation source",
+    )
+    submit_exp.add_argument(
+        "--model-preset",
+        choices=sorted(LIGER_FSDP_MODEL_PRESETS),
+        default=None,
+        help="liger-fsdp only: model shape preset",
+    )
+    submit_exp.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=None,
+        help="liger-fsdp only: per-rank batch size",
+    )
+    submit_exp.add_argument(
+        "--seq-len",
+        type=int,
+        default=None,
+        help="liger-fsdp only: sequence length",
+    )
+    submit_exp.add_argument(
+        "--gradient-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="liger-fsdp only: enable model gradient checkpointing",
+    )
+    submit_exp.add_argument(
+        "--nproc-per-node",
+        type=int,
+        default=None,
+        help="liger-fsdp only: torchrun workers per node",
+    )
+    submit_exp.add_argument(
+        "--backend",
+        choices=available_gemm_backends(),
+        default=None,
+        help="gemm only",
+    )
+    submit_exp.add_argument(
+        "--result-root",
+        default=None,
+        help="PVC directory the in-pod runner writes results to",
+    )
+    submit_exp.add_argument(
+        "--script",
+        default=None,
+        help="override the in-pod entrypoint script",
+    )
+    submit_exp.set_defaults(func=_cmd_submit_experiment)
 
     inspect = sub.add_parser(
         "inspect-run",

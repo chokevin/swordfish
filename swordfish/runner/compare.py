@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 from typing import Any, Sequence
 
-from swordfish.runner.schema import validate_result_protocol
+from swordfish.runner.schema import (
+    TRAINING_SCHEMA_VERSION,
+    validate_result_protocol,
+    validate_training_result_protocol,
+)
 
 
 def _shape_summary(shape: Any) -> str:
@@ -19,6 +23,12 @@ def _shape_summary(shape: Any) -> str:
 
 def _get_float(value: Any) -> float | None:
     return value if isinstance(value, int | float) else None
+
+
+def _validation_errors(result: dict[str, Any]) -> list[str]:
+    if result.get("schema_version") == TRAINING_SCHEMA_VERSION:
+        return validate_training_result_protocol(result)
+    return validate_result_protocol(result)
 
 
 def _format_float(value: float | None) -> str:
@@ -36,7 +46,7 @@ def _result_row(path: Path, result: dict[str, Any], baseline_ms: float | None) -
     mean_ms = _get_float(latency.get("mean_ms"))
     speedup = baseline_ms / mean_ms if baseline_ms and mean_ms and mean_ms > 0 else None
     ncu = result.get("ncu")
-    validation_errors = validate_result_protocol(result)
+    validation_errors = _validation_errors(result)
 
     return [
         path.name,

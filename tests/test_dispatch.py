@@ -10,12 +10,16 @@ import pytest
 from swordfish.dispatch import (
     DEFAULT_IMAGE,
     DEFAULT_PVC,
+    LigerFsdpRun,
     LigerPerkernelMatrix,
     LigerPerkernelRun,
     RuneSubmit,
     RuneSubmitGetMissingAnnotationsError,
     TorchGemmRun,
+    build_run_for_experiment,
     fetch_via_rune_submit_get,
+    list_experiments,
+    resolve_experiment,
 )
 
 
@@ -123,9 +127,19 @@ def test_liger_perkernel_run_defaults_to_swordfish_profile_pack():
     assert submit.volumes == [f"data=pvc:{DEFAULT_PVC}"]
 
 
-def test_liger_perkernel_run_explicit_preset_overrides_profile_default():
-    """Callers can opt back to the raw preset shortcut."""
-    run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", preset="azure.kernel-mode.training.l")
+def test_liger_perkernel_run_rejects_raw_preset_without_escape_hatch():
+    with pytest.raises(ValueError, match="kernel-team queue contract"):
+        LigerPerkernelRun(kernel="rmsnorm", arch="a100", preset="azure.kernel-mode.training.l")
+
+
+def test_liger_perkernel_run_explicit_preset_requires_escape_hatch():
+    """Callers can opt back to the raw preset shortcut, but only explicitly."""
+    run = LigerPerkernelRun(
+        kernel="rmsnorm",
+        arch="a100",
+        preset="azure.kernel-mode.training.l",
+        allow_raw_preset=True,
+    )
     submit = run.to_rune_submit()
     assert submit.preset == "azure.kernel-mode.training.l"
     assert submit.profile is None
@@ -233,6 +247,7 @@ def test_liger_perkernel_run_name_too_long_rejected():
 def test_liger_perkernel_run_profile_mode_passes_through_native_flag():
     """profile_mode must render as the native --profile-mode CLI flag."""
     run = LigerPerkernelRun(kernel="rmsnorm", arch="a100", profile_mode="ncu")
+    assert run.resolved_profile == "swordfish-bench-a100-ncu"
     args = run.to_rune_submit().to_args()
     assert "--profile-mode" in args
     assert args[args.index("--profile-mode") + 1] == "ncu"
@@ -301,6 +316,7 @@ def test_torch_gemm_run_profile_mode_torch_does_not_pass_to_rune():
 def test_torch_gemm_run_profile_mode_ncu_still_uses_rune_native():
     """Sanity: only torch bypasses rune; ncu/nsys still go through --profile-mode."""
     run = TorchGemmRun(arch="a100", profile_mode="ncu")
+    assert run.resolved_profile == "swordfish-bench-a100-ncu"
     args = run.to_rune_submit().to_args()
     assert "--profile-mode" in args
     assert args[args.index("--profile-mode") + 1] == "ncu"
@@ -327,6 +343,150 @@ def test_liger_perkernel_run_no_profile_mode_no_wrapper():
     assert "infra/rune/scripts/swordfish-bench.sh" in str(submit.script)
     assert run.profile_out_path is None
     assert run.profile_out_dir is None
+
+
+def test_liger_fsdp_run_defaults_to_eight_gpu_a100_profile():
+    run = LigerFsdpRun(arch="a100", mode="baseline")
+    submit = run.to_rune_submit()
+
+    assert run.resolved_name == "sf-liger-fsdp-llama3-8b-baseline-a100"
+    assert submit.profile == "swordfish-fsdp-a100"
+    assert submit.preset is None
+    assert submit.output == "/data/swordfish/week1/liger-fsdp/llama3-8b-baseline-a100.json"
+    assert "--gpu-class" in submit.extra_args
+    assert "a100-nvlink-80gb" in submit.extra_args
+
+
+def test_liger_fsdp_run_rejects_raw_preset_without_escape_hatch():
+    with pytest.raises(ValueError, match="kernel-team queue contract"):
+        LigerFsdpRun(arch="a100", mode="baseline", preset="azure.research.training.xl")
+
+
+def test_liger_fsdp_run_forwarded_args_include_torchrun_contract():
+    run = LigerFsdpRun(
+        arch="a100",
+        mode="liger",
+        model_source="transformers",
+        micro_batch_size=1,
+        seq_len=2048,
+        nproc_per_node=8,
+    )
+    forwarded = run.forwarded_args
+
+    assert forwarded[0] == "liger-fsdp-step"
+    assert "--liger-mode" in forwarded
+    assert "liger" in forwarded
+    assert "--model-preset" in forwarded
+    assert "llama3-8b" in forwarded
+    assert "--nproc-per-node" in forwarded
+    assert "8" in forwarded
+    assert "--out" in forwarded
+    assert "/data/swordfish/week1/liger-fsdp/llama3-8b-liger-a100.json" in forwarded
+
+
+def test_liger_fsdp_run_to_command_renders_dry_run():
+    run = LigerFsdpRun(arch="h100", mode="baseline", name="fsdp_smoke")
+    cmd = run.to_command(dry_run="client")
+
+    assert "rune submit fsdp-smoke" in cmd
+    assert "--profile swordfish-fsdp-h100" in cmd
+    assert "--gpu-class h100-standalone-95gb" in cmd
+    assert "liger-fsdp-step" in cmd
+    assert "--nproc-per-node 8" in cmd
+
+
+def test_liger_fsdp_run_profile_mode_torch_uses_in_process_profiler():
+    run = LigerFsdpRun(arch="a100", mode="baseline", profile_mode="torch")
+    submit = run.to_rune_submit()
+    args = submit.to_args()
+
+    assert "--profile-mode" not in args
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
+    assert "SWORDFISH_PROFILE=torch" in env_args
+    assert any(e.endswith("/profile/profile.json") for e in env_args)
+
+
+def test_liger_fsdp_run_profile_mode_ncu_uses_a100_ncu_profile():
+    run = LigerFsdpRun(arch="a100", mode="baseline", profile_mode="ncu")
+    submit = run.to_rune_submit()
+
+    assert submit.profile == "swordfish-fsdp-a100-ncu"
+    assert "--profile-mode" in submit.to_args()
+
+
+# ---------------------------------------------------------------------------
+# experiment registry
+# ---------------------------------------------------------------------------
+
+
+def test_experiment_registry_lists_current_workloads():
+    specs = {spec.name: spec for spec in list_experiments()}
+
+    assert set(specs) == {"gemm", "liger-fsdp", "liger-rmsnorm", "liger-swiglu"}
+    assert specs["gemm"].profile_family == "bench"
+    assert specs["liger-fsdp"].profile_family == "fsdp"
+
+
+def test_resolve_experiment_grounds_profile_and_queue():
+    resolved = resolve_experiment("liger-fsdp", "a100")
+
+    assert resolved.profile == "swordfish-fsdp-a100"
+    assert resolved.queue_summary.cluster_queue == "team-kernel-mode-reserved-cq"
+    assert resolved.queue_summary.local_queue == "kernel-mode-training"
+    assert resolved.queue_summary.gpu_class == "a100-nvlink-80gb"
+    assert resolved.queue_summary.gpus_per_node == 8
+    assert resolved.queue_summary.claim_template == "ds-8gpus"
+
+
+def test_experiment_registry_rejects_unknown_experiment():
+    with pytest.raises(ValueError, match="unknown experiment"):
+        resolve_experiment("secret-side-queue", "a100")
+
+
+def test_build_run_for_experiment_uses_resolved_profile():
+    run = build_run_for_experiment("gemm", "h100", {"m": 1024, "n": 2048, "k": 4096})
+    submit = run.to_rune_submit()
+
+    assert isinstance(run, TorchGemmRun)
+    assert submit.profile == "swordfish-bench-h100"
+    assert submit.preset is None
+    assert run.m == 1024 and run.n == 2048 and run.k == 4096
+
+
+def test_build_run_for_liger_fsdp_experiment_uses_fsdp_profile_and_overrides():
+    run = build_run_for_experiment(
+        "liger-fsdp",
+        "a100",
+        {"mode": "liger", "repeats": 1, "warmup": 0, "iters": 1},
+    )
+    submit = run.to_rune_submit()
+
+    assert isinstance(run, LigerFsdpRun)
+    assert submit.profile == "swordfish-fsdp-a100"
+    assert submit.preset is None
+    assert "--liger-mode" in run.forwarded_args
+    assert "liger" in run.forwarded_args
+
+
+def test_every_registered_experiment_resolves_to_generated_profile_pack():
+    from swordfish.dispatch.profiles import all_profiles
+
+    generated = {profile.name for profile in all_profiles()}
+    for spec in list_experiments():
+        for arch in spec.allowed_arches:
+            resolved = resolve_experiment(spec.name, arch)
+            run = build_run_for_experiment(spec.name, arch)
+            submit = run.to_rune_submit()
+
+            assert resolved.profile in generated
+            assert submit.profile == resolved.profile
+            assert submit.preset is None
+            assert resolved.queue_summary.local_queue.startswith("kernel-mode-")
+
+
+def test_build_run_for_experiment_rejects_invalid_override_for_workload():
+    with pytest.raises(ValueError, match="overrides not valid"):
+        build_run_for_experiment("gemm", "a100", {"seq_len": 2048})
 
 
 # --- retrieval semantics ---
@@ -706,8 +866,17 @@ def test_torch_gemm_run_h200_defaults_to_h200_profile():
     assert run.resolved_profile == "swordfish-bench-h200"
 
 
-def test_torch_gemm_run_explicit_preset_overrides_profile_default():
-    run = TorchGemmRun(arch="a100", preset="azure.kernel-mode.training.l")
+def test_torch_gemm_run_rejects_raw_preset_without_escape_hatch():
+    with pytest.raises(ValueError, match="kernel-team queue contract"):
+        TorchGemmRun(arch="a100", preset="azure.kernel-mode.training.l")
+
+
+def test_torch_gemm_run_explicit_preset_requires_escape_hatch():
+    run = TorchGemmRun(
+        arch="a100",
+        preset="azure.kernel-mode.training.l",
+        allow_raw_preset=True,
+    )
     submit = run.to_rune_submit()
     assert submit.preset == "azure.kernel-mode.training.l"
     assert submit.profile is None
@@ -792,6 +961,20 @@ def test_swordfish_pack_yaml_in_sync_with_python_source():
     assert expected == actual, (
         f"{PACK_YAML_PATH} is out of sync with swordfish.dispatch.profiles. Run: make rune-profiles"
     )
+
+
+def test_swordfish_pack_contains_a100_ncu_profiles_only_for_elevated_capability():
+    from swordfish.dispatch.profiles import all_profiles, render_pack_yaml
+
+    generated = {profile.name: profile for profile in all_profiles()}
+    assert generated["swordfish-bench-a100-ncu"].sys_admin is True
+    assert generated["swordfish-fsdp-a100-ncu"].sys_admin is True
+    assert generated["swordfish-bench-a100"].sys_admin is False
+
+    yaml = render_pack_yaml()
+    assert "name: swordfish-bench-a100-ncu" in yaml
+    assert "name: swordfish-fsdp-a100-ncu" in yaml
+    assert "capabilities:\n        add:\n          - SYS_ADMIN" in yaml
 
 
 # ---------------------------------------------------------------------------
@@ -890,6 +1073,79 @@ def test_submit_bench_cli_dry_run_invokes_submit(monkeypatch, capsys):
     rc = cli.main(["submit-bench", "--workload", "gemm", "--arch", "a100", "--dry-run", "client"])
     assert rc == 0
     assert captured == {"arch": "a100", "dry_run": "client"}
+
+
+def test_list_experiments_cli_prints_registered_experiments(capsys):
+    from swordfish.runner import cli
+
+    rc = cli.main(["list-experiments"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "liger-fsdp" in out
+    assert "profile-family" in out
+
+
+def test_explain_experiment_cli_prints_profile_and_queue(capsys):
+    from swordfish.runner import cli
+
+    rc = cli.main(["explain-experiment", "liger-fsdp", "--arch", "a100"])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "profile:        swordfish-fsdp-a100" in out
+    assert "queue:          team-kernel-mode-reserved-cq/kernel-mode-training" in out
+
+
+def test_submit_experiment_cli_invokes_resolved_run(monkeypatch):
+    from swordfish.runner import cli
+
+    captured: dict = {}
+
+    def fake_submit(self, *, dry_run=None, **kwargs):
+        captured["profile"] = self.to_rune_submit().profile
+        captured["dry_run"] = dry_run
+        captured["mode"] = self.mode
+        from swordfish.dispatch.rune import RuneSubmitResult
+
+        return RuneSubmitResult(
+            name=self.resolved_name,
+            args=["rune"],
+            rendered_yaml="kind: Job",
+            stdout="kind: Job",
+            stderr="",
+        )
+
+    monkeypatch.setattr(LigerFsdpRun, "submit", fake_submit)
+    rc = cli.main(
+        [
+            "submit-experiment",
+            "liger-fsdp",
+            "--arch",
+            "a100",
+            "--liger-mode",
+            "liger",
+            "--dry-run",
+            "client",
+        ]
+    )
+
+    assert rc == 0
+    assert captured == {
+        "profile": "swordfish-fsdp-a100",
+        "dry_run": "client",
+        "mode": "liger",
+    }
+
+
+def test_submit_experiment_cli_does_not_accept_raw_preset():
+    from swordfish.runner.cli import build_parser
+
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["submit-experiment", "liger-fsdp", "--arch", "a100", "--preset", "azure.x"]
+        )
 
 
 def test_generate_rune_profiles_check_passes_when_in_sync(tmp_path):

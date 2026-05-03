@@ -61,15 +61,21 @@ RUNE_PROFILE_PACK ?= infra/rune/profiles/swordfish-pack.yaml
 RUNE_NAMESPACE ?= ray
 RUNE_PVC ?= training-nfs
 RUNE_IMAGE_REF ?= voiceagentcr.azurecr.io/swordfish-bench:latest
+RUNE_RELEASE_TAG ?= rune-cli-v0.2.0
+RUNE_REPO ?= azure-management-and-platforms/aks-ai-runtime
+GITHUB_HOST ?= github.com
+RUNE_PY_SPEC ?= rune-py @ git+https://github.com/azure-management-and-platforms/aks-ai-runtime.git@$(RUNE_RELEASE_TAG)\#subdirectory=applications/rune-py
 SUBMIT_BENCH = uv run python -m swordfish.runner submit-bench \
     --result-root $(RUNE_RESULT_DIR) \
     --script $(RUNE_BENCH_SCRIPT)
 
-.PHONY: rune-profiles rune-profiles-check \
+.PHONY: rune-bootstrap \
+        rune-profiles rune-profiles-check \
         rune-install-profiles \
         rune-submit-gemm-a100 rune-submit-gemm-h100 rune-submit-gemm-h200 \
         rune-submit-gemm-matrix \
         rune-submit-liger-rmsnorm-a100 rune-submit-liger-swiglu-a100 \
+        rune-submit-liger-fsdp-a100-baseline rune-submit-liger-fsdp-a100-liger \
         rune-convert-ncu
 
 rune-profiles:
@@ -85,7 +91,7 @@ rune-install-profiles: rune-profiles-check
 	done
 	@echo "rune profiles installed under $(RUNE_PROFILES_DIR)/"
 	@echo "verify with: rune profile list"
-	@echo "expected: 3 swordfish-bench-* profiles (core parents are embedded in the rune binary)"
+	@echo "expected: 4 swordfish-bench-* and 4 swordfish-fsdp-* profiles"
 
 rune-submit-gemm-a100:
 	$(SUBMIT_BENCH) --workload gemm --arch a100 \
@@ -120,6 +126,18 @@ rune-submit-liger-swiglu-a100:
 	    --name swordfish-liger-swiglu-$(RUNE_RUN_ID)-a100 \
 	    --repeats $(RUNE_REPEATS) --warmup $(RUNE_WARMUP) --iters $(RUNE_ITERS)
 
+rune-submit-liger-fsdp-a100-baseline:
+	$(SUBMIT_BENCH) --workload liger-fsdp --arch a100 \
+	    --name swordfish-liger-fsdp-baseline-$(RUNE_RUN_ID)-a100 \
+	    --liger-mode baseline \
+	    --repeats 3 --warmup 1 --iters 5
+
+rune-submit-liger-fsdp-a100-liger:
+	$(SUBMIT_BENCH) --workload liger-fsdp --arch a100 \
+	    --name swordfish-liger-fsdp-liger-$(RUNE_RUN_ID)-a100 \
+	    --liger-mode liger \
+	    --repeats 3 --warmup 1 --iters 5
+
 # Convert a cluster-side .ncu-rep into a .ncu-summary.csv companion via a
 # CPU-only Pod that runs `ncu --import` against the PVC. Mac developers with
 # Nsight Compute installed don't need this — the runner's ncu_summary path
@@ -133,3 +151,17 @@ rune-convert-ncu:
 	    --namespace $(RUNE_NAMESPACE) \
 	    --pvc $(RUNE_PVC) \
 	    --image $(RUNE_IMAGE_REF)
+
+rune-bootstrap:
+	@if ! command -v gh >/dev/null 2>&1; then echo "missing: gh (install: brew install gh)" >&2; exit 1; fi
+	@if ! command -v uv >/dev/null 2>&1; then echo "missing: uv (install: brew install uv)" >&2; exit 1; fi
+	@if ! gh auth status --hostname $(GITHUB_HOST) >/dev/null 2>&1; then gh auth login --hostname $(GITHUB_HOST); fi
+	gh auth setup-git --hostname $(GITHUB_HOST) >/dev/null
+	gh release view $(RUNE_RELEASE_TAG) --repo $(RUNE_REPO) >/dev/null
+	uv sync
+	uv pip install "$(RUNE_PY_SPEC)"
+	uv run rune-py bootstrap \
+	    --tag $(RUNE_RELEASE_TAG) \
+	    --repo $(RUNE_REPO) \
+	    --github-host $(GITHUB_HOST)
+	uv run rune-py doctor -n $(RUNE_NAMESPACE)

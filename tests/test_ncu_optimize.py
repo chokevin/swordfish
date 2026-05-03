@@ -50,9 +50,7 @@ def _kernel(
             "sm__throughput.avg.pct_of_peak_sustained_elapsed", sm
         )
     if mem is not None:
-        metrics[
-            "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"
-        ] = _metric(
+        metrics["gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed"] = _metric(
             "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed",
             mem,
         )

@@ -36,14 +36,20 @@ NODE_LANE_VALUE = "train"
 PRIORITY_CLASS = "airun-train-default"
 
 # Pod resource requests + DRA claim. `full-gpu` is the right claim template for
-# kernel benches (one full device). 16 vCPU / 64 GiB matches the old
-# ai-train-gpu-l defaults that this pack used to inherit.
+# one-GPU kernel benches. The FSDP profile uses the cluster's single-node
+# 8-GPU DRA claim template so torchrun's eight local ranks each see a device.
 DRA_DEVICE_CLASS = "gpu.nvidia.com"
-DRA_CLAIM_TEMPLATE = "full-gpu"
-GPU_SIZE = "l"
+BENCH_DRA_CLAIM_TEMPLATE = "full-gpu"
+FSDP_DRA_CLAIM_TEMPLATE = "ds-8gpus"
 GPU_MEMORY_GIB_MIN = 60
-CPU_REQUEST = "16"
-MEMORY_REQUEST = "64Gi"
+BENCH_GPU_SIZE = "l"
+BENCH_GPUS_PER_NODE = 1
+BENCH_CPU_REQUEST = "16"
+BENCH_MEMORY_REQUEST = "64Gi"
+FSDP_GPU_SIZE = "xl"
+FSDP_GPUS_PER_NODE = 8
+FSDP_CPU_REQUEST = "64"
+FSDP_MEMORY_REQUEST = "512Gi"
 
 # Policy + cost. Cost is informational only (not enforced by Kueue admission)
 # but the runtime preempt knobs do matter for the scheduler.
@@ -94,10 +100,13 @@ ARCHES = ("a100", "h100", "h200")
 @dataclass(frozen=True)
 class ProfileSpec:
     arch: str
+    workload: str = "bench"
+    sys_admin: bool = False
 
     @property
     def name(self) -> str:
-        return f"swordfish-bench-{self.arch}"
+        base = f"swordfish-{self.workload}-{self.arch}"
+        return f"{base}-ncu" if self.sys_admin else base
 
     @property
     def lane(self) -> str:
@@ -107,9 +116,34 @@ class ProfileSpec:
     def local_queue(self) -> str:
         return ARCH_TO_LOCAL_QUEUE[self.arch]
 
+    @property
+    def gpu_size(self) -> str:
+        return FSDP_GPU_SIZE if self.workload == "fsdp" else BENCH_GPU_SIZE
+
+    @property
+    def gpus_per_node(self) -> int:
+        return FSDP_GPUS_PER_NODE if self.workload == "fsdp" else BENCH_GPUS_PER_NODE
+
+    @property
+    def cpu_request(self) -> str:
+        return FSDP_CPU_REQUEST if self.workload == "fsdp" else BENCH_CPU_REQUEST
+
+    @property
+    def memory_request(self) -> str:
+        return FSDP_MEMORY_REQUEST if self.workload == "fsdp" else BENCH_MEMORY_REQUEST
+
+    @property
+    def claim_template(self) -> str:
+        return FSDP_DRA_CLAIM_TEMPLATE if self.workload == "fsdp" else BENCH_DRA_CLAIM_TEMPLATE
+
 
 def all_profiles() -> list[ProfileSpec]:
-    return [ProfileSpec(arch=a) for a in ARCHES]
+    return [
+        *(ProfileSpec(arch=a, workload="bench") for a in ARCHES),
+        *(ProfileSpec(arch=a, workload="fsdp") for a in ARCHES),
+        ProfileSpec(arch="a100", workload="bench", sys_admin=True),
+        ProfileSpec(arch="a100", workload="fsdp", sys_admin=True),
+    ]
 
 
 _HEADER = """\
@@ -133,20 +167,20 @@ _HEADER = """\
 #   * queue.localQueue   — kernel-mode-training vs kernel-mode-large-memory.
 #   * cost.gpuType       — informational.
 #
-# Shared across all three profiles:
+# Shared across all profiles:
 #   * scheduling.nodeSelector keys on `airun.aks.io/lane=train` (the actual
 #     label on every GPU node in voice-agent-flex today; not the validator's
 #     `lane` value) AND on `nvidia.com/gpu.product` so a100-targeted jobs
 #     can't land on H100/H200 nodes (and vice versa).
 #   * scheduling.tolerations match the lane=train taint.
 #   * resources.dra uses the `full-gpu` claim template (one device per pod;
-#     correct for kernel benches).
+#     correct for kernel benches). `swordfish-bench-*` profiles use gpu.size=l
+#     (one GPU); `swordfish-fsdp-*` profiles use gpu.size=xl (one 8-GPU node).
 #   * resources.persistence mounts the training-nfs PVC at /data.
 #
-# A100 + Nsight Compute caveat: rune profiles cannot currently expose container
-# SYS_ADMIN, which Nsight Compute requires on A100 to read GPU performance
-# counters. A100 NCU is a known limitation tracked in docs/airun/a100-ncu-blocker.md;
-# H100 NVL and H200 NCU work with no extra privileges and run fine through rune.
+# A100 + Nsight Compute caveat: A100 NCU requires container SYS_ADMIN to read
+# GPU performance counters. The normal profiles do not request elevated
+# capability; the dedicated `*-a100-ncu` profiles add it only for profiler runs.
 """
 
 
@@ -162,6 +196,7 @@ def _render_one(profile: ProfileSpec) -> str:
         "    airun.aks.io/pack: swordfish\n"
         f"    airun.aks.io/lane: {profile.lane}\n"
         f"    swordfish.dev/arch: {profile.arch}\n"
+        f"    swordfish.dev/workload: {profile.workload}\n"
         "spec:\n"
         f"  lane: {profile.lane}\n"
         "  queue:\n"
@@ -179,25 +214,30 @@ def _render_one(profile: ProfileSpec) -> str:
         f"    priorityClassName: {PRIORITY_CLASS}\n"
         "  resources:\n"
         "    gpu:\n"
-        f"      size: {GPU_SIZE}\n"
+        f"      size: {profile.gpu_size}\n"
         f"      memoryGiBMin: {GPU_MEMORY_GIB_MIN}\n"
         "    dra:\n"
         f"      deviceClass: {DRA_DEVICE_CLASS}\n"
-        f"      claimTemplate: {DRA_CLAIM_TEMPLATE}\n"
+        f"      claimTemplate: {profile.claim_template}\n"
         "    requests:\n"
-        f'      cpu: "{CPU_REQUEST}"\n'
-        f"      memory: {MEMORY_REQUEST}\n"
+        f'      cpu: "{profile.cpu_request}"\n'
+        f"      memory: {profile.memory_request}\n"
         "    persistence:\n"
         f"      - pvcName: {PVC_NAME}\n"
         f"        mountPath: {PVC_MOUNT}\n"
         "  cost:\n"
         f"    gpuType: {ARCH_TO_GPU_TYPE[profile.arch]}\n"
-        "    gpusPerNode: 1\n"
+        f"    gpusPerNode: {profile.gpus_per_node}\n"
         "  runtime:\n"
         f"    image: {IMAGE}\n"
         f"    imagePullPolicy: {IMAGE_PULL_POLICY}\n"
         f"    imageFamily: {IMAGE_FAMILY}\n"
-        "  policy:\n"
+        + (
+            "    securityContext:\n      capabilities:\n        add:\n          - SYS_ADMIN\n"
+            if profile.sys_admin
+            else ""
+        )
+        + "  policy:\n"
         f"    preemptable: {str(PREEMPTABLE).lower()}\n"
         f"    maxQueueWaitSeconds: {MAX_QUEUE_WAIT_SECONDS}\n"
         f"    checkpointOnPreempt: {str(CHECKPOINT_ON_PREEMPT).lower()}\n"

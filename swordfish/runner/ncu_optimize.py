@@ -186,11 +186,7 @@ def _classify(sm: float | None, mem: float | None, dram: float | None) -> Bounde
         return Boundedness.NEAR_PEAK
 
     # Leaning compute: SM clearly leads MEM, DRAM not the wall.
-    if (
-        sm_v >= SM_BOUND
-        and (sm_v - mem_v) >= SM_OVER_MEM_DELTA
-        and dram_v <= DRAM_NOT_BOTTLENECK
-    ):
+    if sm_v >= SM_BOUND and (sm_v - mem_v) >= SM_OVER_MEM_DELTA and dram_v <= DRAM_NOT_BOTTLENECK:
         return Boundedness.COMPUTE_BOUND
 
     # On-chip memory pressure: MEM saturated, SM low, DRAM not the wall.
@@ -214,7 +210,6 @@ def _suggest(
     """Concrete, kernel-aware suggestions. Each item is one short sentence."""
     out: list[str] = []
     name = kernel.name
-    short = kernel.short_name
 
     if pct_of_total < NEGLIGIBLE_PCT:
         out.append(
@@ -370,8 +365,7 @@ def _job_findings(
 
     # Diagnostic: did NCU capture the SoL metrics at all?
     have_sol = any(
-        a.sm_pct is not None or a.mem_pct is not None or a.dram_pct is not None
-        for a in advice
+        a.sm_pct is not None or a.mem_pct is not None or a.dram_pct is not None for a in advice
     )
     if not have_sol:
         out.append(
@@ -394,11 +388,7 @@ def analyze_ncu_summary(
     negligible = 0
 
     for k in summary.kernels:
-        pct = (
-            k.total_time_ns / summary.total_time_ns * 100.0
-            if summary.total_time_ns > 0
-            else 0.0
-        )
+        pct = k.total_time_ns / summary.total_time_ns * 100.0 if summary.total_time_ns > 0 else 0.0
         if pct < NEGLIGIBLE_PCT:
             negligible += 1
 
@@ -409,11 +399,7 @@ def analyze_ncu_summary(
         sm_v = sm.mean if sm else None
         mem_v = mem.mean if mem else None
         dram_v = dram.mean if dram else None
-        pct = (
-            k.total_time_ns / summary.total_time_ns * 100.0
-            if summary.total_time_ns > 0
-            else 0.0
-        )
+        pct = k.total_time_ns / summary.total_time_ns * 100.0 if summary.total_time_ns > 0 else 0.0
         bound = _classify(sm_v, mem_v, dram_v)
         suggestions = _suggest(k, bound, sm_v, mem_v, dram_v, pct)
         advice.append(
@@ -476,9 +462,7 @@ def format_optimization_report(report: OptimizationReport) -> str:
         short = a.kernel.short_name
         if len(short) > 80:
             short = short[:79] + "…"
-        lines.append(
-            f"  {i}. {short}"
-        )
+        lines.append(f"  {i}. {short}")
         lines.append(
             f"     {a.pct_of_total:.1f}% of time  "
             f"({a.kernel.invocations} invocations, "

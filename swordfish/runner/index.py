@@ -7,13 +7,24 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from swordfish.runner.schema import SCHEMA_VERSION, validate_result_protocol
+from swordfish.runner.schema import (
+    SCHEMA_VERSION,
+    TRAINING_SCHEMA_VERSION,
+    validate_result_protocol,
+    validate_training_result_protocol,
+)
 
 INDEX_SCHEMA_VERSION = "swordfish.result_index.v1"
 
 
 def _float_or_none(value: Any) -> float | None:
     return value if isinstance(value, int | float) else None
+
+
+def _validation_errors(result: dict[str, Any]) -> list[str]:
+    if result.get("schema_version") == TRAINING_SCHEMA_VERSION:
+        return validate_training_result_protocol(result)
+    return validate_result_protocol(result)
 
 
 def _summarize_result(result_dir: Path, path: Path, result: dict[str, Any]) -> dict[str, Any]:
@@ -46,7 +57,7 @@ def _summarize_result(result_dir: Path, path: Path, result: dict[str, Any]) -> d
         "max_abs_error": _float_or_none(correctness.get("max_abs_error")),
         "max_rel_error": _float_or_none(correctness.get("max_rel_error")),
         "ncu_complete": ncu.get("complete") if ncu is not None else None,
-        "protocol_errors": validate_result_protocol(result),
+        "protocol_errors": _validation_errors(result),
     }
 
 
@@ -84,7 +95,7 @@ def build_result_index(
                 {"file": str(path.relative_to(result_dir)), "reason": "not a JSON object"}
             )
             continue
-        if loaded.get("schema_version") != SCHEMA_VERSION:
+        if loaded.get("schema_version") not in {SCHEMA_VERSION, TRAINING_SCHEMA_VERSION}:
             skipped.append(
                 {"file": str(path.relative_to(result_dir)), "reason": "not a swordfish result"}
             )

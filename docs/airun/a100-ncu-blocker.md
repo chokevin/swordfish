@@ -5,6 +5,9 @@
 Fresh A100 timing and Nsight Compute JSON exists and is valid. The A100 blocker
 was resolved by temporarily excluding A100 nodes from the DCGM exporter
 DaemonSet during the NCU profiling window, then restoring the DaemonSet.
+Rune now supports profile-driven container capabilities, so Swordfish's
+dedicated `swordfish-bench-a100-ncu` / `swordfish-fsdp-a100-ncu` profiles can
+request `SYS_ADMIN` without hand-editing rendered Jobs.
 
 - Result path: `runs/airun/week1/torch-gemm-a100.json`
 - GPU: `NVIDIA A100-SXM4-80GB`
@@ -100,6 +103,13 @@ dram__throughput.avg.pct_of_peak_sustained_elapsed=73.36
 gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed=73.36
 ```
 
+The Rune-profile path was rechecked with
+`swordfish-a100-ncu-rune-0502192934`, submitted through
+`swordfish-bench-a100-ncu` and `--profile-mode ncu` while DCGM was excluded
+from A100 nodes. The rendered Job included `securityContext.capabilities.add:
+[SYS_ADMIN]`, NCU profiled the cuBLAS GEMM kernel successfully, and
+`profile.ncu-summary.csv` contained 494 rows across 9 kernels / 10 invocations.
+
 ## Ruled out
 
 - Missing result JSON: ruled out; A100 writes final JSON.
@@ -130,7 +140,10 @@ When A100 NCU profiling is needed:
 4. Run `make airun-a100-ncu-preflight`; it should fail if a running DCGM exporter
    pod is still on a Ready target A100 node or if the A100 arch config lacks
    `SYS_ADMIN`.
-5. Run the NCU benchmark job with `SYS_ADMIN`.
+5. Run the NCU benchmark job through a dedicated A100 NCU profile
+   (`swordfish-bench-a100-ncu` for one-GPU jobs or `swordfish-fsdp-a100-ncu` for
+   8-GPU jobs). The normal dispatch path selects these automatically for
+   `--arch a100 --profile-mode ncu`.
 6. Copy the final JSON/CSV artifacts locally.
 7. Restore the DaemonSet immediately and confirm `rollout status
    ds/nvidia-dcgm-exporter` succeeds.

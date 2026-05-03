@@ -18,20 +18,20 @@
 #   * queue.localQueue   — kernel-mode-training vs kernel-mode-large-memory.
 #   * cost.gpuType       — informational.
 #
-# Shared across all three profiles:
+# Shared across all profiles:
 #   * scheduling.nodeSelector keys on `airun.aks.io/lane=train` (the actual
 #     label on every GPU node in voice-agent-flex today; not the validator's
 #     `lane` value) AND on `nvidia.com/gpu.product` so a100-targeted jobs
 #     can't land on H100/H200 nodes (and vice versa).
 #   * scheduling.tolerations match the lane=train taint.
 #   * resources.dra uses the `full-gpu` claim template (one device per pod;
-#     correct for kernel benches).
+#     correct for kernel benches). `swordfish-bench-*` profiles use gpu.size=l
+#     (one GPU); `swordfish-fsdp-*` profiles use gpu.size=xl (one 8-GPU node).
 #   * resources.persistence mounts the training-nfs PVC at /data.
 #
-# A100 + Nsight Compute caveat: rune profiles cannot currently expose container
-# SYS_ADMIN, which Nsight Compute requires on A100 to read GPU performance
-# counters. A100 NCU is a known limitation tracked in docs/airun/a100-ncu-blocker.md;
-# H100 NVL and H200 NCU work with no extra privileges and run fine through rune.
+# A100 + Nsight Compute caveat: A100 NCU requires container SYS_ADMIN to read
+# GPU performance counters. The normal profiles do not request elevated
+# capability; the dedicated `*-a100-ncu` profiles add it only for profiler runs.
 
 ---
 apiVersion: airun.aks.io/v1alpha1
@@ -43,6 +43,7 @@ metadata:
     airun.aks.io/pack: swordfish
     airun.aks.io/lane: training
     swordfish.dev/arch: a100
+    swordfish.dev/workload: bench
 spec:
   lane: training
   queue:
@@ -93,6 +94,7 @@ metadata:
     airun.aks.io/pack: swordfish
     airun.aks.io/lane: training
     swordfish.dev/arch: h100
+    swordfish.dev/workload: bench
 spec:
   lane: training
   queue:
@@ -143,6 +145,7 @@ metadata:
     airun.aks.io/pack: swordfish
     airun.aks.io/lane: large-memory
     swordfish.dev/arch: h200
+    swordfish.dev/workload: bench
 spec:
   lane: large-memory
   queue:
@@ -178,6 +181,269 @@ spec:
     image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
     imagePullPolicy: IfNotPresent
     imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-fsdp-a100
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: training
+    swordfish.dev/arch: a100
+    swordfish.dev/workload: fsdp
+spec:
+  lane: training
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
+  resources:
+    gpu:
+      size: xl
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: ds-8gpus
+    requests:
+      cpu: "64"
+      memory: 512Gi
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data
+  cost:
+    gpuType: a100
+    gpusPerNode: 8
+  runtime:
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-fsdp-h100
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: training
+    swordfish.dev/arch: h100
+    swordfish.dev/workload: fsdp
+spec:
+  lane: training
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-H100-NVL
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
+  resources:
+    gpu:
+      size: xl
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: ds-8gpus
+    requests:
+      cpu: "64"
+      memory: 512Gi
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data
+  cost:
+    gpuType: h100
+    gpusPerNode: 8
+  runtime:
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-fsdp-h200
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: large-memory
+    swordfish.dev/arch: h200
+    swordfish.dev/workload: fsdp
+spec:
+  lane: large-memory
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-large-memory
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-H200
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
+  resources:
+    gpu:
+      size: xl
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: ds-8gpus
+    requests:
+      cpu: "64"
+      memory: 512Gi
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data
+  cost:
+    gpuType: h200
+    gpusPerNode: 8
+  runtime:
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-bench-a100-ncu
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: training
+    swordfish.dev/arch: a100
+    swordfish.dev/workload: bench
+spec:
+  lane: training
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
+  resources:
+    gpu:
+      size: l
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: full-gpu
+    requests:
+      cpu: "16"
+      memory: 64Gi
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data
+  cost:
+    gpuType: a100
+    gpusPerNode: 1
+  runtime:
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+    securityContext:
+      capabilities:
+        add:
+          - SYS_ADMIN
+  policy:
+    preemptable: true
+    maxQueueWaitSeconds: 3600
+    checkpointOnPreempt: true
+
+---
+apiVersion: airun.aks.io/v1alpha1
+kind: Profile
+metadata:
+  name: swordfish-fsdp-a100-ncu
+  labels:
+    airun.aks.io/catalog: pack
+    airun.aks.io/pack: swordfish
+    airun.aks.io/lane: training
+    swordfish.dev/arch: a100
+    swordfish.dev/workload: fsdp
+spec:
+  lane: training
+  queue:
+    clusterQueue: team-kernel-mode-reserved-cq
+    localQueue: kernel-mode-training
+  scheduling:
+    nodeSelector:
+      airun.aks.io/lane: train
+      nvidia.com/gpu.product: NVIDIA-A100-SXM4-80GB
+    tolerations:
+      - key: airun.aks.io/lane
+        operator: Equal
+        value: train
+        effect: NoSchedule
+    priorityClassName: airun-train-default
+  resources:
+    gpu:
+      size: xl
+      memoryGiBMin: 60
+    dra:
+      deviceClass: gpu.nvidia.com
+      claimTemplate: ds-8gpus
+    requests:
+      cpu: "64"
+      memory: 512Gi
+    persistence:
+      - pvcName: training-nfs
+        mountPath: /data
+  cost:
+    gpuType: a100
+    gpusPerNode: 8
+  runtime:
+    image: voiceagentcr.azurecr.io/airun/swordfish-bench:dev
+    imagePullPolicy: IfNotPresent
+    imageFamily: swordfish-bench
+    securityContext:
+      capabilities:
+        add:
+          - SYS_ADMIN
   policy:
     preemptable: true
     maxQueueWaitSeconds: 3600

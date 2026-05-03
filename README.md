@@ -20,6 +20,12 @@ PyTorch/Inductor, CUTLASS/CuTe, JAX/Pallas, TileLang, and pyptx.
 - **Monday baseline.** `torch.mm`, M=N=K=4096, fp16, 10 warmup + 50 timed iterations × 5 repeats. One full A100, one full H100 NVL, one full H200 once H200 capacity/preflight is healthy. Non-goals: no custom kernel, no tuning, no SOTA claims.
 - **Tuesday handoff.** Detailed in [`docs/notes/week1-tuesday-handoff.md`](docs/notes/week1-tuesday-handoff.md). The chosen first upstream touchpoint is Liger Kernel cross-fleet training profile (LinkedIn / Microsoft); rationale and contribution shape in [`docs/notes/liger-first-touch.md`](docs/notes/liger-first-touch.md).
 - **Wednesday measurement.** bf16 to match Liger defaults; baseline is the unmodified Hugging Face reference; rows land under `runs/rune/week1/liger-perkernel/`.
+- **Thursday catch-up.** End-to-end Liger FSDP rows are now dispatchable via
+  `submit-bench --workload liger-fsdp`. The A100 parity pair is two jobs:
+  `--liger-mode baseline` and `--liger-mode liger`; each uses the generated
+  8-GPU `swordfish-fsdp-a100` profile, launches `torchrun
+  --nproc-per-node 8`, and writes `swordfish.training.v1` JSON under
+  `/data/swordfish/week1/liger-fsdp/`.
 - **Friday artifact.** Writeup at `docs/profiling/liger-fleet-2026-w1.md`; maintainer packet via `swordfish.runner render-upstream-packet --target liger`; public artifact is a Discussion (not Issue, not PR) sharing reproducible JSON.
 
 ### Week 1 preconditions tracked separately
@@ -85,29 +91,69 @@ uv run python -m swordfish.runner run-gemm \
   --out runs/week1/torch-gemm-a100.json
 ```
 
+### Rune setup
+
+Local CPU development only needs the base `uv sync`. Rune dispatch is opt-in:
+`make rune-bootstrap` installs `rune-py` from the private `aks-ai-runtime`
+release tag into this repo's uv environment and then runs `rune-py bootstrap`
+to install the matching `rune` CLI into `.venv/bin`. Override
+`RUNE_RELEASE_TAG`, `RUNE_REPO`, or `GITHUB_HOST` only when testing a different
+private release.
+
 To dispatch a Kueue Job through `rune` (the day-to-day path), use the
-swordfish runner CLI — it builds the right `rune submit` argv from typed
-dataclasses, so callers don't have to remember the
-`--profile`/`--script`/`--output`/`--volume` shape:
+experiment-grounded runner CLI. Researchers pick an experiment and an arch; the
+repo resolves the generated Rune profile so jobs stay in the kernel-team queues
+without requiring callers to remember `--profile` names.
 
 ```bash
+make rune-bootstrap                                     # one-time SDK + CLI setup
 make rune-install-profiles                              # one-time symlink
 
+uv run python -m swordfish.runner list-experiments
+uv run python -m swordfish.runner explain-experiment liger-fsdp --arch a100
+
 # preview the rendered Job manifest (no cluster contact)
-uv run python -m swordfish.runner submit-bench \
-  --workload gemm --arch h100 --m 4096 --n 4096 --k 4096 --dtype fp16 \
+uv run python -m swordfish.runner submit-experiment gemm --arch h100 \
   --dry-run client --print-yaml
 
 # real submission
-uv run python -m swordfish.runner submit-bench --workload gemm --arch h100
+uv run python -m swordfish.runner submit-experiment gemm --arch h100
 ```
 
 The same flow from a Python script:
 
 ```python
-from swordfish.dispatch import TorchGemmRun
-result = TorchGemmRun(arch="h100").submit()
+from swordfish.dispatch import build_run_for_experiment
+
+result = build_run_for_experiment("gemm", "h100").submit()
 print(result.name)
+```
+
+For the Thursday Liger FSDP catch-up row, dispatch the baseline and Liger-patched
+8xA100 jobs separately so the result JSONs can be compared side-by-side:
+
+```bash
+uv run python -m swordfish.runner submit-experiment \
+  liger-fsdp --arch a100 --liger-mode baseline
+
+uv run python -m swordfish.runner submit-experiment \
+  liger-fsdp --arch a100 --liger-mode liger
+```
+
+`submit-bench` remains available as the lower-level workload interface for
+advanced one-offs. Programmatic raw `preset=...` use is guarded behind
+`allow_raw_preset=True` because raw presets bypass the repo-approved profile
+set.
+
+The same runner has a CPU smoke path for local development:
+
+```bash
+uv run python -m swordfish.runner liger-fsdp-step \
+  --model-source reference --model-preset tiny --liger-mode baseline \
+  --micro-batch-size 1 --seq-len 3 --dtype fp32 \
+  --repeats 1 --warmup 0 --iters 1 \
+  --device cpu --allow-cpu \
+  --out /tmp/swordfish-liger-fsdp-smoke.json
 ```
 
 Or the equivalent low-level `rune submit` invocation if you need a one-off
@@ -128,10 +174,12 @@ After a real submit, fetch the JSON back with
 (`swordfish.dispatch.TorchGemmRun`, `LigerPerkernelRun`) wraps the same flow
 as typed dataclasses with `.submit()` and `.fetch_result()` methods.
 
-A100 + Nsight Compute is a known limitation: rune profiles can't currently
-expose container `SYS_ADMIN`, which NCU needs to read A100 perf counters. The
-fix lives in rune (let profiles request `securityContext.capabilities.add:
-SYS_ADMIN` under a kueue-gated allowlist). H100 NVL and H200 NCU run cleanly.
+A100 + Nsight Compute uses dedicated `*-a100-ncu` profiles because A100 NCU
+needs container `SYS_ADMIN` to read perf counters. The dispatch SDK selects
+those profiles automatically for `--profile-mode ncu --arch a100`; the cluster
+still requires the short DCGM exporter pause documented in
+`docs/airun/a100-ncu-blocker.md`. H100 NVL and H200 NCU run without extra
+capabilities.
 
 After all three jobs have produced final JSON files, use the strict completion
 gate:

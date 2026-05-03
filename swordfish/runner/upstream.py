@@ -6,7 +6,11 @@ import json
 from pathlib import Path
 from typing import Any, Literal
 
-from swordfish.runner.schema import validate_result_protocol
+from swordfish.runner.schema import (
+    TRAINING_SCHEMA_VERSION,
+    validate_result_protocol,
+    validate_training_result_protocol,
+)
 
 UpstreamTarget = Literal[
     "triton",
@@ -17,6 +21,7 @@ UpstreamTarget = Literal[
     "vllm",
     "ort",
     "pyptx",
+    "liger",
 ]
 
 TARGET_LABELS: dict[str, str] = {
@@ -28,6 +33,7 @@ TARGET_LABELS: dict[str, str] = {
     "vllm": "vLLM",
     "ort": "ONNX Runtime / ORT GenAI",
     "pyptx": "pyptx",
+    "liger": "Liger Kernel",
 }
 
 
@@ -57,6 +63,12 @@ def _latency_summary(result: dict[str, Any]) -> str:
         f"p95={_format_value(latency.get('p95_ms'))} ms, "
         f"min={_format_value(latency.get('min_ms'))} ms"
     )
+
+
+def _validation_errors(result: dict[str, Any]) -> list[str]:
+    if result.get("schema_version") == TRAINING_SCHEMA_VERSION:
+        return validate_training_result_protocol(result)
+    return validate_result_protocol(result)
 
 
 def _correctness_summary(result: dict[str, Any]) -> str:
@@ -102,7 +114,7 @@ def render_upstream_packet(
 
     config = result.get("config") if isinstance(result.get("config"), dict) else {}
     env = result.get("env") if isinstance(result.get("env"), dict) else {}
-    validation_errors = validate_result_protocol(result)
+    validation_errors = _validation_errors(result)
     target_label = TARGET_LABELS[target]
     packet_title = title or (
         f"{target_label} repro: {result.get('benchmark', 'benchmark')} "

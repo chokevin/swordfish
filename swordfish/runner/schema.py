@@ -106,7 +106,7 @@ def validate_result_protocol(result: dict[str, Any]) -> list[str]:
 # Training-side schema. Each per-kernel result captures the matched baseline +
 # Liger pair on identical input, so the metrics block carries both modes plus
 # explicit deltas. End-to-end FSDP step results reuse the same wrapper but with
-# config.scope == "train_step" and metrics.modes == {"baseline": ...} only.
+# config.scope == "fsdp_train_step" and metrics.modes == {"baseline": ...} only.
 TRAINING_CONFIG_FIELDS = ("scope", "kernel", "dtype", "shape")
 TRAINING_LIGER_FIELDS = ("applied", "version", "kernel_module")
 

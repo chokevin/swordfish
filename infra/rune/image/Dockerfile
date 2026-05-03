@@ -27,7 +27,7 @@
 #   triton        3.3.0
 #   ncu           2025.1.0.0    (for --profile-mode ncu)
 #   ray           2.40.0
-#   transformers  5.5.4         (liger 0.5.10 import verified compatible)
+#   transformers  base-provided (overridden below for Liger Llama patch compatibility)
 #   bitsandbytes, peft, trl, accelerate, datasets, evaluate, hf_transfer
 #
 # What we add via apt on top:
@@ -74,18 +74,22 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/* \
  && nsys --version
 
-# liger-kernel: pinned via build arg so reproducible. Default tracks the
-# stable PyPI release. Bump LIGER_VERSION (or override LIGER_REF to a git ref)
-# to refresh.
+# Liger's Llama monkey patch imports cache helpers that are not present in older
+# transformers builds from the base image, so pin both sides and verify the
+# exact patch entrypoint used by the FSDP reproduction.
+ARG TRANSFORMERS_VERSION=4.56.2
 ARG LIGER_VERSION=0.5.10
 ARG LIGER_REF=
-RUN if [ -n "${LIGER_REF}" ]; then \
+RUN pip install --no-cache-dir "transformers==${TRANSFORMERS_VERSION}" \
+ && if [ -n "${LIGER_REF}" ]; then \
         pip install --no-cache-dir "git+https://github.com/linkedin/Liger-Kernel.git@${LIGER_REF}" --no-deps \
             && pip install --no-cache-dir "liger-kernel==${LIGER_VERSION}" --no-deps; \
     else \
         pip install --no-cache-dir "liger-kernel==${LIGER_VERSION}"; \
     fi \
  && python -c "import liger_kernel; print('liger_kernel OK', liger_kernel.__version__ if hasattr(liger_kernel, '__version__') else 'no __version__ attr')" \
+ && python -c "from transformers.cache_utils import HybridCache; print('Transformers HybridCache OK', HybridCache.__name__)" \
+ && python -c "from liger_kernel.transformers import apply_liger_kernel_to_llama; print('Liger Llama patch OK', apply_liger_kernel_to_llama.__name__)" \
  && python -c "from liger_kernel.transformers.rms_norm import LigerRMSNorm; print('LigerRMSNorm OK')" \
  && python -c "from liger_kernel.transformers.swiglu import LigerSwiGLUMLP; print('LigerSwiGLUMLP OK')"
 

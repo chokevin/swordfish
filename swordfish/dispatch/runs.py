@@ -32,16 +32,55 @@ DEFAULT_RESULT_ROOT = "/data/swordfish/week1"
 # profiles.py, regenerate, and `make rune-submit-*` automatically picks up the
 # new image / queue / persistence shape.
 SWORDFISH_PROFILE_PREFIX = "swordfish-bench-"
+SWORDFISH_FSDP_PROFILE_PREFIX = "swordfish-fsdp-"
 
 
 def default_profile_for(arch: str) -> str:
     return f"{SWORDFISH_PROFILE_PREFIX}{arch}"
 
 
+def default_fsdp_profile_for(arch: str) -> str:
+    return f"{SWORDFISH_FSDP_PROFILE_PREFIX}{arch}"
+
+
+def default_ncu_profile_for(arch: str) -> str:
+    if arch == "a100":
+        return f"{default_profile_for(arch)}-ncu"
+    return default_profile_for(arch)
+
+
+def default_fsdp_ncu_profile_for(arch: str) -> str:
+    if arch == "a100":
+        return f"{default_fsdp_profile_for(arch)}-ncu"
+    return default_fsdp_profile_for(arch)
+
+
+def default_profile_for_mode(arch: str, profile_mode: str | None) -> str:
+    if profile_mode == "ncu":
+        return default_ncu_profile_for(arch)
+    return default_profile_for(arch)
+
+
+def default_fsdp_profile_for_mode(arch: str, profile_mode: str | None) -> str:
+    if profile_mode == "ncu":
+        return default_fsdp_ncu_profile_for(arch)
+    return default_fsdp_profile_for(arch)
+
+
 ARCH_TO_PRESET = {
     "a100": "azure.kernel-mode.training.l",
     "h100": "azure.kernel-mode.training.l",  # same lane today; H100 in kernel-mode pending
     "h200": "azure.kernel-mode.large-memory.xl",
+}
+
+# Fallback raw presets for callers that explicitly opt out of the generated FSDP
+# profiles. Normal FSDP submits use `swordfish-fsdp-<arch>` profiles because the
+# current rune binary renders profile submits reliably and the profiles encode
+# the 8-GPU xl shape.
+ARCH_TO_FSDP_PRESET = {
+    "a100": "azure.research.training.xl",
+    "h100": "azure.research.training.xl",
+    "h200": "azure.research.large-memory.xl",
 }
 
 # Per-arch rune `--gpu-class` injected into every submit. Without this, rune's
@@ -63,6 +102,14 @@ def _inject_gpu_class(arch: str, extra_args: Iterable[str]) -> list[str]:
     if "--gpu-class" in out:
         return out
     return ["--gpu-class", ARCH_TO_GPU_CLASS[arch], *out]
+
+
+def _check_raw_preset_guard(*, preset: str | None, allow_raw_preset: bool) -> None:
+    if preset and not allow_raw_preset:
+        raise ValueError(
+            "raw preset bypasses the Swordfish profile pack and kernel-team queue contract; "
+            "pass allow_raw_preset=True only for an intentional escape hatch"
+        )
 
 
 LIGER_KERNELS = ("rmsnorm", "swiglu", "rope", "fused_linear_ce")
@@ -148,7 +195,8 @@ class LigerPerkernelRun:
     script: str | Path = DEFAULT_BENCH_SCRIPT
     pvc: str = DEFAULT_PVC
     result_root: str = DEFAULT_RESULT_ROOT
-    preset: str | None = None  # falls back to ARCH_TO_PRESET[arch]
+    preset: str | None = None
+    allow_raw_preset: bool = False
     profile: str | None = None
     extra_args: list[str] = field(default_factory=list)
     container_env: dict[str, str] = field(default_factory=dict)
@@ -167,6 +215,7 @@ class LigerPerkernelRun:
             )
         if self.preset and self.profile:
             raise ValueError("preset and profile are mutually exclusive")
+        _check_raw_preset_guard(preset=self.preset, allow_raw_preset=self.allow_raw_preset)
         if self.profile_mode and self.profile_mode not in PROFILE_MODES:
             raise ValueError(f"profile_mode {self.profile_mode!r} not in {PROFILE_MODES}")
 
@@ -188,13 +237,14 @@ class LigerPerkernelRun:
         committed `infra/rune/profiles/swordfish-pack.yaml` (regenerated from
         `swordfish.dispatch.profiles`) is what actually drives image, queue,
         and persistence on every submit. Callers can opt back to the raw
-        preset shortcut by setting `preset=...` explicitly.
+        preset shortcut by setting `preset=...` and `allow_raw_preset=True`
+        explicitly.
         """
         if self.profile:
             return self.profile
         if self.preset:
             return None
-        return default_profile_for(self.arch)
+        return default_profile_for_mode(self.arch, self.profile_mode)
 
     @property
     def out_path(self) -> str:
@@ -451,6 +501,7 @@ class TorchGemmRun:
     pvc: str = DEFAULT_PVC
     result_root: str = DEFAULT_RESULT_ROOT
     preset: str | None = None
+    allow_raw_preset: bool = False
     profile: str | None = None
     extra_args: list[str] = field(default_factory=list)
     container_env: dict[str, str] = field(default_factory=dict)
@@ -464,6 +515,7 @@ class TorchGemmRun:
             )
         if self.preset and self.profile:
             raise ValueError("preset and profile are mutually exclusive")
+        _check_raw_preset_guard(preset=self.preset, allow_raw_preset=self.allow_raw_preset)
         if self.profile_mode and self.profile_mode not in PROFILE_MODES:
             raise ValueError(f"profile_mode {self.profile_mode!r} not in {PROFILE_MODES}")
 
@@ -483,7 +535,7 @@ class TorchGemmRun:
             return self.profile
         if self.preset:
             return None
-        return default_profile_for(self.arch)
+        return default_profile_for_mode(self.arch, self.profile_mode)
 
     @property
     def out_path(self) -> str:
@@ -516,6 +568,167 @@ class TorchGemmRun:
             "--out",
             self.out_path,
         ]
+
+    def to_rune_submit(self) -> RuneSubmit:
+        rune_native_mode, container_env = _resolve_torch_profile(
+            self.profile_mode, self.resolved_name, self.container_env
+        )
+        kwargs: dict = dict(
+            name=self.resolved_name,
+            image=self.image,
+            script=self.script,
+            namespace=self.namespace,
+            context=self.context,
+            volumes=[f"data=pvc:{self.pvc}"],
+            extra_args=_inject_gpu_class(self.arch, self.extra_args),
+            forwarded_args=self.forwarded_args,
+            container_env=container_env,
+            rune_bin=self.rune_bin,
+            profile_mode=rune_native_mode,
+            output=self.out_path,
+        )
+        resolved_profile = self.resolved_profile
+        if resolved_profile:
+            kwargs["profile"] = resolved_profile
+        else:
+            kwargs["preset"] = self.resolved_preset
+        return RuneSubmit(**kwargs)
+
+    def to_command(self, *, dry_run: str | None = None) -> str:
+        return self.to_rune_submit().to_command(dry_run=dry_run)
+
+    def submit(self, *, dry_run: str | None = None, check: bool = True) -> RuneSubmitResult:
+        return self.to_rune_submit().submit(dry_run=dry_run, check=check)
+
+
+@dataclass
+class LigerFsdpRun:
+    """One end-to-end Llama train-step row for the Liger FSDP reproduction."""
+
+    arch: str = "a100"
+    mode: str = "baseline"
+    model_source: str = "transformers"
+    model_preset: str = "llama3-8b"
+    micro_batch_size: int = 1
+    seq_len: int = 2048
+    dtype: str = "bf16"
+    repeats: int = 3
+    warmup: int = 1
+    iters: int = 5
+    nproc_per_node: int = 8
+    gradient_checkpointing: bool = True
+    name: str | None = None
+    namespace: str = DEFAULT_NAMESPACE
+    context: str | None = None
+    image: str = DEFAULT_IMAGE
+    script: str | Path = DEFAULT_BENCH_SCRIPT
+    pvc: str = DEFAULT_PVC
+    result_root: str = DEFAULT_RESULT_ROOT
+    preset: str | None = None
+    allow_raw_preset: bool = False
+    profile: str | None = None
+    extra_args: list[str] = field(default_factory=list)
+    container_env: dict[str, str] = field(default_factory=dict)
+    rune_bin: str = "rune"
+    profile_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.arch not in ARCH_TO_FSDP_PRESET:
+            raise ValueError(
+                f"unknown arch {self.arch!r}; expected one of {sorted(ARCH_TO_FSDP_PRESET)}"
+            )
+        if self.mode not in {"baseline", "liger"}:
+            raise ValueError("mode must be 'baseline' or 'liger'")
+        if self.model_source not in {"reference", "transformers"}:
+            raise ValueError("model_source must be 'reference' or 'transformers'")
+        if self.model_preset not in {"tiny", "llama3-8b"}:
+            raise ValueError("model_preset must be 'tiny' or 'llama3-8b'")
+        if self.preset and self.profile:
+            raise ValueError("preset and profile are mutually exclusive")
+        _check_raw_preset_guard(preset=self.preset, allow_raw_preset=self.allow_raw_preset)
+        if self.profile_mode and self.profile_mode not in PROFILE_MODES:
+            raise ValueError(f"profile_mode {self.profile_mode!r} not in {PROFILE_MODES}")
+        if self.nproc_per_node <= 0:
+            raise ValueError("nproc_per_node must be positive")
+
+    @property
+    def resolved_name(self) -> str:
+        return _normalize_name(
+            self.name or f"sf-liger-fsdp-{self.model_preset}-{self.mode}-{self.arch}"
+        )
+
+    @property
+    def resolved_preset(self) -> str:
+        if self.profile:
+            return ""
+        return self.preset or ARCH_TO_FSDP_PRESET[self.arch]
+
+    @property
+    def resolved_profile(self) -> str | None:
+        if self.profile:
+            return self.profile
+        if self.preset:
+            return None
+        return default_fsdp_profile_for_mode(self.arch, self.profile_mode)
+
+    @property
+    def out_path(self) -> str:
+        return f"{self.result_root}/liger-fsdp/{self.model_preset}-{self.mode}-{self.arch}.json"
+
+    @property
+    def profile_out_dir(self) -> str | None:
+        if not self.profile_mode:
+            return None
+        return f"/data/{self.resolved_name}/profile"
+
+    @property
+    def profile_out_path(self) -> str | None:
+        if not self.profile_mode:
+            return None
+        ext = PROFILE_EXTENSIONS[self.profile_mode]
+        return f"{self.profile_out_dir}/profile.{ext}"
+
+    @property
+    def profile_out_artifact(self) -> str | None:
+        if not self.profile_mode:
+            return None
+        ext = PROFILE_EXTENSIONS[self.profile_mode]
+        return f"profile.{ext}"
+
+    @property
+    def forwarded_args(self) -> list[str]:
+        args = [
+            "liger-fsdp-step",
+            "--liger-mode",
+            self.mode,
+            "--model-source",
+            self.model_source,
+            "--model-preset",
+            self.model_preset,
+            "--micro-batch-size",
+            str(self.micro_batch_size),
+            "--seq-len",
+            str(self.seq_len),
+            "--dtype",
+            self.dtype,
+            "--repeats",
+            str(self.repeats),
+            "--warmup",
+            str(self.warmup),
+            "--iters",
+            str(self.iters),
+            "--nproc-per-node",
+            str(self.nproc_per_node),
+            "--device",
+            "auto",
+            "--arch-label",
+            self.arch,
+            "--out",
+            self.out_path,
+        ]
+        if not self.gradient_checkpointing:
+            args.append("--no-gradient-checkpointing")
+        return args
 
     def to_rune_submit(self) -> RuneSubmit:
         rune_native_mode, container_env = _resolve_torch_profile(

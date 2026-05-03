@@ -22,23 +22,34 @@ The shape is:
 | --- | --- |
 | `infra/rune/image/Dockerfile` + `build-acr.sh` | **Working.** Builds on `voiceagentcr.azurecr.io/airun/autoresearch-pytorch-ray:dev` (in-region ACR, prewarmed on every GPU node). Bakes liger-kernel + swordfish source. Canonical build path is `az acr build` (publishes to `voiceagentcr.azurecr.io/airun/swordfish-bench`). The legacy `build.sh` (podman → ghcr.io) still works for local iteration. |
 | `infra/rune/scripts/swordfish-bench.sh` | **Working.** In-pod entrypoint, on-the-fly liger install self-heal. |
-| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Three profiles, queue=`team-kernel-mode-reserved-cq`, image=`voiceagentcr.azurecr.io/airun/swordfish-bench:dev`, PVC `training-nfs` mounted at `/data` (rune storage contract). Self-contained spec (no `extends:` — embedded core profiles were removed in `airun-zero`). Generated from `swordfish/dispatch/profiles.py` — edit the Python, then `make rune-profiles`. A sync test in `tests/test_dispatch.py` enforces the invariant. |
+| `infra/rune/profiles/swordfish-pack.yaml` | **Working.** Eight profiles: three normal one-GPU `swordfish-bench-*` profiles, three normal 8-GPU `swordfish-fsdp-*` profiles, plus A100-only `*-a100-ncu` variants that add `SYS_ADMIN` for Nsight Compute. Queue=`team-kernel-mode-reserved-cq`, image=`voiceagentcr.azurecr.io/airun/swordfish-bench:dev`, PVC `training-nfs` mounted at `/data` (rune storage contract). Self-contained spec (no `extends:` — embedded core profiles were removed in `airun-zero`). Generated from `swordfish/dispatch/profiles.py` — edit the Python, then `make rune-profiles`. A sync test in `tests/test_dispatch.py` enforces the invariant. |
 | `make rune-install-profiles` | **Working.** Verifies the YAML is in sync with the Python source, then symlinks the pack into `~/.config/rune/profiles/`. The core parents are embedded in the rune binary; no extra symlink needed. |
-| Makefile targets `rune-submit-*` | **Working.** Each target shells out to `python -m swordfish.runner submit-bench --workload {gemm,liger-rmsnorm,liger-swiglu} --arch {a100,h100,h200}`; the dispatch SDK builds and invokes the right `rune submit` argv. Each sets `--output` so `rune submit get` can fetch results. |
-| `rune submit --dry-run=client` GPU + DRA + PVC | **Working** — DRA `full-gpu` claim renders, container `requests`/`claims` renders, queue label correct, PVC mounted at `/data` with hot `/mnt` scratch added by rune. |
-| `rune submit --profile-mode ncu` | **Working** — output lands at `/data/<job-name>/profile/profile.ncu-rep`; image must have `ncu` on PATH (the swordfish-bench image does — Nsight Compute 2025.1.0.0 from the autoresearch-pytorch-ray base). |
+| Makefile targets `rune-submit-*` | **Working.** Targets shell out to `python -m swordfish.runner submit-bench` for the GEMM matrix, A100 Liger per-kernel rows, and the A100 FSDP baseline/Liger catch-up pair; the dispatch SDK builds and invokes the right `rune submit` argv. Each sets `--output` so `rune submit get` can fetch results. |
+| `rune submit --dry-run=client` GPU + DRA + PVC | **Working** — one-GPU profiles render DRA `full-gpu`; FSDP profiles render `ds-8gpus`; container `requests`/`claims` render, queue label correct, PVC mounted at `/data` with hot `/mnt` scratch added by rune. |
+| `rune submit --profile-mode ncu` | **Working** — output lands at `/data/<job-name>/profile/profile.ncu-rep`; image must have `ncu` on PATH (the swordfish-bench image does — Nsight Compute 2025.1.0.0 from the autoresearch-pytorch-ray base). A100 submits use `swordfish-bench-a100-ncu` / `swordfish-fsdp-a100-ncu` so Rune renders `securityContext.capabilities.add: [SYS_ADMIN]`; A100 still needs the temporary DCGM exporter pause below. |
 | `rune submit --profile-mode nsys` | **Working** — output lands at `/data/<job-name>/profile/profile.nsys-rep`; image must have `nsys` on PATH (the swordfish-bench image installs Nsight Systems 2024.6.2 via `cuda-nsight-systems-12-8` apt package). |
 | `--profile-mode torch` (swordfish-side, in-process) | **Working** — output is a Chrome trace JSON at `/data/<job-name>/profile/profile.json` (open in [Perfetto](https://ui.perfetto.dev/) or chrome://tracing). Bypasses rune's external-wrapper path: the dispatch SDK injects `SWORDFISH_PROFILE=torch` + `SWORDFISH_PROFILE_OUT=...` env vars and `swordfish.runner.profile_torch.torch_profiler_context` wraps the bench main in `torch.profiler`. No SYS_ADMIN needed (unlike NCU on A100), and works on any image that has `torch` (i.e. all of them) — useful when nsys/ncu image dependencies or cluster mirrors are broken. |
 | `rune submit --output /data/...` + `rune submit get NAME` | **Working** — annotations recorded; `rune submit get NAME --output raw` cats the file via a one-shot helper Pod. Use `--artifact NAME` for items inside a directory output. |
+| `submit-bench --workload liger-fsdp` | **Dry-runable / dispatchable.** Uses generated 8-GPU `swordfish-fsdp-*` profiles, injects `--gpu-class`, and the bench script launches `torchrun --standalone --nproc-per-node 8` before running `liger-fsdp-step`. |
 
-## A100 + Nsight Compute caveat
+## A100 + Nsight Compute procedure
 
-Rune profiles cannot currently expose container `SYS_ADMIN` through the Profile
-spec, which Nsight Compute requires on A100 to read GPU performance counters.
-A100 NCU is a **known limitation** tracked in
-[`docs/airun/a100-ncu-blocker.md`](../../docs/airun/a100-ncu-blocker.md); the fix
-lives in rune (let profiles request `securityContext.capabilities.add: SYS_ADMIN`
-under a kueue-gated allowlist), not swordfish.
+A100 NCU requires both container `SYS_ADMIN` and exclusive ownership of the
+driver profiling resource. Rune now renders `spec.runtime.securityContext` from
+profiles, and Swordfish's A100 NCU profiles request:
+
+```yaml
+runtime:
+  securityContext:
+    capabilities:
+      add:
+        - SYS_ADMIN
+```
+
+Before running A100 NCU, temporarily patch `nvidia-dcgm-exporter` so it does not
+schedule on `gpu=a100` nodes, run the short profiling job, then restore the
+DaemonSet immediately. The full operational checklist and evidence live in
+[`docs/airun/a100-ncu-blocker.md`](../../docs/airun/a100-ncu-blocker.md).
 
 H100 NVL and H200 NCU work with no extra privileges and run fine through `rune`.
 
@@ -98,23 +109,27 @@ uses; pass `CONTAINER_CMD=docker` if you prefer.
 
 ## Profiles
 
-`infra/rune/profiles/swordfish-pack.yaml` defines three profiles, all of
-which extend the embedded core profile `ai-train-gpu-l`. The pack is
+`infra/rune/profiles/swordfish-pack.yaml` defines one-GPU benchmark profiles,
+8-GPU FSDP profiles, and A100-only NCU variants. The pack is
 **generated from `swordfish/dispatch/profiles.py`** — edit the Python
 constants and run `make rune-profiles` to regenerate; CI fails the build
 if the two drift via `tests/test_dispatch.py::test_swordfish_pack_yaml_in_sync_with_python_source`.
 
 | Profile | Arch (intended) | Queue | Notes |
 | --- | --- | --- | --- |
-| `swordfish-bench-a100` | A100 SXM4-80GB | `kernel-mode-training` | NCU on A100 needs SYS_ADMIN — currently a known rune limitation, see caveat above |
-| `swordfish-bench-h100` | H100 NVL | `kernel-mode-training` | NCU works without extra caps |
-| `swordfish-bench-h200` | H200 | `kernel-mode-training` | NCU works without extra caps |
+| `swordfish-bench-a100` | A100 SXM4-80GB | `kernel-mode-training` | One-GPU microbenchmark profile for normal runs |
+| `swordfish-bench-a100-ncu` | A100 SXM4-80GB | `kernel-mode-training` | One-GPU NCU profile; adds `SYS_ADMIN` and still requires the short DCGM pause |
+| `swordfish-bench-h100` | H100 NVL | `kernel-mode-training` | One-GPU microbenchmark profile. NCU works without extra caps |
+| `swordfish-bench-h200` | H200 | `kernel-mode-large-memory` | One-GPU microbenchmark profile. NCU works without extra caps |
+| `swordfish-fsdp-a100` | 8x A100 SXM4-80GB | `kernel-mode-training` | Thursday Liger FSDP parity profile; gpu.size=xl, claimTemplate=ds-8gpus |
+| `swordfish-fsdp-a100-ncu` | 8x A100 SXM4-80GB | `kernel-mode-training` | A100 FSDP NCU variant; adds `SYS_ADMIN` and uses claimTemplate=ds-8gpus |
+| `swordfish-fsdp-h100` | 8x H100 NVL | `kernel-mode-training` | Capacity-permitting extension profile; gpu.size=xl, claimTemplate=ds-8gpus |
+| `swordfish-fsdp-h200` | 8x H200 | `kernel-mode-large-memory` | Capacity-permitting extension profile; gpu.size=xl, claimTemplate=ds-8gpus |
 
-Today the three profiles are functionally identical at the rune resolver
-level — Kueue routes to whichever ResourceFlavor in
-`team-kernel-mode-reserved-cq` has capacity. Per-arch routing via
-`spec.resources.dra.claimTemplate` is the next iteration once arch-specific
-flavors land; until then, treat the arch suffix as a label hint.
+All profiles pin `nvidia.com/gpu.product` so A100/H100/H200 runs cannot land on
+the wrong node class. The FSDP profiles differ from the one-GPU profiles by
+requesting gpu.size=xl, the `ds-8gpus` DRA claim template, and higher
+CPU/memory, which maps to a full 8-GPU node.
 
 ## Installing the profiles into rune's search path
 
@@ -130,12 +145,18 @@ Rune searches for profiles in (in order):
 To make the swordfish pack discoverable on a workstation:
 
 ```bash
+make rune-bootstrap           # installs rune-py + matching rune CLI
 make rune-install-profiles      # symlinks infra/rune/profiles -> ~/.config/rune/profiles/
 ```
 
-After install, `rune profile list` should show the three swordfish-bench
-profiles plus the embedded core profiles they inherit from. To validate a
-profile against the cluster:
+`make rune-bootstrap` uses the private `aks-ai-runtime` `rune-cli-v0.2.0`
+release by default. It configures `gh` git auth, installs `rune-py` into this
+repo's uv environment, downloads the matching CLI with `rune-py bootstrap`, and
+runs `rune-py doctor`.
+
+After profile install, `rune profile list` should show the four swordfish-bench
+profiles and the four swordfish-fsdp profiles. To validate a profile against
+the cluster:
 
 ```bash
 rune profile doctor swordfish-bench-a100 --context voice-agent-flex-admin -n ray
@@ -143,22 +164,33 @@ rune profile doctor swordfish-bench-a100 --context voice-agent-flex-admin -n ray
 
 ## Day-to-day flows
 
-The day-to-day entrypoint is the Python dispatch SDK; it builds the right
-`rune submit` argv from typed dataclasses so callers don't have to remember
-the `--profile`/`--script`/`--output`/`--volume` shape.
+The day-to-day entrypoint is the experiment-grounded Python dispatch shim. It
+builds the right `rune submit` argv from repo-registered experiment intent, so
+callers choose an experiment and an arch instead of remembering
+`--profile`/`--script`/`--output`/`--volume` details.
 
 ```bash
-# preferred: dispatch via the swordfish runner CLI (python wraps rune)
-uv run python -m swordfish.runner submit-bench \
-  --workload gemm --arch h100 --m 4096 --n 4096 --k 4096 --dtype fp16
+# discover and explain repo-approved experiment intents
+uv run python -m swordfish.runner list-experiments
+uv run python -m swordfish.runner explain-experiment liger-fsdp --arch a100
+
+# preferred: dispatch by experiment intent (python wraps rune)
+uv run python -m swordfish.runner submit-experiment gemm --arch h100
 
 # the same workload from a Python script:
-python -c "from swordfish.dispatch import TorchGemmRun; print(TorchGemmRun(arch='h100').submit().name)"
+python -c "from swordfish.dispatch import build_run_for_experiment; print(build_run_for_experiment('gemm', 'h100').submit().name)"
 
 # preview the rendered Job manifest without submitting
-uv run python -m swordfish.runner submit-bench --workload gemm --arch a100 \
+uv run python -m swordfish.runner submit-experiment gemm --arch a100 \
   --dry-run client --print-yaml
 ```
+
+The local registry lives in `swordfish.dispatch.experiments` until upstream Rune
+grows project-scoped experiment aliases (tracked in
+https://github.com/azure-management-and-platforms/aks-ai-runtime/issues/285).
+It maps experiment IDs such as `gemm` and `liger-fsdp` to generated profile
+families (`swordfish-bench-*`, `swordfish-fsdp-*`) while queue placement stays
+owned by the generated profile YAML.
 
 If you need a one-off submission with arbitrary args, the underlying
 `rune submit` is still available:

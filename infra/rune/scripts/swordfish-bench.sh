@@ -46,6 +46,9 @@
 #
 #   bash infra/rune/scripts/swordfish-bench.sh \
 #       liger-perkernel --kernel rmsnorm --hidden 4096 ...
+#
+#   bash infra/rune/scripts/swordfish-bench.sh \
+#       liger-fsdp-step --nproc-per-node 8 --liger-mode baseline ...
 
 set -euo pipefail
 
@@ -83,7 +86,34 @@ if [[ -n "$ARCH_LABEL" ]]; then
   fi
 fi
 
-PYTHON_CMD=(python -m swordfish.runner "$@" "${inject_arch[@]}")
+extract_nproc_per_node() {
+  local nproc="1"
+  local prev=""
+  for a in "$@"; do
+    if [[ "$prev" == "--nproc-per-node" ]]; then
+      nproc="$a"
+      break
+    fi
+    if [[ "$a" == --nproc-per-node=* ]]; then
+      nproc="${a#--nproc-per-node=}"
+      break
+    fi
+    prev="$a"
+  done
+  echo "$nproc"
+}
+
+if [[ "${1:-}" == "liger-fsdp-step" && -z "${RANK:-}" ]]; then
+  nproc="$(extract_nproc_per_node "$@")"
+else
+  nproc="1"
+fi
+
+if [[ "$nproc" =~ ^[0-9]+$ && "$nproc" -gt 1 ]]; then
+  PYTHON_CMD=(torchrun --standalone --nnodes 1 --nproc-per-node "$nproc" -m swordfish.runner "$@" "${inject_arch[@]}")
+else
+  PYTHON_CMD=(python -m swordfish.runner "$@" "${inject_arch[@]}")
+fi
 
 # Derive a default profile output path from the --out flag the caller passed
 # to swordfish.runner. The profile output sits next to the result JSON so

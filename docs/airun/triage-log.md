@@ -59,3 +59,11 @@
 - Verification: `kubectl --context voice-agent-flex -n gpu-operator rollout status ds/nvidia-dcgm-exporter --timeout=300s` succeeded with 6/6 exporter pods ready, including both A100 nodes. `make airun-validate-results` now reports `GEMM result matrix is complete`.
 - Guardrail: added `make airun-a100-ncu-preflight`, and `make airun-apply` now invokes it automatically when `AIRUN_ARCH_LABELS` includes `a100`. The preflight fails before submission if running `nvidia-dcgm-exporter` pods are still on Ready target A100 nodes or if the A100 arch config lacks `SYS_ADMIN`.
 - Lesson: On this lane, complete A100 NCU requires a controlled profiling window where DCGM exporter is paused/excluded from the target A100 nodes, followed by immediate restore. Do not permanently disable DCGM and do not fake NCU completeness from partial profiler output.
+
+## 2026-05-02 — A100 NCU through Rune profile-mode needed SYS_ADMIN profile support
+- Initial suspicion: L4
+- Actual root cause: L4 (GPU/profiler pod security + DCGM contention) — A100 NCU needs `SYS_ADMIN`, and Rune previously could not render that capability from a Profile; after adding profile-driven `runtime.securityContext.capabilities.add`, the remaining blocker was the known DCGM exporter profiler-resource contention.
+- Layers ruled out before finding it: L2/L3, because the NCU smoke job was admitted and scheduled to `aks-gpu-33826946-vmss000000`; L5, because the A100 nodes were Ready and available; application-level GEMM execution, because the job wrote its result JSON and NCU profiled the cuBLAS GEMM kernel once `SYS_ADMIN` and the DCGM pause were both in place.
+- Time to root cause: ~20 min
+- Fix: added Rune renderer support for `spec.runtime.securityContext.capabilities.add`, generated `swordfish-bench-a100-ncu` / `swordfish-fsdp-a100-ncu`, installed the patched local `rune`, temporarily excluded `gpu=a100` nodes from `nvidia-dcgm-exporter`, ran `swordfish-a100-ncu-rune-0502192934` with `--profile-mode ncu`, converted/fetched `profile.ncu-summary.csv`, then restored DCGM to 6/6 Ready.
+- Lesson: Profile-mode alone is not enough for A100; the easy path must select an elevated A100 NCU profile and still run inside a controlled DCGM pause window.

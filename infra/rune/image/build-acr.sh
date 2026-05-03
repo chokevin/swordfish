@@ -23,6 +23,7 @@
 # Env overrides:
 #   ACR_REGISTRY=voiceagentcr           # registry name (no .azurecr.io)
 #   ACR_REPO=airun/swordfish-bench      # repo name within registry
+#   TRANSFORMERS_VERSION=4.56.2         # Liger Llama patch-compatible pin
 #   LIGER_VERSION=0.5.10                # bake a different liger pin
 #   LIGER_REF=                          # or a git ref against linkedin/Liger-Kernel
 #   BASE_IMAGE=...                      # pin a digest for sweep reproducibility
@@ -35,6 +36,7 @@ set -euo pipefail
 
 ACR_REGISTRY="${ACR_REGISTRY:-voiceagentcr}"
 ACR_REPO="${ACR_REPO:-airun/swordfish-bench}"
+TRANSFORMERS_VERSION="${TRANSFORMERS_VERSION:-4.56.2}"
 LIGER_VERSION="${LIGER_VERSION:-0.5.10}"
 LIGER_REF="${LIGER_REF:-}"
 BASE_IMAGE="${BASE_IMAGE:-}"
@@ -61,6 +63,7 @@ build_args=(
     -r "$ACR_REGISTRY"
     -t "${ACR_REPO}:dev"
     -t "${ACR_REPO}:${sha_tag}"
+    --build-arg "TRANSFORMERS_VERSION=${TRANSFORMERS_VERSION}"
     --build-arg "LIGER_VERSION=${LIGER_VERSION}"
     --build-arg "SWORDFISH_SHA=${sha_tag}"
     -f infra/rune/image/Dockerfile

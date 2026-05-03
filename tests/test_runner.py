@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -23,7 +25,9 @@ from swordfish.quant.marlin_triton import (
 from swordfish.runner.backends import available_gemm_backends, get_gemm_backend
 from swordfish.runner.compare import render_results_comparison
 from swordfish.runner.index import build_result_index
+from swordfish.runner import liger_fsdp as liger_fsdp_module
 from swordfish.runner.liger_perkernel import KERNEL_NAMES as LIGER_KERNEL_NAMES, run_liger_perkernel
+from swordfish.runner.liger_fsdp import run_liger_fsdp_step
 from swordfish.runner.matrix import run_gemm_matrix, validate_gemm_matrix_results
 from swordfish.runner.schema import (
     TRAINING_SCHEMA_VERSION,
@@ -197,6 +201,137 @@ def test_build_result_index_skips_non_results(tmp_path):
 
     with_raw = build_result_index(result_dir, include_raw=True)
     assert with_raw["count"] == 2
+
+
+def test_liger_fsdp_reference_train_step_cpu_smoke():
+    result = run_liger_fsdp_step(
+        mode="baseline",
+        model_source="reference",
+        model_preset="tiny",
+        micro_batch_size=1,
+        seq_len=3,
+        dtype="fp32",
+        repeats=1,
+        warmup=0,
+        iters=1,
+        device_name="cpu",
+        allow_cpu=True,
+        arch_label="a100",
+        seed=0,
+        gradient_checkpointing=False,
+    )
+
+    assert result is not None
+    assert result["schema_version"] == TRAINING_SCHEMA_VERSION
+    assert validate_training_result_protocol(result) == []
+    assert result["benchmark"] == "liger_fsdp_train_step"
+    assert result["config"]["scope"] == "fsdp_train_step"
+    assert result["config"]["distributed_strategy"] == "single_process"
+    assert result["config"]["shape"]["global_batch_size"] == 1
+    assert result["config"]["shape"]["world_size"] == 1
+    assert result["config"]["liger"]["applied"] is False
+    assert result["correctness"]["finite_loss"] is True
+    assert result["metrics"]["tokens_per_second"] > 0
+    assert "baseline" in result["metrics"]["modes"]
+
+
+def test_transformers_liger_fsdp_uses_non_reentrant_checkpointing(monkeypatch):
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeLlamaForCausalLM:
+        def __init__(self, config):
+            self.config = config
+            self.gradient_checkpointing_kwargs = None
+            self.to_kwargs = None
+
+        def gradient_checkpointing_enable(self, *, gradient_checkpointing_kwargs):
+            self.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+
+        def to(self, **kwargs):
+            self.to_kwargs = kwargs
+            return self
+
+    fake_transformers = types.ModuleType("transformers")
+    fake_transformers.LlamaConfig = FakeConfig
+    fake_transformers.LlamaForCausalLM = FakeLlamaForCausalLM
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    model = liger_fsdp_module._build_transformers_llama(
+        liger_fsdp_module.MODEL_PRESETS["tiny"],
+        device=liger_fsdp_module.torch.device("cpu"),
+        dtype=liger_fsdp_module.torch.float32,
+        gradient_checkpointing=True,
+    )
+
+    assert model.gradient_checkpointing_kwargs == {"use_reentrant": False}
+    assert model.to_kwargs == {
+        "device": liger_fsdp_module.torch.device("cpu"),
+        "dtype": liger_fsdp_module.torch.float32,
+    }
+
+
+def test_build_result_index_includes_training_results(tmp_path):
+    result_dir = tmp_path / "results"
+    result_dir.mkdir()
+    result = run_liger_fsdp_step(
+        mode="baseline",
+        model_source="reference",
+        model_preset="tiny",
+        micro_batch_size=1,
+        seq_len=3,
+        dtype="fp32",
+        repeats=1,
+        warmup=0,
+        iters=1,
+        device_name="cpu",
+        allow_cpu=True,
+        arch_label="h100",
+        seed=0,
+        gradient_checkpointing=False,
+    )
+    assert result is not None
+    write_result(result, result_dir / "liger-fsdp-h100.json")
+
+    index = build_result_index(result_dir)
+
+    assert index["count"] == 1
+    row = index["results"][0]
+    assert row["benchmark"] == "liger_fsdp_train_step"
+    assert row["scope"] == "fsdp_train_step"
+    assert row["gpu_class"] == "h100"
+    assert row["tokens_per_second"] > 0
+    assert row["protocol_errors"] == []
+
+
+def test_render_upstream_packet_accepts_liger_training_result(tmp_path):
+    result_path = tmp_path / "liger-fsdp.json"
+    result = run_liger_fsdp_step(
+        mode="baseline",
+        model_source="reference",
+        model_preset="tiny",
+        micro_batch_size=1,
+        seq_len=3,
+        dtype="fp32",
+        repeats=1,
+        warmup=0,
+        iters=1,
+        device_name="cpu",
+        allow_cpu=True,
+        arch_label="a100",
+        seed=0,
+        gradient_checkpointing=False,
+    )
+    assert result is not None
+    result["command"] = ["python", "-m", "swordfish.runner", "liger-fsdp-step"]
+    write_result(result, result_path)
+
+    packet = render_upstream_packet(result_path=result_path, target="liger")
+
+    assert "**Target:** Liger Kernel" in packet
+    assert "**Benchmark:** liger_fsdp_train_step" in packet
+    assert "## Result protocol validation\n\n- OK" in packet
 
 
 def test_render_completion_report_blocks_on_missing_arch(tmp_path):
@@ -1205,6 +1340,3 @@ def test_import_ncu_report_respects_env_var_override(monkeypatch, tmp_path):
 
     mod = _nsum_mod._import_ncu_report()
     assert getattr(mod, "OVERRIDE_MARKER", None) == "env-var-stub"
-
-
-import sys  # noqa: E402,F401  — kept as import marker for any future tests
