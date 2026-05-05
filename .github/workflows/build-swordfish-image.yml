@@ -4,9 +4,12 @@ name: build-swordfish-image
 # build context. Tags: branch name, short SHA, latest on main, optional
 # version tag via workflow_dispatch.
 #
-# Note: the base is nvcr.io/nvidia/pytorch:25.03-py3 (~12GB), so this build
-# is slow (~15-30min on ubuntu-latest). We reclaim ~30GB of preinstalled
-# tooling first to avoid running out of disk on the base image pull.
+# Note: GitHub Actions builds use the public nvcr.io/nvidia/pytorch:25.03-py3
+# base (~12GB), so this build is slow (~15-30min on ubuntu-latest). The
+# Dockerfile default remains the private in-region ACR base used by the
+# canonical Azure ACR build path; Actions cannot pull that base without Azure
+# credentials. We reclaim ~30GB of preinstalled tooling first to avoid running
+# out of disk on the public base image pull.
 
 on:
   push:
@@ -94,6 +97,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
+            BASE_IMAGE=nvcr.io/nvidia/pytorch:25.03-py3
             ${{ inputs.liger_version && format('LIGER_VERSION={0}', inputs.liger_version) || '' }}
             ${{ inputs.liger_ref && format('LIGER_REF={0}', inputs.liger_ref) || '' }}
             SWORDFISH_SHA=${{ github.sha }}

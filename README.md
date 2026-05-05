@@ -37,8 +37,8 @@ PyTorch/Inductor, CUTLASS/CuTe, JAX/Pallas, TileLang, and pyptx.
 ## Quick start
 
 ```bash
-uv sync
-uv run pytest
+uv sync --extra dev
+make test
 uv run python -m swordfish.runner run-gemm \
   --backend torch \
   --m 32 --n 32 --k 32 \
@@ -106,7 +106,8 @@ uv run python -m swordfish.runner run-gemm \
 
 ### Rune setup
 
-Local CPU development only needs the base `uv sync`. Rune dispatch is opt-in:
+Local CPU development uses `uv sync --extra dev` so the optional `ruff` and
+`pytest` tools are present for `make test`. Rune dispatch is opt-in:
 `make rune-bootstrap` installs `rune-py` from the private `aks-ai-runtime`
 release tag into this repo's uv environment and then runs `rune-py bootstrap`
 to install the matching `rune` CLI into `.venv/bin`. Override

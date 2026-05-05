@@ -1,5 +1,6 @@
 .PHONY: test validate-results dashboard-index completion-report
 
+UV_RUN_DEV ?= uv run --extra dev
 RESULT_DIR ?= runs/rune/week1
 RESULT_PREFIX ?= torch-gemm
 VALIDATE_ARCH_LABELS ?= a100 h100 h200
@@ -9,9 +10,9 @@ DASHBOARD_RESULT_INDEX ?= docs/dashboard/results-index.json
 COMPLETION_REPORT ?= docs/dashboard/completion-report.md
 
 test:
-	uv run ruff format --check swordfish tests
-	uv run ruff check swordfish tests
-	uv run pytest -q
+	$(UV_RUN_DEV) ruff format --check swordfish tests
+	$(UV_RUN_DEV) ruff check swordfish tests
+	$(UV_RUN_DEV) pytest -q
 
 validate-results:
 	uv run python -m swordfish.runner validate-gemm-matrix \
