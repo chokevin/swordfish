@@ -37,8 +37,8 @@ PyTorch/Inductor, CUTLASS/CuTe, JAX/Pallas, TileLang, and pyptx.
 ## Quick start
 
 ```bash
-uv sync
-uv run pytest
+uv sync --extra dev
+make test
 uv run python -m swordfish.runner run-gemm \
   --backend torch \
   --m 32 --n 32 --k 32 \
@@ -60,6 +60,19 @@ uv run python -m swordfish.runner bench-transformer \
   --repeats 1 --warmup 0 --iters 1 \
   --device cpu --allow-cpu \
   --out /tmp/swordfish-transformer-smoke.json
+```
+
+The standalone reduction-kernel track starts with `vectorsum_v2`:
+
+```bash
+uv run python -m swordfish.runner bench-vectorsum \
+  --backend torch \
+  --size 1638400 \
+  --dtype fp32 \
+  --repeats 1 --warmup 0 --iters 1 \
+  --device cpu --allow-cpu \
+  --arch-label a100 \
+  --out /tmp/swordfish-vectorsum-smoke.json
 ```
 
 To time a full training step instead of inference-only forward, use
@@ -93,7 +106,8 @@ uv run python -m swordfish.runner run-gemm \
 
 ### Rune setup
 
-Local CPU development only needs the base `uv sync`. Rune dispatch is opt-in:
+Local CPU development uses `uv sync --extra dev` so the optional `ruff` and
+`pytest` tools are present for `make test`. Rune dispatch is opt-in:
 `make rune-bootstrap` installs `rune-py` from the private `aks-ai-runtime`
 release tag into this repo's uv environment and then runs `rune-py bootstrap`
 to install the matching `rune` CLI into `.venv/bin`. Override
@@ -111,6 +125,7 @@ make rune-install-profiles                              # one-time symlink
 
 uv run python -m swordfish.runner list-experiments
 uv run python -m swordfish.runner explain-experiment liger-fsdp --arch a100
+uv run python -m swordfish.runner explain-experiment vectorsum-v2 --arch a100
 
 # preview the rendered Job manifest (no cluster contact)
 uv run python -m swordfish.runner submit-experiment gemm --arch h100 \
@@ -227,6 +242,10 @@ artifact under `swordfish/kernels/ptx/`; it is intentionally blocked on a CUDA
 driver loader instead of pretending `torch.add` is raw PTX. Future raw-PTX
 benchmarks should plug into the same backend interface so timing, correctness,
 NCU, and JSON output do not fork per kernel.
+
+`bench-vectorsum` is the first standalone reduction target. `torch` is the fp32
+reference path; `triton` is a two-stage block reduction that writes fp32 partials
+and a scalar output while preserving the common result schema.
 
 ## License
 

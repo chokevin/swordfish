@@ -44,5 +44,6 @@ infra/airun/generated/
 *.parquet
 
 # local junk
+.tmp/
 scratch/
 tmp/

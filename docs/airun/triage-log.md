@@ -67,3 +67,21 @@
 - Time to root cause: ~20 min
 - Fix: added Rune renderer support for `spec.runtime.securityContext.capabilities.add`, generated `swordfish-bench-a100-ncu` / `swordfish-fsdp-a100-ncu`, installed the patched local `rune`, temporarily excluded `gpu=a100` nodes from `nvidia-dcgm-exporter`, ran `swordfish-a100-ncu-rune-0502192934` with `--profile-mode ncu`, converted/fetched `profile.ncu-summary.csv`, then restored DCGM to 6/6 Ready.
 - Lesson: Profile-mode alone is not enough for A100; the easy path must select an elevated A100 NCU profile and still run inside a controlled DCGM pause window.
+
+## 2026-05-04 — A100/H200 FSDP comparison submit blocked by context and H200 capacity
+- Initial suspicion: L5
+- Actual root cause: L5 (cluster context / transient node-pool capacity) — the first Rune submit targeted the current `chokevin-aks` context, which had no `ray` namespace; after switching to `voice-agent-flex`, the first H200 comparison leg had no schedulable H200 node and hit scheduler/autoscaler max-size events.
+- Layers ruled out before finding it: L2 for the target context, because `kernel-mode-training`, `kernel-mode-large-memory`, and `team-kernel-mode-reserved-cq` existed with no initial pending workloads; L3/L4 for A100, because pinned A100 jobs admitted, scheduled to `NVIDIA-A100-SXM4-80GB`, and completed with result JSON + NSYS profiles.
+- Time to root cause: ~15 min
+- Fix: exposed `--context` and `--image` through `submit-experiment`, submitted against `voice-agent-flex`, deleted the initially blocked H200 jobs, pinned reruns to `voiceagentcr.azurecr.io/airun/swordfish-bench:bf92726-dirty` instead of cached `:dev`, and reran H200 once two Ready `NVIDIA-H200` nodes appeared.
+- Follow-up: the completed pinned comparison (`sf-fsdp-pin-{a100,h200}-*`) showed `tb-no-limit` as the best overlap lead on both A100 and H200; H200 recovered during the session, so this was a transient capacity/context blocker rather than a persistent H200 experiment blocker.
+- Lesson: For Rune sweeps, pass the kube context explicitly and pin the image tag; `:dev` plus `IfNotPresent` can reuse stale runner code even after the ACR tag has moved, and H200 must be preflighted for live schedulable nodes before using it as a comparison leg.
+
+## 2026-05-04 — vectorsum A100 capture-policy sweep pod Pending after admission
+- Initial suspicion: L3
+- Actual root cause: L3 (k8s scheduler) — `vs-v2-capture-policy-05041233` was admitted by Kueue but rendered an impossible selector: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB` together with `rune.ai/gpu-class=h200-nvlink-141gb`.
+- Layers ruled out before finding it: L2, because the Workload was `QuotaReserved` and `Admitted` in `team-kernel-mode-reserved-cq`.
+- Time to root cause: ~10 min
+- Fix: deleted the stuck admitted job and reran the benchmark with `--gpu-class a100-nvlink-80gb`; dry-run confirmed the selector changed to `rune.ai/gpu-class=a100-nvlink-80gb`.
+- Verification: fixed-selector reruns scheduled on `aks-gpu-33826946-vmss000001` and wrote A100 result JSON.
+- Lesson: When using a nominal A100 Rune profile, still dry-run/check the rendered `rune.ai/gpu-class`; a stale or inherited H200 GPU-class selector can make an A100 pod unschedulable even though Kueue admits it.
