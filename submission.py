@@ -44,9 +44,15 @@ _PROJECTION_KEYS = (
     "out_gate.weight",
 )
 _MAX_CACHED_PROJECTIONS = 8
-_projection_cache: OrderedDict[tuple[tuple[int, ...], torch.device, torch.dtype], torch.Tensor] = (
-    OrderedDict()
-)
+_projection_cache: OrderedDict[
+    tuple[tuple[int, ...], torch.device, torch.dtype, torch.dtype], torch.Tensor
+] = OrderedDict()
+_weight_cast_cache: OrderedDict[
+    tuple[int, torch.device, torch.dtype, torch.dtype], torch.Tensor
+] = OrderedDict()
+_MAX_CACHED_WEIGHT_CASTS = 16
+_DEFAULT_LINEAR_BACKEND = "auto"
+_LINEAR_BACKENDS = ("auto", "torch", "bf16", "bf16_projection", "bf16_output")
 _DEFAULT_TRIANGLE_BACKEND = "auto"
 _DEFAULT_TRITON_BLOCK_M = 32
 _DEFAULT_TRITON_BLOCK_N = 32
@@ -185,13 +191,17 @@ else:
     _triangle_multiply_packed_kernel = None
 
 
-def _stacked_projection_weight(weights: dict[str, torch.Tensor]) -> torch.Tensor:
+def _stacked_projection_weight(
+    weights: dict[str, torch.Tensor], *, dtype: torch.dtype | None = None
+) -> torch.Tensor:
     """Return [5 * hidden_dim, dim] weight for the combined input projection."""
     first = weights[_PROJECTION_KEYS[0]]
+    target_dtype = dtype or first.dtype
     key = (
         tuple(int(weights[name].data_ptr()) for name in _PROJECTION_KEYS),
         first.device,
         first.dtype,
+        target_dtype,
     )
     cached = _projection_cache.get(key)
     if cached is not None:
@@ -199,15 +209,60 @@ def _stacked_projection_weight(weights: dict[str, torch.Tensor]) -> torch.Tensor
         return cached
 
     stacked = torch.cat([weights[name] for name in _PROJECTION_KEYS], dim=0).contiguous()
+    if stacked.dtype != target_dtype:
+        stacked = stacked.to(target_dtype)
     _projection_cache[key] = stacked
     if len(_projection_cache) > _MAX_CACHED_PROJECTIONS:
         _projection_cache.popitem(last=False)
     return stacked
 
 
+def _cached_weight_cast(weight: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    if weight.dtype == dtype:
+        return weight
+
+    key = (int(weight.data_ptr()), weight.device, weight.dtype, dtype)
+    cached = _weight_cast_cache.get(key)
+    if cached is not None:
+        _weight_cast_cache.move_to_end(key)
+        return cached
+
+    cast = weight.to(dtype)
+    _weight_cast_cache[key] = cast
+    if len(_weight_cast_cache) > _MAX_CACHED_WEIGHT_CASTS:
+        _weight_cast_cache.popitem(last=False)
+    return cast
+
+
 def _has_real_mask(mask: torch.Tensor) -> bool:
     """Official no-mask cases use float ones; masked cases use integer 0/1."""
     return not mask.dtype.is_floating_point
+
+
+def _bf16_available(input_tensor: torch.Tensor) -> bool:
+    return input_tensor.is_cuda and torch.cuda.is_bf16_supported()
+
+
+def _linear_dtypes(input_tensor: torch.Tensor, backend: str) -> tuple[torch.dtype, torch.dtype]:
+    if backend not in _LINEAR_BACKENDS:
+        raise ValueError(f"unknown linear backend: {backend}")
+    if backend == "torch":
+        return input_tensor.dtype, input_tensor.dtype
+    if backend == "auto":
+        if _bf16_available(input_tensor) and input_tensor.shape[1] <= 256:
+            if int(input_tensor.shape[-1]) == 384:
+                return torch.bfloat16, torch.bfloat16
+            return torch.bfloat16, input_tensor.dtype
+        return input_tensor.dtype, input_tensor.dtype
+    if not _bf16_available(input_tensor):
+        raise RuntimeError("BF16 linear backend requires BF16-capable CUDA hardware")
+    if backend == "bf16":
+        return torch.bfloat16, torch.bfloat16
+    if backend == "bf16_projection":
+        return torch.bfloat16, input_tensor.dtype
+    if backend == "bf16_output":
+        return input_tensor.dtype, torch.bfloat16
+    raise ValueError(f"unknown linear backend: {backend}")
 
 
 def _triangle_multiply_torch(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
@@ -398,9 +453,22 @@ def _triangle_multiply(
 @torch.no_grad()
 def custom_kernel(data: input_t) -> output_t:
     """Outgoing Triangle Multiplicative Update forward pass."""
+    output, _ = _custom_kernel_impl(data, collect_timings=False)
+    return output
+
+
+def _custom_kernel_impl(
+    data: input_t, *, collect_timings: bool
+) -> tuple[torch.Tensor, dict[str, float] | None]:
     input_tensor, mask, weights, config = data
     dim = int(config["dim"])
     hidden_dim = int(config["hidden_dim"])
+    linear_backend = str(
+        config.get(
+            "linear_backend", os.environ.get("TRIMUL_LINEAR_BACKEND", _DEFAULT_LINEAR_BACKEND)
+        )
+    ).lower()
+    projection_dtype, output_dtype = _linear_dtypes(input_tensor, linear_backend)
     triangle_backend = str(
         config.get(
             "triangle_backend", os.environ.get("TRIMUL_TRIANGLE_BACKEND", _DEFAULT_TRIANGLE_BACKEND)
@@ -434,15 +502,31 @@ def custom_kernel(data: input_t) -> output_t:
         )
     )
 
+    events: list[tuple[str, torch.cuda.Event]] = []
+
+    def mark(name: str) -> None:
+        if collect_timings:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            events.append((name, event))
+
+    if collect_timings:
+        if not input_tensor.is_cuda:
+            raise RuntimeError("op-level timing requires CUDA tensors")
+        mark("start")
+
     x = F.layer_norm(
         input_tensor,
         (dim,),
         weights["norm.weight"],
         weights["norm.bias"],
     )
+    mark("layernorm_in")
 
-    projected = F.linear(x, _stacked_projection_weight(weights))
+    x_linear = x if projection_dtype == x.dtype else x.to(projection_dtype)
+    projected = F.linear(x_linear, _stacked_projection_weight(weights, dtype=projection_dtype))
     left, right, left_gate, right_gate, out_gate = projected.split(hidden_dim, dim=-1)
+    mark("stacked_projection")
 
     if _has_real_mask(mask):
         mask_view = mask.unsqueeze(-1).to(dtype=left.dtype)
@@ -454,6 +538,7 @@ def custom_kernel(data: input_t) -> output_t:
     out_gate.sigmoid_()
     left = left * left_gate
     right = right * right_gate
+    mark("gate_mask")
 
     out = _triangle_multiply(
         left,
@@ -465,6 +550,7 @@ def custom_kernel(data: input_t) -> output_t:
         triton_num_warps=triton_num_warps,
         triton_num_stages=triton_num_stages,
     )
+    mark("triangle")
     out = F.layer_norm(
         out,
         (hidden_dim,),
@@ -472,7 +558,22 @@ def custom_kernel(data: input_t) -> output_t:
         weights["to_out_norm.bias"],
     )
     out = out * out_gate
-    return F.linear(out, weights["to_out.weight"])
+    mark("tail_norm_gate")
+    out_linear = out if output_dtype == out.dtype else out.to(output_dtype)
+    output = F.linear(out_linear, _cached_weight_cast(weights["to_out.weight"], output_dtype)).to(
+        torch.float32
+    )
+    mark("final_projection")
+
+    if not collect_timings:
+        return output, None
+
+    events[-1][1].synchronize()
+    timings = {
+        events[idx][0]: events[idx - 1][1].elapsed_time(events[idx][1])
+        for idx in range(1, len(events))
+    }
+    return output, timings
 
 
 def _reference_output(
@@ -580,6 +681,11 @@ def _latency_stats(samples: list[float]) -> dict[str, float | list[float]]:
     }
 
 
+def _phase_stats(samples: list[dict[str, float]]) -> dict[str, dict[str, float | list[float]]]:
+    phases = samples[0].keys()
+    return {phase: _latency_stats([sample[phase] for sample in samples]) for phase in phases}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TriMul outgoing benchmark harness")
     parser.add_argument("--seqlen", type=int, default=256)
@@ -593,6 +699,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--check-reference", action="store_true")
+    parser.add_argument("--profile-ops", action="store_true")
+    parser.add_argument(
+        "--linear-backend",
+        choices=list(_LINEAR_BACKENDS),
+        default=os.environ.get("TRIMUL_LINEAR_BACKEND", _DEFAULT_LINEAR_BACKEND),
+        help="input/output linear precision backend",
+    )
     parser.add_argument(
         "--backend",
         choices=["auto", "torch", "bmm", "triton", "triton_packed"],
@@ -624,6 +737,7 @@ def _main() -> int:
         device=device,
     )
     data[3]["triangle_backend"] = args.backend
+    data[3]["linear_backend"] = args.linear_backend
     data[3]["triton_block_m"] = args.triton_block_m
     data[3]["triton_block_n"] = args.triton_block_n
     data[3]["triton_block_k"] = args.triton_block_k
@@ -655,6 +769,19 @@ def _main() -> int:
         _time_cuda(run_once, warmup=args.warmup, iters=args.iters) for _ in range(args.repeats)
     ]
     stats = _latency_stats(samples)
+    phase_stats = None
+    if args.profile_ops:
+        for _ in range(args.warmup):
+            run_once()
+        torch.cuda.synchronize()
+        phase_samples: list[dict[str, float]] = []
+        for _ in range(args.repeats):
+            _, phase_timings = _custom_kernel_impl(data, collect_timings=True)
+            if phase_timings is None:
+                raise RuntimeError("phase timings were not collected")
+            phase_samples.append(phase_timings)
+        phase_stats = _phase_stats(phase_samples)
+
     result = {
         "schema_version": "swordfish.runner.v1",
         "benchmark": "trimul_outgoing",
@@ -668,6 +795,8 @@ def _main() -> int:
             "repeats": args.repeats,
             "warmup": args.warmup,
             "iters": args.iters,
+            "profile_ops": args.profile_ops,
+            "linear_backend": args.linear_backend,
             "triangle_backend": args.backend,
             "triton_block_m": args.triton_block_m,
             "triton_block_n": args.triton_block_n,
@@ -686,6 +815,8 @@ def _main() -> int:
         "metrics": {"latency": stats},
         "timestamp_unix": time.time(),
     }
+    if phase_stats is not None:
+        result["metrics"]["phases"] = phase_stats
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(result, indent=2, sort_keys=True))
