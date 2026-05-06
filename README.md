@@ -62,6 +62,19 @@ uv run python -m swordfish.runner bench-transformer \
   --out /tmp/swordfish-transformer-smoke.json
 ```
 
+The standalone reduction-kernel track starts with `vectorsum_v2`:
+
+```bash
+uv run python -m swordfish.runner bench-vectorsum \
+  --backend torch \
+  --size 1638400 \
+  --dtype fp32 \
+  --repeats 1 --warmup 0 --iters 1 \
+  --device cpu --allow-cpu \
+  --arch-label a100 \
+  --out /tmp/swordfish-vectorsum-smoke.json
+```
+
 To time a full training step instead of inference-only forward, use
 `--mode train-step`. This runs forward, loss, backward, and an AdamW optimizer
 step on the same tiny GPT-style reference:
@@ -111,6 +124,7 @@ make rune-install-profiles                              # one-time symlink
 
 uv run python -m swordfish.runner list-experiments
 uv run python -m swordfish.runner explain-experiment liger-fsdp --arch a100
+uv run python -m swordfish.runner explain-experiment vectorsum-v2 --arch a100
 
 # preview the rendered Job manifest (no cluster contact)
 uv run python -m swordfish.runner submit-experiment gemm --arch h100 \
@@ -181,6 +195,18 @@ still requires the short DCGM exporter pause documented in
 `docs/airun/a100-ncu-blocker.md`. H100 NVL and H200 NCU run without extra
 capabilities.
 
+Trace handoff is standardized under `runs/traces/`:
+
+```bash
+uv run python -m swordfish.runner bundle-traces my-bench:ncu \
+  --context voice-agent-flex \
+  --bundle-name my-bench-handoff
+```
+
+That fetches the result JSON plus `.ncu-rep` / `.nsys-rep` / torch trace into an
+expanded directory and writes `runs/traces/my-bench-handoff.tar.gz` for copying
+to a Mac or handing to Hermes.
+
 After all three jobs have produced final JSON files, use the strict completion
 gate:
 
@@ -227,6 +253,12 @@ artifact under `swordfish/kernels/ptx/`; it is intentionally blocked on a CUDA
 driver loader instead of pretending `torch.add` is raw PTX. Future raw-PTX
 benchmarks should plug into the same backend interface so timing, correctness,
 NCU, and JSON output do not fork per kernel.
+
+`bench-vectorsum` is the first standalone reduction target. `torch` is the fp32
+reference path; `triton` is a two-stage block reduction that writes fp32 partials
+and a scalar output while preserving the common result schema. The root-level
+`submission.py` mirrors that Triton reduction as a self-contained evaluator
+entrypoint for environments where the `swordfish` package is not installed.
 
 ## License
 

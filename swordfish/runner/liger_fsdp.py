@@ -15,6 +15,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from functools import partial
 from importlib import metadata
 from collections.abc import Iterator
 from typing import Any, Literal
@@ -27,11 +28,13 @@ from swordfish.runner.backends import TORCH_DTYPES
 from swordfish.runner.schema import TRAINING_SCHEMA_VERSION, latency_stats
 from swordfish.runner.torch_gemm import _resolve_device, capture_env
 from swordfish.transformer.config import GPTConfig
-from swordfish.transformer.model import GPTLanguageModel
+from swordfish.transformer.model import GPTDecoderBlock, GPTLanguageModel
 
 LigerMode = Literal["baseline", "liger"]
 ModelSource = Literal["reference", "transformers"]
 ModelPreset = Literal["tiny", "llama3-8b"]
+FsdpWrapPolicy = Literal["root", "transformer-block"]
+FsdpBackwardPrefetch = Literal["default", "backward-pre", "backward-post", "none"]
 
 
 @dataclass(frozen=True)
@@ -204,15 +207,22 @@ def _maybe_wrap_fsdp(
     *,
     state: DistributedState,
     dtype: torch.dtype,
+    model_source: ModelSource,
+    fsdp_wrap_policy: FsdpWrapPolicy,
+    fsdp_backward_prefetch: FsdpBackwardPrefetch,
+    fsdp_forward_prefetch: bool,
+    fsdp_limit_all_gathers: bool,
 ) -> tuple[nn.Module, str]:
     if state.world_size == 1:
         return model, "single_process"
 
     from torch.distributed.fsdp import (  # noqa: PLC0415
+        BackwardPrefetch,
         FullyShardedDataParallel as FSDP,
         MixedPrecision,
         ShardingStrategy,
     )
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy  # noqa: PLC0415
 
     mixed_precision = None
     if dtype in {torch.float16, torch.bfloat16}:
@@ -222,13 +232,36 @@ def _maybe_wrap_fsdp(
             buffer_dtype=dtype,
         )
 
+    auto_wrap_policy = None
+    if fsdp_wrap_policy == "transformer-block":
+        if model_source == "transformers":
+            from transformers.models.llama.modeling_llama import LlamaDecoderLayer  # noqa: PLC0415
+
+            transformer_layer_cls = {LlamaDecoderLayer}
+        else:
+            transformer_layer_cls = {GPTDecoderBlock}
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls=transformer_layer_cls,
+        )
+
+    fsdp_kwargs: dict[str, Any] = {
+        "sharding_strategy": ShardingStrategy.FULL_SHARD,
+        "mixed_precision": mixed_precision,
+        "use_orig_params": True,
+        "auto_wrap_policy": auto_wrap_policy,
+        "forward_prefetch": fsdp_forward_prefetch,
+        "limit_all_gathers": fsdp_limit_all_gathers,
+    }
+    if fsdp_backward_prefetch != "default":
+        fsdp_kwargs["backward_prefetch"] = {
+            "backward-pre": BackwardPrefetch.BACKWARD_PRE,
+            "backward-post": BackwardPrefetch.BACKWARD_POST,
+            "none": None,
+        }[fsdp_backward_prefetch]
+
     return (
-        FSDP(
-            model,
-            sharding_strategy=ShardingStrategy.FULL_SHARD,
-            mixed_precision=mixed_precision,
-            use_orig_params=True,
-        ),
+        FSDP(model, **fsdp_kwargs),
         "FSDP1",
     )
 
@@ -312,6 +345,10 @@ def run_liger_fsdp_step(
     weight_decay: float = 0.1,
     gradient_checkpointing: bool = True,
     profile_steady_state: bool = False,
+    fsdp_wrap_policy: FsdpWrapPolicy = "root",
+    fsdp_backward_prefetch: FsdpBackwardPrefetch = "default",
+    fsdp_forward_prefetch: bool = False,
+    fsdp_limit_all_gathers: bool = True,
 ) -> dict[str, Any] | None:
     """Run one baseline or Liger-patched training-step benchmark.
 
@@ -335,6 +372,12 @@ def run_liger_fsdp_step(
         )
     if lr <= 0 or weight_decay < 0:
         raise ValueError("lr must be positive and weight_decay must be non-negative")
+    if fsdp_wrap_policy not in {"root", "transformer-block"}:
+        raise ValueError("fsdp_wrap_policy must be 'root' or 'transformer-block'")
+    if fsdp_backward_prefetch not in {"default", "backward-pre", "backward-post", "none"}:
+        raise ValueError(
+            "fsdp_backward_prefetch must be one of: default, backward-pre, backward-post, none"
+        )
 
     spec = MODEL_PRESETS[model_preset]
     if seq_len > spec.block_size:
@@ -362,7 +405,16 @@ def run_liger_fsdp_step(
         else:
             model = _build_reference_model(spec, device=state.device, dtype=torch_dtype)
 
-        model, distributed_strategy = _maybe_wrap_fsdp(model, state=state, dtype=torch_dtype)
+        model, distributed_strategy = _maybe_wrap_fsdp(
+            model,
+            state=state,
+            dtype=torch_dtype,
+            model_source=model_source,
+            fsdp_wrap_policy=fsdp_wrap_policy,
+            fsdp_backward_prefetch=fsdp_backward_prefetch,
+            fsdp_forward_prefetch=fsdp_forward_prefetch,
+            fsdp_limit_all_gathers=fsdp_limit_all_gathers,
+        )
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
@@ -500,6 +552,12 @@ def run_liger_fsdp_step(
                 "weight_decay": weight_decay,
                 "gradient_checkpointing": gradient_checkpointing,
                 "gradient_checkpointing_use_reentrant": (False if gradient_checkpointing else None),
+                "fsdp": {
+                    "wrap_policy": fsdp_wrap_policy,
+                    "backward_prefetch": fsdp_backward_prefetch,
+                    "forward_prefetch": fsdp_forward_prefetch,
+                    "limit_all_gathers": fsdp_limit_all_gathers,
+                },
                 "profile": {
                     "nvtx_ranges": True,
                     "steady_state_cuda_profiler_api": profile_steady_state,

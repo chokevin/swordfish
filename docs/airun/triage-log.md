@@ -67,3 +67,58 @@
 - Time to root cause: ~20 min
 - Fix: added Rune renderer support for `spec.runtime.securityContext.capabilities.add`, generated `swordfish-bench-a100-ncu` / `swordfish-fsdp-a100-ncu`, installed the patched local `rune`, temporarily excluded `gpu=a100` nodes from `nvidia-dcgm-exporter`, ran `swordfish-a100-ncu-rune-0502192934` with `--profile-mode ncu`, converted/fetched `profile.ncu-summary.csv`, then restored DCGM to 6/6 Ready.
 - Lesson: Profile-mode alone is not enough for A100; the easy path must select an elevated A100 NCU profile and still run inside a controlled DCGM pause window.
+
+## 2026-05-04 — A100/H200 FSDP comparison submit blocked by context and H200 capacity
+- Initial suspicion: L5
+- Actual root cause: L5 (cluster context / transient node-pool capacity) — the first Rune submit targeted the current `chokevin-aks` context, which had no `ray` namespace; after switching to `voice-agent-flex`, the first H200 comparison leg had no schedulable H200 node and hit scheduler/autoscaler max-size events.
+- Layers ruled out before finding it: L2 for the target context, because `kernel-mode-training`, `kernel-mode-large-memory`, and `team-kernel-mode-reserved-cq` existed with no initial pending workloads; L3/L4 for A100, because pinned A100 jobs admitted, scheduled to `NVIDIA-A100-SXM4-80GB`, and completed with result JSON + NSYS profiles.
+- Time to root cause: ~15 min
+- Fix: exposed `--context` and `--image` through `submit-experiment`, submitted against `voice-agent-flex`, deleted the initially blocked H200 jobs, pinned reruns to `voiceagentcr.azurecr.io/airun/swordfish-bench:bf92726-dirty` instead of cached `:dev`, and reran H200 once two Ready `NVIDIA-H200` nodes appeared.
+- Follow-up: the completed pinned comparison (`sf-fsdp-pin-{a100,h200}-*`) showed `tb-no-limit` as the best overlap lead on both A100 and H200; H200 recovered during the session, so this was a transient capacity/context blocker rather than a persistent H200 experiment blocker.
+- Lesson: For Rune sweeps, pass the kube context explicitly and pin the image tag; `:dev` plus `IfNotPresent` can reuse stale runner code even after the ACR tag has moved, and H200 must be preflighted for live schedulable nodes before using it as a comparison leg.
+
+## 2026-05-04 — vectorsum A100 capture-policy sweep pod Pending after admission
+- Initial suspicion: L3
+- Actual root cause: L3 (k8s scheduler) — `vs-v2-capture-policy-05041233` was admitted by Kueue but rendered an impossible selector: `nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB` together with `rune.ai/gpu-class=h200-nvlink-141gb`.
+- Layers ruled out before finding it: L2, because the Workload was `QuotaReserved` and `Admitted` in `team-kernel-mode-reserved-cq`.
+- Time to root cause: ~10 min
+- Fix: deleted the stuck admitted job and reran the benchmark with `--gpu-class a100-nvlink-80gb`; dry-run confirmed the selector changed to `rune.ai/gpu-class=a100-nvlink-80gb`.
+- Verification: fixed-selector reruns scheduled on `aks-gpu-33826946-vmss000001` and wrote A100 result JSON.
+- Lesson: When using a nominal A100 Rune profile, still dry-run/check the rendered `rune.ai/gpu-class`; a stale or inherited H200 GPU-class selector can make an A100 pod unschedulable even though Kueue admits it.
+
+## 2026-05-05 — local session could not submit vectorsum NCU sweep
+- Initial suspicion: L5
+- Actual root cause: L5 (local kube/tooling context) — this session only had the `chokevin-aks` context, which has no `ray` namespace and no Kueue `ClusterQueue` CRD; `voice-agent-flex` / `voice-agent-flex-admin` were not configured, and neither `rune` nor `rune-py` was installed on PATH.
+- Layers ruled out before finding it: application/runner, because `make test` passed, `bench-vectorsum` wrote valid local JSON, and the Python dispatch layer rendered the intended A100/H100/H200 `rune submit ... --profile-mode ncu` commands with explicit `--gpu-class`.
+- Time to root cause: ~10 min
+- Fix: local-only packaging completed; `.tmp/` run artifacts are ignored, the standalone `submission.py` evaluator entrypoint is documented, and the vector-sum/FSDP command render path is verified. No safe cluster submission is possible from this environment without a configured `voice-agent-flex` context and Rune bootstrap/auth.
+- Follow-up: run the rendered `vectorsum-v2` NCU sweep from a workstation/session with `rune`, `ray` namespace access, and `voice-agent-flex` configured. For A100, use the elevated NCU profile/DCGM pause procedure from the prior A100 NCU entries.
+- Lesson: before any Rune sweep, preflight both the local toolchain (`rune`, `rune-py`, GitHub auth if bootstrapping) and kube context (`ray` namespace + Kueue CRDs). A green Python dispatch layer is not sufficient proof that the current shell can submit jobs.
+
+## 2026-05-05 — vectorsum-v2 NCU sweep completed on H100/H200, A100 counters blocked
+- Initial suspicion: L4 for A100 NCU, application/kernel behavior for H100/H200 tuning.
+- Actual root cause: H100/H200 NCU completed successfully; A100 still failed at L4 with `ERR_NVGPUCTRPERM` even after selecting `swordfish-bench-a100-ncu` and temporarily excluding `gpu=a100` nodes from `nvidia-dcgm-exporter`. The A100 workload wrote a passing result JSON, so this is a profiler-counter permission/configuration blocker rather than a vector-sum runtime failure.
+- Layers ruled out before finding it: L2/L3/L5 for this sweep, because all three jobs admitted and scheduled on Ready GPU nodes in `voice-agent-flex`; H100/H200 L4, because both generated and converted `profile.ncu-rep`; application correctness, because the fetched result JSONs reported `matches_reference=true`.
+- Time to root cause: ~25 min after Rune/tooling was restored in-session.
+- Fix/workaround: built a session-local Rune binary, installed swordfish profiles, submitted standalone `submission.py` against `voiceagentcr.azurecr.io/airun/autoresearch-pytorch-ray:dev`, fetched/converted H100/H200 NCU reports with `inspect-run --convert-ncu`, and restored the DCGM exporter DaemonSet to 6/6 pods after the A100 profiling window.
+- Evidence: run id `230122`; H100 `_partial_sum_kernel` took 302 invocations / 1.86 ms / 62.2% of kernel time, with `_final_sum_kernel` another 1.01 ms / 33.9%; H200 `_partial_sum_kernel` took 302 invocations / 1.38 ms / 61.7%, with `_final_sum_kernel` another 765.24 us / 34.3%. Both top kernels showed low SM utilization and modest memory utilization, so the first tuning target is launch/reduction-structure overhead, not raw bandwidth.
+- Timing caveat: latency JSON from NCU-profiled H100/H200 runs is inflated by NCU replay. A separate no-profile latency pass (`sf-vectorsum-v2-lat-230122-{a100,h100,h200}`) measured mean latency of 0.008638 ms on A100, 0.004723 ms on H100, and 0.004449 ms on H200 for the same size/repeats/iters, all with `matches_reference=true`.
+- Lesson: For `vectorsum-v2`, use NCU runs for kernel attribution and no-profile runs for latency. A100 NCU remains a cluster/operator profiler-counter blocker even when the elevated profile and DCGM exclusion procedure are followed; do not block H100/H200 tuning on A100 counters.
+
+## 2026-05-05 — FSDP overlap follow-up ran via standalone script
+- Initial suspicion: application/image contract, then FSDP overlap behavior.
+- Actual root cause: the profile image `voiceagentcr.azurecr.io/airun/swordfish-bench:dev` did not contain the new FSDP wrap/prefetch/all-gather flags (`run_liger_fsdp_step` still accepted only `profile_steady_state`), so the follow-up could not safely use `python -m swordfish.runner submit-experiment` without rebuilding/pushing the image. A session-local standalone script reproduced the dirty FSDP runner logic and was submitted through Rune instead.
+- Layers ruled out before running: L2/L3/L5, because `voice-agent-flex` admitted/scheduled all A100/H200 8-GPU jobs; runtime dependency availability, because the image still had `transformers`, `liger-kernel`, torchrun, and Nsight Systems.
+- Time to root cause: ~10 min for image-contract probe, then normal job runtime.
+- Fix/workaround: submitted `sf-fsdp-ovl-230122-{a100,h200}-{root,tb}` with steady-state NSYS output under `/data/<job>/profile/profile.nsys-rep`, plus no-profile latency checks `sf-fsdp-lat-230122-{a100,h200}-{root,tb}`. All eight jobs completed and fetched JSON; the four NSYS `.nsys-rep` files were also fetched locally under `runs/inspect/fsdp-overlap-230122/`.
+- Results: no-profile latency favored transformer-block/no-limit slightly while reducing peak reserved memory: A100 root/default 845.15 ms / 19.39k tok/s / 63.71 GiB versus tb/no-limit 823.07 ms / 19.91k tok/s / 40.18 GiB; H200 root/default 374.70 ms / 43.73k tok/s / 63.71 GiB versus tb/no-limit 361.63 ms / 45.31k tok/s / 40.18 GiB. NSYS-wrapped timing inverted in favor of root/default (A100 1905.23 ms root vs 2254.85 ms tb; H200 1144.41 ms root vs 1448.47 ms tb), so use those traces for overlap attribution, not as the latency scoreboard.
+- Lesson: Until the FSDP flag code is in the image, treat standalone-script jobs as the valid follow-up path and explicitly separate no-profile latency from NSYS trace capture. The tb/no-limit variant is still a small throughput win and a large memory win in clean timing, but the NSYS traces need offline inspection before claiming improved communication overlap.
+
+## 2026-05-06 — A100 NCU profile lacked SYS_ADMIN in rendered pod
+- Initial suspicion: L4
+- Actual root cause: L4 (GPU/profiler permission) exposed a Rune renderer/tooling bug — `swordfish-bench-a100-ncu` declared `runtime.securityContext.capabilities.add: [SYS_ADMIN]`, but the submitted A100 NCU pod had an empty container `securityContext`, so Nsight Compute failed with `ERR_NVGPUCTRPERM`.
+- Layers ruled out before finding it: L2/L3/L5, because the failed A100 job was admitted, scheduled onto `aks-gpu-33826946-vmss000001`, and wrote a correct result JSON; workload correctness, because `matches_reference=true`; H100/H200 L4, because their NCU reports converted successfully.
+- Time to root cause: ~10 min after inspecting the rendered Job and profile.
+- Fix: patched Rune's submit renderer to propagate `spec.runtime.securityContext` into the main container, rebuilt the session-local Rune binary, and added a Swordfish dispatch preflight that refuses real A100 NCU submits when dry-run output lacks `SYS_ADMIN`. Added `a100-ncu-window` / Make helpers to pause and restore DCGM exporter on A100 nodes, deleting existing A100 exporter pods after the affinity patch.
+- Verification: patched Rune dry-run renders `securityContext.capabilities.add: [SYS_ADMIN]`; A100 smoke `sf-ncu-smoke-001148-a100` completed under a DCGM exclusion window and fetched a 48,773,066-byte `profile.ncu-rep`; `bundle-traces` produced `runs/traces/sf-ncu-smoke-001148-a100-hermes.tar.gz`. DCGM exporter was restored to 6 desired / 6 ready pods afterward.
+- Lesson: A100 NCU seamlessness needs three guards together: a Rune binary that propagates profile security context, a DCGM exclusion window that also deletes already-running A100 exporter pods, and a stable trace bundle path for handoff instead of ad hoc `runs/inspect` directories.

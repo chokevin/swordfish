@@ -13,6 +13,7 @@ from swordfish.kernels.ptx import (
     raw_ptx_blocker,
     torch_vector_add_reference,
 )
+from swordfish.kernels.vector_sum import torch_vector_sum_reference, triton_vector_sum
 from swordfish.quant.marlin_triton import (
     dequantize_weight_int4,
     pack_int4_signed,
@@ -44,6 +45,10 @@ from swordfish.runner.torch_gemm import (
     write_result,
 )
 from swordfish.runner.upstream import render_upstream_packet
+from swordfish.runner.vector_sum import (
+    VECTOR_SUM_BENCHMARK_SIZES,
+    run_vector_sum_benchmark,
+)
 
 
 def test_gpu_class_from_name():
@@ -230,6 +235,12 @@ def test_liger_fsdp_reference_train_step_cpu_smoke():
     assert result["config"]["shape"]["global_batch_size"] == 1
     assert result["config"]["shape"]["world_size"] == 1
     assert result["config"]["liger"]["applied"] is False
+    assert result["config"]["fsdp"] == {
+        "wrap_policy": "root",
+        "backward_prefetch": "default",
+        "forward_prefetch": False,
+        "limit_all_gathers": True,
+    }
     assert result["config"]["profile"]["nvtx_ranges"] is True
     assert result["config"]["profile"]["steady_state_cuda_profiler_api"] is False
     assert result["config"]["profile"]["step_phases"] == [
@@ -463,6 +474,238 @@ def test_raw_ptx_vector_add_artifact_and_blocker():
     assert torch.equal(torch_vector_add_reference(a, b), torch.tensor([5.0, 7.0, 9.0]))
     with pytest.raises(RuntimeError, match="requires CUDA tensors"):
         ptx_vector_add(a, b, torch.empty_like(a))
+
+
+def test_vectorsum_v2_benchmark_sizes_match_target_shapes():
+    assert VECTOR_SUM_BENCHMARK_SIZES == (
+        1_638_400,
+        3_276_800,
+        6_553_600,
+        13_107_200,
+        26_214_400,
+        52_428_800,
+    )
+
+
+def test_vectorsum_v2_torch_reference_sums_to_fp32_scalar():
+    import torch
+
+    x = torch.tensor([1.0, 16_777_216.0, -16_777_216.0], dtype=torch.float32)
+    out = torch.empty((1,), dtype=torch.float32)
+
+    result = torch_vector_sum_reference(x, out)
+
+    assert result is out
+    assert out.shape == (1,)
+    assert out.item() == pytest.approx(1.0)
+
+
+def test_vectorsum_v2_triton_backend_rejects_cpu_before_launch():
+    import torch
+
+    x = torch.ones((8,), dtype=torch.float32)
+    out = torch.empty((), dtype=torch.float32)
+    partials = torch.empty((1,), dtype=torch.float32)
+
+    with pytest.raises(RuntimeError, match="requires.*CUDA|requires the triton package"):
+        triton_vector_sum(x, out, partials)
+
+
+def test_submission_exports_custom_kernel():
+    import importlib
+
+    submission = importlib.import_module("submission")
+
+    assert callable(submission.custom_kernel)
+
+
+def test_submission_custom_kernel_returns_scalar_view(monkeypatch):
+    import importlib
+    import math
+    import torch
+
+    submission = importlib.import_module("submission")
+
+    class FakeTriton:
+        @staticmethod
+        def cdiv(a, b):
+            return math.ceil(a / b)
+
+        @staticmethod
+        def next_power_of_2(value):
+            return 1 << (value - 1).bit_length()
+
+    class FakePartialKernel:
+        def __getitem__(self, grid):
+            return self
+
+        def __call__(self, *args, **kwargs):
+            return None
+
+    class FakeFinalKernel:
+        def __getitem__(self, grid):
+            return self
+
+        def __call__(self, partials, output, *args, **kwargs):
+            output.reshape(-1)[0].fill_(3.0)
+
+    monkeypatch.setattr(submission, "triton", FakeTriton)
+    monkeypatch.setattr(submission, "_partial_sum_kernel", FakePartialKernel())
+    monkeypatch.setattr(submission, "_final_sum_kernel", FakeFinalKernel())
+    monkeypatch.setattr(submission, "_PARTIALS", None)
+    monkeypatch.setattr(submission, "_PARTIALS_DEVICE", None)
+    monkeypatch.setattr(submission, "_PARTIALS_N", 0)
+    monkeypatch.setattr(submission, "_N_PARTIALS", 0)
+    monkeypatch.setattr(submission, "_FINAL_BLOCK_SIZE", 0)
+    monkeypatch.setattr(submission, "_GRAPH", None)
+    monkeypatch.setattr(submission, "_GRAPH_X", None)
+    monkeypatch.setattr(submission, "_GRAPH_OUTPUT", None)
+    monkeypatch.setattr(submission, "_GRAPH_DATA", None)
+    monkeypatch.setattr(submission, "_GRAPH_PARTIALS", None)
+    monkeypatch.setattr(submission, "_GRAPH_N", 0)
+    monkeypatch.setattr(submission, "_GRAPH_REPLAY", None)
+    monkeypatch.setattr(submission, "_GRAPH_RESULT", None)
+
+    output = torch.empty(1, dtype=torch.float32)
+    result = submission.custom_kernel((torch.ones(4, dtype=torch.float32), output))
+    cached_partials = submission._PARTIALS
+    result_again = submission.custom_kernel((torch.ones(4, dtype=torch.float32), output))
+
+    assert result.shape == torch.Size([])
+    assert result.item() == pytest.approx(3.0)
+    assert result_again.shape == torch.Size([])
+    assert result_again.item() == pytest.approx(3.0)
+    assert submission._PARTIALS is cached_partials
+
+
+def test_submission_does_not_capture_graph_for_new_output(monkeypatch):
+    import importlib
+    import math
+    import types
+
+    submission = importlib.import_module("submission")
+
+    class FakeDevice:
+        type = "cuda"
+        index = 0
+
+    class FakeTensor:
+        def __init__(self, name, numel=1):
+            self.name = name
+            self.device = FakeDevice()
+            self.value = 0.0
+            self._numel = numel
+
+        def numel(self):
+            return self._numel
+
+        def reshape(self, *args):
+            return self
+
+        def __getitem__(self, index):
+            return self
+
+    class FakeTriton:
+        @staticmethod
+        def cdiv(a, b):
+            return math.ceil(a / b)
+
+        @staticmethod
+        def next_power_of_2(value):
+            return 1 << (value - 1).bit_length()
+
+    class FakePartialKernel:
+        def __getitem__(self, grid):
+            return self
+
+        def __call__(self, *args, **kwargs):
+            return None
+
+    class FakeFinalKernel:
+        def __getitem__(self, grid):
+            return self
+
+        def __call__(self, partials, output, *args, **kwargs):
+            output.value = 3.0
+
+    class FakeGraph:
+        captures = 0
+
+        def __init__(self):
+            FakeGraph.captures += 1
+
+        def replay(self):
+            return None
+
+    class FakeGraphContext:
+        def __init__(self, graph):
+            self.graph = graph
+
+        def __enter__(self):
+            return self.graph
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(submission, "triton", FakeTriton)
+    monkeypatch.setattr(submission, "_partial_sum_kernel", FakePartialKernel())
+    monkeypatch.setattr(submission, "_final_sum_kernel", FakeFinalKernel())
+    monkeypatch.setattr(
+        submission.torch,
+        "empty",
+        lambda shape, device=None, dtype=None: FakeTensor(
+            "empty", shape[0] if isinstance(shape, tuple) else shape
+        ),
+    )
+    monkeypatch.setattr(
+        submission.torch,
+        "cuda",
+        types.SimpleNamespace(
+            CUDAGraph=FakeGraph,
+            graph=lambda graph: FakeGraphContext(graph),
+            synchronize=lambda: None,
+        ),
+    )
+
+    kernel = submission._make_custom_kernel()
+    x = FakeTensor("x", numel=4)
+    first_output = FakeTensor("first_output")
+    second_output = FakeTensor("second_output")
+
+    kernel((x, first_output))
+    kernel((x, second_output))
+
+    assert FakeGraph.captures == 0
+
+    kernel((x, second_output))
+
+    assert FakeGraph.captures == 1
+
+
+def test_vectorsum_v2_torch_benchmark_cpu_smoke():
+    result = run_vector_sum_benchmark(
+        backend="torch",
+        size=64,
+        dtype="fp32",
+        repeats=1,
+        warmup=0,
+        iters=1,
+        device_name="cpu",
+        allow_cpu=True,
+        arch_label="a100",
+    )
+
+    assert result["benchmark"] == "vectorsum_v2"
+    assert validate_result_protocol(result) == []
+    assert result["config"]["scope"] == "vector_sum"
+    assert result["config"]["backend"] == "torch"
+    assert result["config"]["shape"] == {"size": 64}
+    assert result["env"]["gpu_class"] == "a100"
+    assert result["correctness"]["finite_output"] is True
+    assert result["correctness"]["matches_reference"] is True
+    assert result["correctness"]["output_shape"] == [1]
+    assert result["metrics"]["elements"] == 64
+    assert result["metrics"]["latency"]["mean_ms"] > 0
 
 
 def test_marlin_int4_pack_round_trip_odd_columns():
@@ -885,7 +1128,75 @@ from swordfish.runner.ncu_summary import (  # noqa: E402
 )
 
 
-_FIXTURES_DIR = Path(__file__).parent.parent / "runs" / "airun" / "week1"
+def _write_ncu_gemm_fixture(tmp_path: Path, name: str, top_kernel: str) -> Path:
+    """Write a small long-form NCU CSV shaped like the real GEMM captures.
+
+    The real week-1 NCU CSVs are large run artifacts and are intentionally not
+    required for unit tests. This fixture preserves the contracts the parser
+    needs to support: multiple invocations per kernel, canonical metric names,
+    cuBLAS-style kernel names, and a dominant matmul kernel.
+    """
+
+    path = tmp_path / name
+    rows = [
+        [
+            '"ID"',
+            '"Kernel Name"',
+            '"Block Size"',
+            '"Grid Size"',
+            '"Metric Name"',
+            '"Metric Unit"',
+            '"Metric Value"',
+        ]
+    ]
+
+    def add_invocation(
+        inv_id: int,
+        kernel: str,
+        *,
+        duration_ns: float,
+        sm: float,
+        mem: float,
+        dram: float,
+        block: str = "(384,1,1)",
+        grid: str = "(2,66,1)",
+    ) -> None:
+        for metric, unit, value in [
+            ("gpu__time_duration.sum", "ns", duration_ns),
+            ("sm__throughput.avg.pct_of_peak_sustained_elapsed", "%", sm),
+            ("gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed", "%", mem),
+            ("dram__throughput.avg.pct_of_peak_sustained_elapsed", "%", dram),
+        ]:
+            rows.append(
+                [
+                    f'"{inv_id}"',
+                    f'"{kernel}"',
+                    f'"{block}"',
+                    f'"{grid}"',
+                    f'"{metric}"',
+                    f'"{unit}"',
+                    f'"{value}"',
+                ]
+            )
+
+    add_invocation(0, top_kernel, duration_ns=1_000_000, sm=90.0, mem=70.0, dram=16.0)
+    add_invocation(1, top_kernel, duration_ns=1_010_000, sm=91.0, mem=71.0, dram=15.0)
+    add_invocation(2, top_kernel, duration_ns=990_000, sm=89.0, mem=69.0, dram=17.0)
+    add_invocation(
+        3, "at::vectorized_elementwise_kernel", duration_ns=3_000, sm=20, mem=72, dram=72
+    )
+    add_invocation(4, "at::reduce_kernel", duration_ns=2_000, sm=18, mem=75, dram=75)
+    add_invocation(
+        5,
+        "at::distribution_elementwise_grid_stride_kernel",
+        duration_ns=1_000,
+        sm=74,
+        mem=12,
+        dram=3,
+    )
+
+    path.write_text("\n".join(",".join(row) for row in rows))
+    return path
 
 
 def test_short_name_strips_void_return_type_and_template_args():
@@ -930,46 +1241,64 @@ def test_percentile_linear_interpolation_matches_numpy_default():
     assert _percentile([1.0, 2.0, 3.0, 4.0], 50) == 2.5
 
 
-def test_parse_ncu_csv_full_against_h100_gemm_fixture():
-    """The H100 GEMM fixture: 9 kernels, 309 invocations, 1236 metric rows.
-
-    cuBLAS-via-nvjet should dominate (~99% of time) at ~90% SM throughput.
-    These numbers are stable across re-runs of the bench in week 1.
-    """
-    summary = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv")
-    assert summary.rows == 1236
-    assert summary.unique_kernels == 9
-    assert summary.total_invocations == 309
+def test_parse_ncu_csv_full_against_h100_gemm_fixture(tmp_path):
+    """cuBLAS-via-nvjet should dominate at roughly 90% SM throughput."""
+    csv_path = _write_ncu_gemm_fixture(
+        tmp_path,
+        "torch-gemm-h100.ncu.csv",
+        "nvjet_hsh_128x256_64x4_2x1_v_bz_coopA_NNN",
+    )
+    summary = parse_ncu_csv_full(csv_path)
+    assert summary.rows == 24
+    assert summary.unique_kernels == 4
+    assert summary.total_invocations == 6
     assert summary.total_time_ns > 0
     # Top kernel must be the cuBLAS H100 SXM5 SGEMM and ~99% of time.
     top = summary.kernels[0]
     assert top.short_name.startswith("nvjet_hsh_")
-    assert top.invocations == 300
+    assert top.invocations == 3
     pct_top = top.total_time_ns / summary.total_time_ns
     assert pct_top > 0.99, f"expected nvjet to dominate; got {pct_top:.2%}"
     # Per-metric SoL means must be in the right ballpark.
     sm = top.metrics["sm__throughput.avg.pct_of_peak_sustained_elapsed"]
     assert 80 < sm.mean < 100
-    assert sm.samples == 300
+    assert sm.samples == 3
 
 
-def test_parse_ncu_csv_full_against_a100_gemm_fixture():
+def test_parse_ncu_csv_full_against_a100_gemm_fixture(tmp_path):
     """A100 GEMM: dominated by `ampere_fp16_s16816gemm_*` (cuBLAS pre-Hopper)."""
-    summary = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-a100.ncu.csv")
-    assert summary.rows == 1236
+    csv_path = _write_ncu_gemm_fixture(
+        tmp_path,
+        "torch-gemm-a100.ncu.csv",
+        "ampere_fp16_s16816gemm_fp16_256x128_ldg8_f2f_stages_32x3_nn",
+    )
+    summary = parse_ncu_csv_full(csv_path)
+    assert summary.rows == 24
     top = summary.kernels[0]
     assert "ampere" in top.short_name and "gemm" in top.short_name
-    assert top.invocations == 300
+    assert top.invocations == 3
 
 
-def test_parse_ncu_csv_full_against_h200_gemm_fixture_uses_different_nvjet_variant():
+def test_parse_ncu_csv_full_against_h200_gemm_fixture_uses_different_nvjet_variant(tmp_path):
     """H200 picks a different cuBLAS tile shape than H100 (256x128 vs 128x256).
 
     This test exists because catching that difference is exactly the kind of
     insight the tool is supposed to enable.
     """
-    h100 = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv")
-    h200 = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h200.ncu.csv")
+    h100 = parse_ncu_csv_full(
+        _write_ncu_gemm_fixture(
+            tmp_path,
+            "torch-gemm-h100.ncu.csv",
+            "nvjet_hsh_128x256_64x4_2x1_v_bz_coopA_NNN",
+        )
+    )
+    h200 = parse_ncu_csv_full(
+        _write_ncu_gemm_fixture(
+            tmp_path,
+            "torch-gemm-h200.ncu.csv",
+            "nvjet_hsh_256x128_64x4_1x2_h_bz_coopA_NNT",
+        )
+    )
     h100_top = h100.kernels[0].short_name
     h200_top = h200.kernels[0].short_name
     assert h100_top.startswith("nvjet_hsh_") and h200_top.startswith("nvjet_hsh_")
@@ -1034,19 +1363,25 @@ def test_parse_ncu_csv_full_pivots_multiple_invocations_into_one_kernel_row(tmp_
     assert sm.max == 70.0
 
 
-def test_format_summary_text_renders_top_n_table_and_truncation_notice():
-    summary = parse_ncu_csv_full(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv")
+def test_format_summary_text_renders_top_n_table_and_truncation_notice(tmp_path):
+    summary = parse_ncu_csv_full(
+        _write_ncu_gemm_fixture(
+            tmp_path,
+            "torch-gemm-h100.ncu.csv",
+            "nvjet_hsh_128x256_64x4_2x1_v_bz_coopA_NNN",
+        )
+    )
     out = format_summary_text(summary, top_n=3)
     # Header lines.
     assert "NCU summary:" in out
-    assert "rows=1236" in out
-    assert "unique_kernels=9" in out
+    assert "rows=24" in out
+    assert "unique_kernels=4" in out
     # Column header.
     assert "kernel" in out and "SM%" in out and "DRAM%" in out
     # Top kernel rendered.
     assert "nvjet_hsh_" in out
-    # Truncation notice for the 6 kernels not shown.
-    assert "6 more kernels not shown" in out
+    # Truncation notice for the 1 kernel not shown.
+    assert "1 more kernels not shown" in out
 
 
 def test_format_summary_text_handles_empty_summary_gracefully(tmp_path):
@@ -1063,23 +1398,28 @@ def test_format_summary_text_handles_empty_summary_gracefully(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_ncu_summary_cli_prints_table_and_returns_zero(capsys):
+def test_ncu_summary_cli_prints_table_and_returns_zero(tmp_path, capsys):
     from swordfish.runner import cli
 
+    csv_path = _write_ncu_gemm_fixture(
+        tmp_path,
+        "torch-gemm-h100.ncu.csv",
+        "nvjet_hsh_128x256_64x4_2x1_v_bz_coopA_NNN",
+    )
     rc = cli.main(
         [
             "ncu-summary",
-            str(_FIXTURES_DIR / "torch-gemm-h100.ncu.csv"),
+            str(csv_path),
             "--top",
-            "5",
+            "3",
         ]
     )
     out = capsys.readouterr().out
     assert rc == 0
     assert "NCU summary:" in out
     assert "nvjet_hsh_" in out
-    # --top 5 means 4 kernels not shown (9 total).
-    assert "4 more kernels not shown" in out
+    # --top 3 means 1 kernel not shown (4 total).
+    assert "1 more kernels not shown" in out
 
 
 def test_ncu_summary_cli_returns_nonzero_on_unparseable_csv(tmp_path, capsys):

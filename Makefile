@@ -63,6 +63,8 @@ RUNE_PVC ?= training-nfs
 RUNE_IMAGE_REF ?= voiceagentcr.azurecr.io/swordfish-bench:latest
 RUNE_RELEASE_TAG ?= rune-cli-v0.2.0
 RUNE_REPO ?= azure-management-and-platforms/aks-ai-runtime
+KUBE_CONTEXT ?=
+GPU_OPERATOR_NAMESPACE ?= gpu-operator
 GITHUB_HOST ?= github.com
 RUNE_PY_SPEC ?= rune-py @ git+https://github.com/azure-management-and-platforms/aks-ai-runtime.git@$(RUNE_RELEASE_TAG)\#subdirectory=applications/rune-py
 SUBMIT_BENCH = uv run python -m swordfish.runner submit-bench \
@@ -76,7 +78,8 @@ SUBMIT_BENCH = uv run python -m swordfish.runner submit-bench \
         rune-submit-gemm-matrix \
         rune-submit-liger-rmsnorm-a100 rune-submit-liger-swiglu-a100 \
         rune-submit-liger-fsdp-a100-baseline rune-submit-liger-fsdp-a100-liger \
-        rune-convert-ncu
+        rune-convert-ncu \
+        airun-a100-ncu-status airun-a100-ncu-pause airun-a100-ncu-restore
 
 rune-profiles:
 	uv run python -m swordfish.runner generate-rune-profiles --out $(RUNE_PROFILE_PACK)
@@ -92,6 +95,21 @@ rune-install-profiles: rune-profiles-check
 	@echo "rune profiles installed under $(RUNE_PROFILES_DIR)/"
 	@echo "verify with: rune profile list"
 	@echo "expected: 4 swordfish-bench-* and 4 swordfish-fsdp-* profiles"
+
+airun-a100-ncu-status:
+	uv run python -m swordfish.runner a100-ncu-window status \
+		--namespace $(GPU_OPERATOR_NAMESPACE) \
+		$(if $(KUBE_CONTEXT),--context $(KUBE_CONTEXT),)
+
+airun-a100-ncu-pause:
+	uv run python -m swordfish.runner a100-ncu-window pause \
+		--namespace $(GPU_OPERATOR_NAMESPACE) \
+		$(if $(KUBE_CONTEXT),--context $(KUBE_CONTEXT),)
+
+airun-a100-ncu-restore:
+	uv run python -m swordfish.runner a100-ncu-window restore \
+		--namespace $(GPU_OPERATOR_NAMESPACE) \
+		$(if $(KUBE_CONTEXT),--context $(KUBE_CONTEXT),)
 
 rune-submit-gemm-a100:
 	$(SUBMIT_BENCH) --workload gemm --arch a100 \

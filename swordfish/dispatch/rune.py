@@ -27,6 +27,10 @@ class RuneCommandError(RuntimeError):
         )
 
 
+class RuneProfileSecurityError(RuntimeError):
+    """Raised when the local rune binary drops profile-required pod security."""
+
+
 @dataclass(frozen=True)
 class RuneSubmitResult:
     name: str
@@ -147,10 +151,13 @@ class RuneSubmit:
         """
         from swordfish.dispatch.topology import topology_policy_env
 
-        args = self.to_args(dry_run=dry_run)
         env = {**os.environ, **self.env}
         if auto_topology_policy:
             env.update(topology_policy_env())
+        if dry_run is None and _requires_sys_admin_ncu_guard(self):
+            self._preflight_sys_admin_ncu(env=env)
+
+        args = self.to_args(dry_run=dry_run)
         proc = subprocess.run(
             args,
             text=True,
@@ -169,3 +176,30 @@ class RuneSubmit:
             stdout=proc.stdout,
             stderr=proc.stderr,
         )
+
+    def _preflight_sys_admin_ncu(self, *, env: dict[str, str]) -> None:
+        args = self.to_args(dry_run="client")
+        proc = subprocess.run(
+            args,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=env,
+        )
+        if proc.returncode != 0:
+            raise RuneCommandError(args, proc.returncode, proc.stdout, proc.stderr)
+        rendered = proc.stdout
+        if "securityContext:" not in rendered or "SYS_ADMIN" not in rendered:
+            raise RuneProfileSecurityError(
+                "A100 NCU requires container securityContext.capabilities.add=[SYS_ADMIN], "
+                f"but {self.rune_bin} dry-run did not render it for profile {self.profile!r}. "
+                "Rebuild/install a Rune binary that supports profile spec.runtime.securityContext "
+                "before submitting, otherwise Nsight Compute fails with ERR_NVGPUCTRPERM."
+            )
+
+
+def _requires_sys_admin_ncu_guard(run: RuneSubmit) -> bool:
+    return (
+        run.profile_mode == "ncu" and run.profile is not None and run.profile.endswith("-a100-ncu")
+    )

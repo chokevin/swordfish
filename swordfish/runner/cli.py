@@ -9,7 +9,9 @@ from pathlib import Path
 
 from swordfish.dispatch import (
     LigerPerkernelRun,
+    ResultFetchError,
     TorchGemmRun,
+    VectorSumRun,
     build_run_for_experiment,
     format_experiment_explain,
     format_experiment_table,
@@ -19,6 +21,13 @@ from swordfish.dispatch.profiles import PACK_YAML_PATH, render_pack_yaml
 from swordfish.quant.marlin_triton import run_w4a16_benchmark, write_w4a16_result
 from swordfish.runner.backends import available_gemm_backends
 from swordfish.runner.compare import write_results_comparison
+from swordfish.runner.dcgm_window import (
+    DcgmWindowError,
+    dcgm_window_status,
+    format_dcgm_status,
+    pause_a100_dcgm,
+    restore_dcgm,
+)
 from swordfish.runner.index import write_result_index
 from swordfish.runner.liger_perkernel import (
     DEFAULT_DTYPE as LIGER_DEFAULT_DTYPE,
@@ -41,7 +50,14 @@ from swordfish.runner.profile_torch import (
 from swordfish.runner.schema import attach_ncu_summary
 from swordfish.runner.status import write_completion_report
 from swordfish.runner.torch_gemm import run_gemm_benchmark, write_result
+from swordfish.runner.trace_bundle import bundle_traces, parse_trace_job_spec
 from swordfish.runner.upstream import TARGET_LABELS, write_upstream_packet
+from swordfish.runner.vector_sum import (
+    DEFAULT_BLOCK_SIZE as VECTOR_SUM_DEFAULT_BLOCK_SIZE,
+    VECTOR_SUM_BENCHMARK_SIZES,
+    available_vector_sum_backends,
+    run_vector_sum_benchmark,
+)
 from swordfish.transformer.bench import (
     run_transformer_forward_benchmark,
     run_transformer_train_step_benchmark,
@@ -65,6 +81,28 @@ def _cmd_run_gemm(args: argparse.Namespace) -> int:
             seed=args.seed,
             ncu_csv=args.ncu_csv,
             backend=args.backend,
+        )
+    result["command"] = argv
+    write_result(result, args.out)
+    print(f"wrote {args.out}", file=sys.stderr)
+    return 0
+
+
+def _cmd_bench_vector_sum(args: argparse.Namespace) -> int:
+    argv = sys.argv if args.argv is None else args.argv
+    with torch_profiler_context(resolve_torch_profile_out()):
+        result = run_vector_sum_benchmark(
+            backend=args.backend,
+            size=args.size,
+            dtype=args.dtype,
+            repeats=args.repeats,
+            warmup=args.warmup,
+            iters=args.iters,
+            device_name=args.device,
+            allow_cpu=args.allow_cpu,
+            arch_label=args.arch_label,
+            seed=args.seed,
+            block_size=args.block_size,
         )
     result["command"] = argv
     write_result(result, args.out)
@@ -119,6 +157,10 @@ def _cmd_run_liger_fsdp_step(args: argparse.Namespace) -> int:
             weight_decay=args.weight_decay,
             gradient_checkpointing=args.gradient_checkpointing,
             profile_steady_state=args.profile_steady_state,
+            fsdp_wrap_policy=args.fsdp_wrap_policy,
+            fsdp_backward_prefetch=args.fsdp_backward_prefetch,
+            fsdp_forward_prefetch=args.fsdp_forward_prefetch,
+            fsdp_limit_all_gathers=args.fsdp_limit_all_gathers,
         )
     if result is None:
         return 0
@@ -311,6 +353,20 @@ def _build_submit_run(args: argparse.Namespace):
             profile_mode=args.profile_mode,
             **common,
         )
+    if args.workload == "vectorsum-v2":
+        return VectorSumRun(
+            arch=args.arch,
+            backend=args.backend,
+            size=args.size,
+            dtype=args.dtype or "fp32",
+            repeats=repeats,
+            warmup=warmup,
+            iters=iters,
+            name=args.name,
+            profile_mode=args.profile_mode,
+            block_size=args.block_size,
+            **common,
+        )
     if args.workload == "liger-fsdp":
         repeats = args.repeats if args.repeats is not None else 3
         warmup = args.warmup if args.warmup is not None else 1
@@ -333,6 +389,10 @@ def _build_submit_run(args: argparse.Namespace):
             profile_mode=args.profile_mode,
             gradient_checkpointing=args.gradient_checkpointing,
             profile_steady_state=args.profile_steady_state,
+            fsdp_wrap_policy=args.fsdp_wrap_policy,
+            fsdp_backward_prefetch=args.fsdp_backward_prefetch,
+            fsdp_forward_prefetch=args.fsdp_forward_prefetch,
+            fsdp_limit_all_gathers=args.fsdp_limit_all_gathers,
             **common,
         )
     kernel = "rmsnorm" if args.workload == "liger-rmsnorm" else "swiglu"
@@ -361,6 +421,8 @@ def _cmd_submit_bench(args: argparse.Namespace) -> int:
 def _experiment_overrides(args: argparse.Namespace) -> dict[str, object]:
     keys = (
         "backend",
+        "size",
+        "block_size",
         "m",
         "n",
         "k",
@@ -373,11 +435,18 @@ def _experiment_overrides(args: argparse.Namespace) -> dict[str, object]:
         "micro_batch_size",
         "seq_len",
         "gradient_checkpointing",
+        "profile_steady_state",
+        "fsdp_wrap_policy",
+        "fsdp_backward_prefetch",
+        "fsdp_forward_prefetch",
+        "fsdp_limit_all_gathers",
         "nproc_per_node",
         "name",
         "profile_mode",
         "result_root",
         "script",
+        "context",
+        "image",
     )
     out: dict[str, object] = {}
     for key in keys:
@@ -668,6 +737,63 @@ def _cmd_convert_ncu(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bundle_traces(args: argparse.Namespace) -> int:
+    try:
+        jobs = [
+            parse_trace_job_spec(raw, default_profile_mode=args.profile_mode) for raw in args.jobs
+        ]
+        result = bundle_traces(
+            jobs,
+            bundle_name=args.bundle_name,
+            local_root=args.local_root,
+            namespace=args.namespace,
+            context=args.context,
+            pvc=args.pvc,
+            rune_bin=args.rune_bin,
+            overwrite=args.overwrite,
+            create_archive=args.create_archive,
+        )
+    except (ValueError, ResultFetchError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2 if isinstance(exc, ValueError) else 1
+
+    print(f"bundle dir:  {result.bundle_dir}", file=sys.stderr)
+    print(f"manifest:    {result.manifest_path}", file=sys.stderr)
+    if result.archive_path:
+        print(f"archive:     {result.archive_path}", file=sys.stderr)
+    return 0
+
+
+def _cmd_a100_ncu_window(args: argparse.Namespace) -> int:
+    try:
+        common = {
+            "context": args.context,
+            "namespace": args.namespace,
+            "daemonset": args.daemonset,
+        }
+        if args.action == "status":
+            status = dcgm_window_status(
+                **common,
+                app_label=args.app_label,
+                a100_selector=args.a100_selector,
+            )
+        elif args.action == "pause":
+            status = pause_a100_dcgm(
+                **common,
+                app_label=args.app_label,
+                a100_selector=args.a100_selector,
+                timeout_seconds=args.timeout_seconds,
+            )
+        else:
+            status = restore_dcgm(**common, timeout_seconds=args.timeout_seconds)
+    except DcgmWindowError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+    print(format_dcgm_status(status))
+    return 0
+
+
 def _cmd_generate_rune_profiles(args: argparse.Namespace) -> int:
     rendered = render_pack_yaml()
     out: Path = args.out
@@ -710,6 +836,36 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--ncu-csv", type=Path, default=None)
     run.add_argument("--out", type=Path, required=True)
     run.set_defaults(func=_cmd_run_gemm)
+
+    vector_sum = sub.add_parser(
+        "bench-vectorsum",
+        help="run one vectorsum_v2 reduction benchmark",
+    )
+    vector_sum.add_argument(
+        "--backend",
+        choices=available_vector_sum_backends(),
+        default="torch",
+    )
+    vector_sum.add_argument(
+        "--size",
+        type=int,
+        default=VECTOR_SUM_BENCHMARK_SIZES[0],
+        help="1D tensor size; benchmark target sizes are "
+        + ", ".join(str(size) for size in VECTOR_SUM_BENCHMARK_SIZES),
+    )
+    vector_sum.add_argument("--dtype", choices=["fp16", "bf16", "fp32"], default="fp32")
+    vector_sum.add_argument("--repeats", type=int, default=5)
+    vector_sum.add_argument("--warmup", type=int, default=10)
+    vector_sum.add_argument("--iters", type=int, default=50)
+    vector_sum.add_argument("--device", default="auto")
+    vector_sum.add_argument(
+        "--allow-cpu", action="store_true", help="allow CPU timing for local smoke tests"
+    )
+    vector_sum.add_argument("--arch-label", choices=["a100", "h100", "h200"], default=None)
+    vector_sum.add_argument("--seed", type=int, default=0)
+    vector_sum.add_argument("--block-size", type=int, default=VECTOR_SUM_DEFAULT_BLOCK_SIZE)
+    vector_sum.add_argument("--out", type=Path, required=True)
+    vector_sum.set_defaults(func=_cmd_bench_vector_sum)
 
     liger = sub.add_parser(
         "liger-perkernel",
@@ -780,6 +936,30 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="enable model gradient checkpointing (default: enabled)",
+    )
+    fsdp.add_argument(
+        "--fsdp-wrap-policy",
+        choices=["root", "transformer-block"],
+        default="root",
+        help="FSDP wrapping granularity: root preserves the original one-wrapper setup; "
+        "transformer-block wraps decoder blocks for communication overlap experiments",
+    )
+    fsdp.add_argument(
+        "--fsdp-backward-prefetch",
+        choices=["default", "backward-pre", "backward-post", "none"],
+        default="default",
+        help="FSDP backward prefetch policy override",
+    )
+    fsdp.add_argument(
+        "--fsdp-forward-prefetch",
+        action="store_true",
+        help="enable FSDP forward prefetch for static-graph overlap experiments",
+    )
+    fsdp.add_argument(
+        "--fsdp-limit-all-gathers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable FSDP all-gather rate limiting (default: enabled)",
     )
     fsdp.add_argument(
         "--nproc-per-node",
@@ -963,7 +1143,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument(
         "--workload",
-        choices=["gemm", "liger-rmsnorm", "liger-swiglu", "liger-fsdp"],
+        choices=["gemm", "vectorsum-v2", "liger-rmsnorm", "liger-swiglu", "liger-fsdp"],
         required=True,
     )
     submit.add_argument("--arch", choices=["a100", "h100", "h200"], required=True)
@@ -983,6 +1163,18 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument("--m", type=int, default=4096, help="GEMM only")
     submit.add_argument("--n", type=int, default=4096, help="GEMM only")
     submit.add_argument("--k", type=int, default=4096, help="GEMM only")
+    submit.add_argument(
+        "--size",
+        type=int,
+        default=VECTOR_SUM_BENCHMARK_SIZES[0],
+        help="vectorsum-v2 only: 1D tensor size",
+    )
+    submit.add_argument(
+        "--block-size",
+        type=int,
+        default=VECTOR_SUM_DEFAULT_BLOCK_SIZE,
+        help="vectorsum-v2 only: Triton block size",
+    )
     submit.add_argument(
         "--dtype",
         default=None,
@@ -1043,6 +1235,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="liger-fsdp only: enable model gradient checkpointing",
     )
     submit.add_argument(
+        "--fsdp-wrap-policy",
+        choices=["root", "transformer-block"],
+        default="root",
+        help="liger-fsdp only: FSDP wrapping granularity",
+    )
+    submit.add_argument(
+        "--fsdp-backward-prefetch",
+        choices=["default", "backward-pre", "backward-post", "none"],
+        default="default",
+        help="liger-fsdp only: FSDP backward prefetch policy override",
+    )
+    submit.add_argument(
+        "--fsdp-forward-prefetch",
+        action="store_true",
+        help="liger-fsdp only: enable FSDP forward prefetch",
+    )
+    submit.add_argument(
+        "--fsdp-limit-all-gathers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="liger-fsdp only: enable FSDP all-gather rate limiting",
+    )
+    submit.add_argument(
         "--nproc-per-node",
         type=int,
         default=8,
@@ -1058,9 +1273,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit.add_argument(
         "--backend",
-        choices=available_gemm_backends(),
+        choices=tuple(
+            sorted(set(available_gemm_backends()) | set(available_vector_sum_backends()))
+        ),
         default="torch",
-        help="GEMM only",
+        help="GEMM and vectorsum-v2 only",
     )
     submit.add_argument(
         "--result-root",
@@ -1101,6 +1318,16 @@ def build_parser() -> argparse.ArgumentParser:
     submit_exp.add_argument("--name", default=None, help="override generated job name")
     submit_exp.add_argument("--profile-mode", choices=["ncu", "nsys", "torch"], default=None)
     submit_exp.add_argument(
+        "--context",
+        default=None,
+        help="kubectl context for the rune submit invocation",
+    )
+    submit_exp.add_argument(
+        "--image",
+        default=None,
+        help="override the profile runtime image for the rune submit invocation",
+    )
+    submit_exp.add_argument(
         "--dry-run",
         choices=["client", "server"],
         default=None,
@@ -1114,6 +1341,8 @@ def build_parser() -> argparse.ArgumentParser:
     submit_exp.add_argument("--m", type=int, default=None, help="gemm only")
     submit_exp.add_argument("--n", type=int, default=None, help="gemm only")
     submit_exp.add_argument("--k", type=int, default=None, help="gemm only")
+    submit_exp.add_argument("--size", type=int, default=None, help="vectorsum-v2 only")
+    submit_exp.add_argument("--block-size", type=int, default=None, help="vectorsum-v2 only")
     submit_exp.add_argument(
         "--dtype",
         default=None,
@@ -1159,6 +1388,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="liger-fsdp only: enable model gradient checkpointing",
     )
     submit_exp.add_argument(
+        "--profile-steady-state",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "liger-fsdp only: bracket measured iterations with cudaProfilerStart/Stop; "
+            "when combined with --profile-mode nsys, capture excludes setup/warmup"
+        ),
+    )
+    submit_exp.add_argument(
+        "--fsdp-wrap-policy",
+        choices=["root", "transformer-block"],
+        default=None,
+        help="liger-fsdp only: FSDP wrapping granularity",
+    )
+    submit_exp.add_argument(
+        "--fsdp-backward-prefetch",
+        choices=["default", "backward-pre", "backward-post", "none"],
+        default=None,
+        help="liger-fsdp only: FSDP backward prefetch policy override",
+    )
+    submit_exp.add_argument(
+        "--fsdp-forward-prefetch",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="liger-fsdp only: enable FSDP forward prefetch",
+    )
+    submit_exp.add_argument(
+        "--fsdp-limit-all-gathers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="liger-fsdp only: enable FSDP all-gather rate limiting",
+    )
+    submit_exp.add_argument(
         "--nproc-per-node",
         type=int,
         default=None,
@@ -1166,9 +1428,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     submit_exp.add_argument(
         "--backend",
-        choices=available_gemm_backends(),
+        choices=tuple(
+            sorted(set(available_gemm_backends()) | set(available_vector_sum_backends()))
+        ),
         default=None,
-        help="gemm only",
+        help="gemm and vectorsum-v2 only",
     )
     submit_exp.add_argument(
         "--result-root",
@@ -1252,6 +1516,105 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip the heuristic optimization report (only print the per-kernel table)",
     )
     inspect.set_defaults(func=_cmd_inspect_run, open=True)
+
+    bundle = sub.add_parser(
+        "bundle-traces",
+        help="fetch result JSON + profile traces into runs/traces/<bundle>/ and "
+        "write a tar.gz handoff bundle for Mac/Hermes inspection",
+    )
+    bundle.add_argument(
+        "jobs",
+        nargs="+",
+        help="Rune job names to fetch; use NAME:PROFILE_MODE to fetch traces "
+        "(PROFILE_MODE is ncu, nsys, or torch)",
+    )
+    bundle.add_argument(
+        "--profile-mode",
+        choices=["ncu", "nsys", "torch"],
+        default=None,
+        help="default profile mode for jobs without a NAME:PROFILE_MODE suffix",
+    )
+    bundle.add_argument(
+        "--bundle-name",
+        default=None,
+        help="stable bundle directory/archive name (default: trace-YYYYmmdd-HHMMSS)",
+    )
+    bundle.add_argument(
+        "--local-root",
+        type=Path,
+        default=Path("runs/traces"),
+        help="local handoff root (default: runs/traces)",
+    )
+    bundle.add_argument(
+        "--namespace",
+        default="ray",
+        help="kubernetes namespace the jobs ran in (default: ray)",
+    )
+    bundle.add_argument(
+        "--context",
+        default=None,
+        help="kubectl context (default: current)",
+    )
+    bundle.add_argument(
+        "--pvc",
+        default="training-nfs",
+        help="PVC name containing profile artifacts (default: training-nfs)",
+    )
+    bundle.add_argument(
+        "--rune-bin",
+        default="rune",
+        help="rune binary to use for submit get (default: rune)",
+    )
+    bundle.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="re-fetch even when local copies already exist",
+    )
+    bundle.add_argument(
+        "--no-archive",
+        dest="create_archive",
+        action="store_false",
+        help="only write the expanded bundle directory, not the tar.gz archive",
+    )
+    bundle.set_defaults(func=_cmd_bundle_traces, create_archive=True)
+
+    a100_window = sub.add_parser(
+        "a100-ncu-window",
+        help="pause/restore the DCGM exporter A100 window required for A100 Nsight Compute",
+    )
+    a100_window.add_argument("action", choices=["status", "pause", "restore"])
+    a100_window.add_argument(
+        "--context",
+        default=None,
+        help="kubectl context (default: current)",
+    )
+    a100_window.add_argument(
+        "--namespace",
+        default="gpu-operator",
+        help="GPU operator namespace (default: gpu-operator)",
+    )
+    a100_window.add_argument(
+        "--daemonset",
+        default="nvidia-dcgm-exporter",
+        help="DCGM exporter DaemonSet name (default: nvidia-dcgm-exporter)",
+    )
+    a100_window.add_argument(
+        "--app-label",
+        default="app=nvidia-dcgm-exporter",
+        help="label selector for DCGM exporter pods (default: app=nvidia-dcgm-exporter)",
+    )
+    a100_window.add_argument(
+        "--a100-selector",
+        default="nvidia.com/gpu.product=NVIDIA-A100-SXM4-80GB",
+        help="node selector identifying target A100 nodes",
+    )
+    a100_window.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=600,
+        help="pause/restore wait timeout (default: 600)",
+    )
+    a100_window.set_defaults(func=_cmd_a100_ncu_window)
 
     ncu_summary = sub.add_parser(
         "ncu-summary",

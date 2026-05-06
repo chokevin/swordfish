@@ -133,20 +133,30 @@ from A100 nodes. The rendered Job included `securityContext.capabilities.add:
 When A100 NCU profiling is needed:
 
 1. Confirm the benchmark can run normally without profiling.
-2. Temporarily patch `nvidia-dcgm-exporter` so it does not schedule on
-   `gpu=a100` nodes.
-3. Wait until no `nvidia-dcgm-exporter-*` pods are running on the target A100
-   nodes.
-4. Run `make airun-a100-ncu-preflight`; it should fail if a running DCGM exporter
-   pod is still on a Ready target A100 node or if the A100 arch config lacks
-   `SYS_ADMIN`.
-5. Run the NCU benchmark job through a dedicated A100 NCU profile
+2. Use the repo helper to open the A100 profiling window:
+
+   ```bash
+   make airun-a100-ncu-pause KUBE_CONTEXT=voice-agent-flex
+   ```
+
+   This patches `nvidia-dcgm-exporter` away from A100 nodes and deletes any
+   already-running A100 exporter pods so the DaemonSet does not keep querying
+   the profiling metric groups during Nsight Compute.
+3. Run `make airun-a100-ncu-status KUBE_CONTEXT=voice-agent-flex`; it should
+   show no A100 exporter pods.
+4. Run the NCU benchmark job through a dedicated A100 NCU profile
    (`swordfish-bench-a100-ncu` for one-GPU jobs or `swordfish-fsdp-a100-ncu` for
    8-GPU jobs). The normal dispatch path selects these automatically for
    `--arch a100 --profile-mode ncu`.
-6. Copy the final JSON/CSV artifacts locally.
-7. Restore the DaemonSet immediately and confirm `rollout status
-   ds/nvidia-dcgm-exporter` succeeds.
+5. Copy or bundle the final JSON/trace artifacts locally.
+6. Restore the DaemonSet immediately:
+
+   ```bash
+   make airun-a100-ncu-restore KUBE_CONTEXT=voice-agent-flex
+   ```
+
+   Confirm the status reaches the expected ready count before leaving the
+   window unattended.
 
 Do not leave DCGM disabled after profiling. The permanent lesson is that A100
 NCU and DCGM exporter profiling groups contend for the same driver profiling

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import tarfile
 import tempfile
 from pathlib import Path
 
@@ -13,9 +15,11 @@ from swordfish.dispatch import (
     LigerFsdpRun,
     LigerPerkernelMatrix,
     LigerPerkernelRun,
+    RuneProfileSecurityError,
     RuneSubmit,
     RuneSubmitGetMissingAnnotationsError,
     TorchGemmRun,
+    VectorSumRun,
     build_run_for_experiment,
     fetch_via_rune_submit_get,
     list_experiments,
@@ -114,6 +118,57 @@ def test_rune_submit_rejects_reserved_container_env_keys():
 def test_rune_submit_rejects_unknown_profile_mode():
     with pytest.raises(ValueError, match="profile_mode"):
         RuneSubmit(name="j", preset="p", script="s.sh", profile_mode="vtune")
+
+
+def test_a100_ncu_submit_preflights_sys_admin_security_context(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(args, **_kwargs):
+        calls.append(list(args))
+
+        class P:
+            returncode = 0
+            stdout = "securityContext:\n  capabilities:\n    add:\n    - SYS_ADMIN\n"
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    run = RuneSubmit(
+        name="a100-ncu",
+        profile="swordfish-bench-a100-ncu",
+        script="bench.sh",
+        profile_mode="ncu",
+    )
+
+    result = run.submit()
+
+    assert result.submitted
+    assert len(calls) == 2
+    assert calls[0][-1] == "client"
+    assert "--dry-run" in calls[0]
+    assert "--dry-run" not in calls[1]
+
+
+def test_a100_ncu_submit_blocks_when_rune_drops_sys_admin(monkeypatch):
+    def fake_run(args, **_kwargs):
+        class P:
+            returncode = 0
+            stdout = "apiVersion: batch/v1\nkind: Job\n"
+            stderr = ""
+
+        return P()
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    run = RuneSubmit(
+        name="a100-ncu",
+        profile="swordfish-bench-a100-ncu",
+        script="bench.sh",
+        profile_mode="ncu",
+    )
+
+    with pytest.raises(RuneProfileSecurityError, match="SYS_ADMIN"):
+        run.submit()
 
 
 def test_liger_perkernel_run_defaults_to_swordfish_profile_pack():
@@ -324,6 +379,43 @@ def test_torch_gemm_run_profile_mode_ncu_still_uses_rune_native():
     assert not any(e.startswith("SWORDFISH_PROFILE=") for e in env_args)
 
 
+def test_vector_sum_run_defaults_to_triton_profile_and_unique_output():
+    run = VectorSumRun(arch="a100", size=52_428_800)
+    submit = run.to_rune_submit()
+
+    assert run.resolved_name == "sf-vectorsum-v2-triton-52428800-a100"
+    assert submit.profile == "swordfish-bench-a100"
+    assert submit.output == "/data/swordfish/week1/vectorsum-v2/triton-52428800-a100.json"
+    assert "--gpu-class" in submit.extra_args
+    assert "a100-nvlink-80gb" in submit.extra_args
+
+
+def test_vector_sum_run_forwarded_args_include_reduction_contract():
+    run = VectorSumRun(arch="h200", backend="torch", size=1_638_400, block_size=2048)
+    forwarded = run.forwarded_args
+
+    assert forwarded[0] == "bench-vectorsum"
+    assert "--backend" in forwarded
+    assert forwarded[forwarded.index("--backend") + 1] == "torch"
+    assert "--size" in forwarded
+    assert forwarded[forwarded.index("--size") + 1] == "1638400"
+    assert "--block-size" in forwarded
+    assert forwarded[forwarded.index("--block-size") + 1] == "2048"
+    assert "--arch-label" in forwarded
+    assert "h200" in forwarded
+
+
+def test_vector_sum_run_profile_mode_torch_uses_in_process_profiler():
+    run = VectorSumRun(arch="a100", profile_mode="torch")
+    submit = run.to_rune_submit()
+    args = submit.to_args()
+
+    assert "--profile-mode" not in args
+    env_args = [args[i + 1] for i, a in enumerate(args) if a == "--env"]
+    assert "SWORDFISH_PROFILE=torch" in env_args
+    assert any(e.endswith("/profile/profile.json") for e in env_args)
+
+
 def test_liger_perkernel_run_profile_mode_allows_custom_script():
     """The 'profile_mode only with default bench script' restriction is gone:
     rune wraps any cmd at the renderer level, so custom scripts work."""
@@ -384,6 +476,24 @@ def test_liger_fsdp_run_forwarded_args_include_torchrun_contract():
     assert "/data/swordfish/week1/liger-fsdp/llama3-8b-liger-a100.json" in forwarded
 
 
+def test_liger_fsdp_run_custom_name_uses_unique_output_path():
+    run = LigerFsdpRun(
+        arch="a100",
+        mode="liger",
+        name="sf-fsdp-liger-knob-tb-no-limit-05031248-a100",
+        fsdp_wrap_policy="transformer-block",
+        fsdp_limit_all_gathers=False,
+    )
+    submit = run.to_rune_submit()
+
+    assert (
+        run.out_path
+        == "/data/swordfish/week1/liger-fsdp/sf-fsdp-liger-knob-tb-no-limit-05031248-a100.json"
+    )
+    assert submit.output == run.out_path
+    assert run.out_path in run.forwarded_args
+
+
 def test_liger_fsdp_run_to_command_renders_dry_run():
     run = LigerFsdpRun(arch="h100", mode="baseline", name="fsdp_smoke")
     cmd = run.to_command(dry_run="client")
@@ -430,6 +540,25 @@ def test_liger_fsdp_run_profile_steady_state_sets_runner_and_nsys_capture_env():
     assert "NSYS_CAPTURE_RANGE_END=stop" in env_args
 
 
+def test_liger_fsdp_run_forwarded_args_include_fsdp_overlap_knobs():
+    run = LigerFsdpRun(
+        arch="a100",
+        mode="liger",
+        fsdp_wrap_policy="transformer-block",
+        fsdp_backward_prefetch="backward-post",
+        fsdp_forward_prefetch=True,
+        fsdp_limit_all_gathers=False,
+    )
+    forwarded = run.forwarded_args
+
+    assert "--fsdp-wrap-policy" in forwarded
+    assert forwarded[forwarded.index("--fsdp-wrap-policy") + 1] == "transformer-block"
+    assert "--fsdp-backward-prefetch" in forwarded
+    assert forwarded[forwarded.index("--fsdp-backward-prefetch") + 1] == "backward-post"
+    assert "--fsdp-forward-prefetch" in forwarded
+    assert "--no-fsdp-limit-all-gathers" in forwarded
+
+
 # ---------------------------------------------------------------------------
 # experiment registry
 # ---------------------------------------------------------------------------
@@ -438,8 +567,15 @@ def test_liger_fsdp_run_profile_steady_state_sets_runner_and_nsys_capture_env():
 def test_experiment_registry_lists_current_workloads():
     specs = {spec.name: spec for spec in list_experiments()}
 
-    assert set(specs) == {"gemm", "liger-fsdp", "liger-rmsnorm", "liger-swiglu"}
+    assert set(specs) == {
+        "gemm",
+        "vectorsum-v2",
+        "liger-fsdp",
+        "liger-rmsnorm",
+        "liger-swiglu",
+    }
     assert specs["gemm"].profile_family == "bench"
+    assert specs["vectorsum-v2"].profile_family == "bench"
     assert specs["liger-fsdp"].profile_family == "fsdp"
 
 
@@ -469,11 +605,71 @@ def test_build_run_for_experiment_uses_resolved_profile():
     assert run.m == 1024 and run.n == 2048 and run.k == 4096
 
 
+def test_build_run_for_vectorsum_experiment_uses_bench_profile_and_overrides():
+    run = build_run_for_experiment(
+        "vectorsum-v2",
+        "h200",
+        {
+            "backend": "triton",
+            "size": 52_428_800,
+            "dtype": "fp32",
+            "block_size": 2048,
+        },
+    )
+    submit = run.to_rune_submit()
+
+    assert isinstance(run, VectorSumRun)
+    assert submit.profile == "swordfish-bench-h200"
+    assert submit.preset is None
+    assert run.size == 52_428_800
+    assert run.block_size == 2048
+    assert "--size" in run.forwarded_args
+    assert "52428800" in run.forwarded_args
+
+
+def test_build_run_for_vectorsum_experiment_uses_a100_ncu_profile():
+    run = build_run_for_experiment(
+        "vectorsum-v2",
+        "a100",
+        {"profile_mode": "ncu"},
+    )
+    submit = run.to_rune_submit()
+
+    assert isinstance(run, VectorSumRun)
+    assert submit.profile == "swordfish-bench-a100-ncu"
+    assert "--profile-mode" in submit.to_args()
+
+
+def test_build_run_for_liger_fsdp_experiment_uses_a100_ncu_profile():
+    run = build_run_for_experiment(
+        "liger-fsdp",
+        "a100",
+        {"mode": "liger", "profile_mode": "ncu"},
+    )
+    submit = run.to_rune_submit()
+
+    assert isinstance(run, LigerFsdpRun)
+    assert submit.profile == "swordfish-fsdp-a100-ncu"
+    assert "--profile-mode" in submit.to_args()
+
+
 def test_build_run_for_liger_fsdp_experiment_uses_fsdp_profile_and_overrides():
     run = build_run_for_experiment(
         "liger-fsdp",
         "a100",
-        {"mode": "liger", "repeats": 1, "warmup": 0, "iters": 1},
+        {
+            "mode": "liger",
+            "repeats": 1,
+            "warmup": 0,
+            "iters": 1,
+            "profile_steady_state": True,
+            "fsdp_wrap_policy": "transformer-block",
+            "fsdp_backward_prefetch": "backward-pre",
+            "fsdp_forward_prefetch": True,
+            "fsdp_limit_all_gathers": False,
+            "context": "voice-agent-flex",
+            "image": "voiceagentcr.azurecr.io/airun/swordfish-bench:bf92726-dirty",
+        },
     )
     submit = run.to_rune_submit()
 
@@ -482,6 +678,16 @@ def test_build_run_for_liger_fsdp_experiment_uses_fsdp_profile_and_overrides():
     assert submit.preset is None
     assert "--liger-mode" in run.forwarded_args
     assert "liger" in run.forwarded_args
+    assert "--profile-steady-state" in run.forwarded_args
+    assert "--fsdp-wrap-policy" in run.forwarded_args
+    assert "transformer-block" in run.forwarded_args
+    assert "--fsdp-backward-prefetch" in run.forwarded_args
+    assert "backward-pre" in run.forwarded_args
+    assert "--fsdp-forward-prefetch" in run.forwarded_args
+    assert "--no-fsdp-limit-all-gathers" in run.forwarded_args
+    assert submit.context == "voice-agent-flex"
+    assert submit.image == "voiceagentcr.azurecr.io/airun/swordfish-bench:bf92726-dirty"
+    assert "--context" in submit.to_args()
 
 
 def test_every_registered_experiment_resolves_to_generated_profile_pack():
@@ -1122,6 +1328,8 @@ def test_submit_experiment_cli_invokes_resolved_run(monkeypatch):
         captured["profile"] = self.to_rune_submit().profile
         captured["dry_run"] = dry_run
         captured["mode"] = self.mode
+        captured["context"] = self.context
+        captured["image"] = self.image
         from swordfish.dispatch.rune import RuneSubmitResult
 
         return RuneSubmitResult(
@@ -1141,6 +1349,10 @@ def test_submit_experiment_cli_invokes_resolved_run(monkeypatch):
             "a100",
             "--liger-mode",
             "liger",
+            "--context",
+            "voice-agent-flex",
+            "--image",
+            "voiceagentcr.azurecr.io/airun/swordfish-bench:bf92726-dirty",
             "--dry-run",
             "client",
         ]
@@ -1151,6 +1363,8 @@ def test_submit_experiment_cli_invokes_resolved_run(monkeypatch):
         "profile": "swordfish-fsdp-a100",
         "dry_run": "client",
         "mode": "liger",
+        "context": "voice-agent-flex",
+        "image": "voiceagentcr.azurecr.io/airun/swordfish-bench:bf92726-dirty",
     }
 
 
@@ -1458,6 +1672,155 @@ def test_inspect_run_cli_prints_install_hint_when_only_ncu_rep_is_fetched(
     assert rc == 0
     err = capsys.readouterr().err
     assert "brew install" in err and "ncu-summary" in err
+
+
+# ---------------------------------------------------------------------------
+# bundle-traces CLI / Hermes handoff bundle
+# ---------------------------------------------------------------------------
+
+
+def test_parse_trace_job_spec_accepts_inline_profile_mode():
+    from swordfish.runner.trace_bundle import parse_trace_job_spec
+
+    spec = parse_trace_job_spec("sf-job:nsys")
+
+    assert spec.name == "sf-job"
+    assert spec.profile_mode == "nsys"
+
+
+def test_bundle_traces_fetches_jobs_and_writes_manifest_archive(monkeypatch, tmp_path):
+    from swordfish.dispatch.results import FetchedRunArtifacts
+    from swordfish.runner.trace_bundle import TraceJobSpec, bundle_traces
+
+    calls: list[dict] = []
+
+    def fake_fetch_run_artifacts(**kwargs):
+        calls.append(kwargs)
+        local_dir = Path(kwargs["local_dir"])
+        local_dir.mkdir(parents=True, exist_ok=True)
+        name = kwargs["name"]
+        result_json = local_dir / f"{name}.json"
+        result_json.write_text('{"ok": true}\n')
+        profile_artifact = None
+        if kwargs["profile_mode"] == "ncu":
+            profile_artifact = local_dir / f"{name}.ncu-rep"
+            profile_artifact.write_bytes(b"NCU")
+        return FetchedRunArtifacts(
+            name=name,
+            local_dir=local_dir,
+            result_json=result_json,
+            profile_artifact=profile_artifact,
+            profile_mode=kwargs["profile_mode"],
+        )
+
+    monkeypatch.setattr(
+        "swordfish.runner.trace_bundle.fetch_run_artifacts", fake_fetch_run_artifacts
+    )
+
+    result = bundle_traces(
+        [TraceJobSpec("job-a", "ncu"), TraceJobSpec("job-b", None)],
+        bundle_name="handoff",
+        local_root=tmp_path,
+        namespace="ray",
+        context="voice-agent-flex",
+        pvc="training-nfs",
+    )
+
+    assert [c["name"] for c in calls] == ["job-a", "job-b"]
+    assert result.archive_path == tmp_path / "handoff.tar.gz"
+    manifest = json.loads(result.manifest_path.read_text())
+    assert manifest["schema_version"] == "swordfish.trace-bundle.v1"
+    assert manifest["jobs"][0]["remote_profile_path"] == "/data/job-a/profile/profile.ncu-rep"
+    assert manifest["jobs"][1]["profile_artifact"] is None
+    with tarfile.open(result.archive_path) as archive:
+        names = set(archive.getnames())
+    assert "handoff/manifest.json" in names
+    assert "handoff/job-a/job-a.ncu-rep" in names
+
+
+def test_bundle_traces_cli_wires_args(monkeypatch, tmp_path, capsys):
+    from swordfish.runner import cli
+
+    captured: dict = {}
+
+    def fake_bundle_traces(jobs, **kwargs):
+        captured["jobs"] = jobs
+        captured.update(kwargs)
+        from swordfish.runner.trace_bundle import TraceBundleResult
+
+        bundle_dir = tmp_path / "b"
+        manifest = bundle_dir / "manifest.json"
+        archive = tmp_path / "b.tar.gz"
+        return TraceBundleResult(
+            bundle_name="b",
+            bundle_dir=bundle_dir,
+            manifest_path=manifest,
+            archive_path=archive,
+            jobs=tuple(jobs),
+        )
+
+    monkeypatch.setattr(cli, "bundle_traces", fake_bundle_traces)
+
+    rc = cli.main(
+        [
+            "bundle-traces",
+            "job1:ncu",
+            "job2",
+            "--profile-mode",
+            "nsys",
+            "--bundle-name",
+            "b",
+            "--local-root",
+            str(tmp_path),
+            "--context",
+            "voice-agent-flex",
+            "--overwrite",
+        ]
+    )
+
+    assert rc == 0
+    assert [j.name for j in captured["jobs"]] == ["job1", "job2"]
+    assert [j.profile_mode for j in captured["jobs"]] == ["ncu", "nsys"]
+    assert captured["bundle_name"] == "b"
+    assert captured["context"] == "voice-agent-flex"
+    assert captured["overwrite"] is True
+    assert "archive:" in capsys.readouterr().err
+
+
+def test_a100_ncu_window_cli_pause_wires_helpers(monkeypatch, capsys):
+    from swordfish.runner import cli
+    from swordfish.runner.dcgm_window import DcgmWindowStatus
+
+    captured: dict = {}
+
+    def fake_pause(**kwargs):
+        captured.update(kwargs)
+        return DcgmWindowStatus(
+            a100_nodes=("a100-node",),
+            a100_exporter_pods=(),
+            desired=4,
+            ready=4,
+            updated=4,
+            available=4,
+        )
+
+    monkeypatch.setattr(cli, "pause_a100_dcgm", fake_pause)
+
+    rc = cli.main(
+        [
+            "a100-ncu-window",
+            "pause",
+            "--context",
+            "voice-agent-flex",
+            "--timeout-seconds",
+            "123",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["context"] == "voice-agent-flex"
+    assert captured["timeout_seconds"] == 123
+    assert "A100 exporter pods: none" in capsys.readouterr().out
 
 
 # -----------------------------------------------------------------------------
