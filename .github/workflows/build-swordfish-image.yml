@@ -18,15 +18,9 @@ on:
       - "uv.lock"
       - ".dockerignore"
       - ".github/workflows/build-swordfish-image.yml"
-  pull_request:
-    branches: [main]
-    paths:
-      - "infra/rune/image/**"
-      - "swordfish/**"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".dockerignore"
-      - ".github/workflows/build-swordfish-image.yml"
+  # Keep this off pull_request: the base image lives in private ACR, so PR
+  # runners cannot pull it anonymously. Use local `make test` + `ci/lint` for
+  # PR validation, and build the image from main or workflow_dispatch.
   workflow_dispatch:
     inputs:
       liger_version:
