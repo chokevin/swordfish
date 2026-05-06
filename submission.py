@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import socket
 import time
 from collections import OrderedDict
@@ -20,6 +21,13 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError:  # pragma: no cover - Triton is optional outside CUDA images.
+    triton = None
+    tl = None
 
 try:  # The official harness provides task.py; local tests do not.
     from task import input_t, output_t
@@ -39,6 +47,96 @@ _MAX_CACHED_PROJECTIONS = 8
 _projection_cache: OrderedDict[tuple[tuple[int, ...], torch.device, torch.dtype], torch.Tensor] = (
     OrderedDict()
 )
+_DEFAULT_TRIANGLE_BACKEND = "torch"
+_DEFAULT_TRITON_BLOCK_M = 32
+_DEFAULT_TRITON_BLOCK_N = 32
+_DEFAULT_TRITON_BLOCK_K = 64
+_DEFAULT_TRITON_NUM_WARPS = 4
+_DEFAULT_TRITON_NUM_STAGES = 3
+
+
+if triton is not None and tl is not None:
+
+    @triton.jit
+    def _triangle_multiply_kernel(
+        left,
+        right,
+        out,
+        n: tl.constexpr,
+        hidden_dim: tl.constexpr,
+        left_stride_b: tl.constexpr,
+        left_stride_i: tl.constexpr,
+        left_stride_k: tl.constexpr,
+        left_stride_d: tl.constexpr,
+        right_stride_b: tl.constexpr,
+        right_stride_j: tl.constexpr,
+        right_stride_k: tl.constexpr,
+        right_stride_d: tl.constexpr,
+        out_stride_b: tl.constexpr,
+        out_stride_i: tl.constexpr,
+        out_stride_j: tl.constexpr,
+        out_stride_d: tl.constexpr,
+        block_m: tl.constexpr,
+        block_n: tl.constexpr,
+        block_k: tl.constexpr,
+    ) -> None:
+        pid_ij = tl.program_id(0)
+        pid_bd = tl.program_id(1)
+        blocks_j = tl.cdiv(n, block_n)
+        block_i = pid_ij // blocks_j
+        block_j = pid_ij - block_i * blocks_j
+        batch = pid_bd // hidden_dim
+        hidden = pid_bd - batch * hidden_dim
+
+        offs_i = block_i * block_m + tl.arange(0, block_m)
+        offs_j = block_j * block_n + tl.arange(0, block_n)
+        offs_k = tl.arange(0, block_k)
+        acc = tl.zeros((block_m, block_n), dtype=tl.float32)
+
+        for k_start in range(0, n, block_k):
+            k = k_start + offs_k
+            left_offsets = (
+                batch * left_stride_b
+                + offs_i[:, None] * left_stride_i
+                + k[None, :] * left_stride_k
+                + hidden * left_stride_d
+            )
+            right_offsets = (
+                batch * right_stride_b
+                + k[:, None] * right_stride_k
+                + offs_j[None, :] * right_stride_j
+                + hidden * right_stride_d
+            )
+            left_tile = tl.load(
+                left + left_offsets,
+                mask=(offs_i[:, None] < n) & (k[None, :] < n),
+                other=0.0,
+            )
+            right_tile = tl.load(
+                right + right_offsets,
+                mask=(k[:, None] < n) & (offs_j[None, :] < n),
+                other=0.0,
+            )
+            acc += tl.dot(
+                left_tile.to(tl.bfloat16),
+                right_tile.to(tl.bfloat16),
+                out_dtype=tl.float32,
+            )
+
+        out_offsets = (
+            batch * out_stride_b
+            + offs_i[:, None] * out_stride_i
+            + offs_j[None, :] * out_stride_j
+            + hidden * out_stride_d
+        )
+        tl.store(
+            out + out_offsets,
+            acc,
+            mask=(offs_i[:, None] < n) & (offs_j[None, :] < n),
+        )
+
+else:
+    _triangle_multiply_kernel = None
 
 
 def _stacked_projection_weight(weights: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -66,7 +164,7 @@ def _has_real_mask(mask: torch.Tensor) -> bool:
     return not mask.dtype.is_floating_point
 
 
-def _triangle_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+def _triangle_multiply_torch(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Compute out[b, i, j, d] = sum_k left[b, i, k, d] * right[b, j, k, d]."""
     if left.is_cuda and torch.cuda.is_bf16_supported():
         return torch.einsum(
@@ -77,12 +175,128 @@ def _triangle_multiply(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     return torch.einsum("bikd,bjkd->bijd", left, right)
 
 
+def _triangle_multiply_triton(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+) -> torch.Tensor:
+    """Triangle contraction in Triton, one tiled matmul per batch/hidden channel."""
+    if triton is None or _triangle_multiply_kernel is None:
+        raise RuntimeError("Triton triangle backend requested, but Triton is not available")
+    if not left.is_cuda:
+        raise RuntimeError("Triton triangle backend requires CUDA tensors")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("Triton triangle backend requires BF16-capable CUDA hardware")
+
+    batch, n, right_n, hidden_dim = left.shape
+    if right.shape != (batch, n, right_n, hidden_dim) or right_n != n:
+        raise ValueError(
+            f"expected matching [B, N, N, H] tensors, got {left.shape} and {right.shape}"
+        )
+
+    out = torch.empty((batch, n, n, hidden_dim), device=left.device, dtype=torch.float32)
+    grid = (
+        triton.cdiv(n, block_m) * triton.cdiv(n, block_n),
+        batch * hidden_dim,
+    )
+    _triangle_multiply_kernel[grid](
+        left,
+        right,
+        out,
+        n,
+        hidden_dim,
+        left.stride(0),
+        left.stride(1),
+        left.stride(2),
+        left.stride(3),
+        right.stride(0),
+        right.stride(1),
+        right.stride(2),
+        right.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out
+
+
+def _triangle_multiply(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    backend: str,
+    triton_block_m: int,
+    triton_block_n: int,
+    triton_block_k: int,
+    triton_num_warps: int,
+    triton_num_stages: int,
+) -> torch.Tensor:
+    if backend == "auto":
+        backend = "triton" if left.is_cuda and triton is not None else "torch"
+    if backend == "triton":
+        return _triangle_multiply_triton(
+            left,
+            right,
+            block_m=triton_block_m,
+            block_n=triton_block_n,
+            block_k=triton_block_k,
+            num_warps=triton_num_warps,
+            num_stages=triton_num_stages,
+        )
+    if backend == "torch":
+        return _triangle_multiply_torch(left, right)
+    raise ValueError(f"unknown triangle backend: {backend}")
+
+
 @torch.no_grad()
 def custom_kernel(data: input_t) -> output_t:
     """Outgoing Triangle Multiplicative Update forward pass."""
     input_tensor, mask, weights, config = data
     dim = int(config["dim"])
     hidden_dim = int(config["hidden_dim"])
+    triangle_backend = str(
+        config.get(
+            "triangle_backend", os.environ.get("TRIMUL_TRIANGLE_BACKEND", _DEFAULT_TRIANGLE_BACKEND)
+        )
+    ).lower()
+    triton_block_m = int(
+        config.get(
+            "triton_block_m", os.environ.get("TRIMUL_TRITON_BLOCK_M", _DEFAULT_TRITON_BLOCK_M)
+        )
+    )
+    triton_block_n = int(
+        config.get(
+            "triton_block_n", os.environ.get("TRIMUL_TRITON_BLOCK_N", _DEFAULT_TRITON_BLOCK_N)
+        )
+    )
+    triton_block_k = int(
+        config.get(
+            "triton_block_k", os.environ.get("TRIMUL_TRITON_BLOCK_K", _DEFAULT_TRITON_BLOCK_K)
+        )
+    )
+    triton_num_warps = int(
+        config.get(
+            "triton_num_warps",
+            os.environ.get("TRIMUL_TRITON_NUM_WARPS", _DEFAULT_TRITON_NUM_WARPS),
+        )
+    )
+    triton_num_stages = int(
+        config.get(
+            "triton_num_stages",
+            os.environ.get("TRIMUL_TRITON_NUM_STAGES", _DEFAULT_TRITON_NUM_STAGES),
+        )
+    )
 
     x = F.layer_norm(
         input_tensor,
@@ -105,7 +319,16 @@ def custom_kernel(data: input_t) -> output_t:
     left = left * left_gate
     right = right * right_gate
 
-    out = _triangle_multiply(left, right)
+    out = _triangle_multiply(
+        left,
+        right,
+        backend=triangle_backend,
+        triton_block_m=triton_block_m,
+        triton_block_n=triton_block_n,
+        triton_block_k=triton_block_k,
+        triton_num_warps=triton_num_warps,
+        triton_num_stages=triton_num_stages,
+    )
     out = F.layer_norm(
         out,
         (hidden_dim,),
@@ -234,6 +457,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iters", type=int, default=3)
     parser.add_argument("--check-reference", action="store_true")
+    parser.add_argument(
+        "--backend",
+        choices=["auto", "torch", "triton"],
+        default=os.environ.get("TRIMUL_TRIANGLE_BACKEND", _DEFAULT_TRIANGLE_BACKEND),
+        help="triangle contraction backend",
+    )
+    parser.add_argument("--triton-block-m", type=int, default=_DEFAULT_TRITON_BLOCK_M)
+    parser.add_argument("--triton-block-n", type=int, default=_DEFAULT_TRITON_BLOCK_N)
+    parser.add_argument("--triton-block-k", type=int, default=_DEFAULT_TRITON_BLOCK_K)
+    parser.add_argument("--triton-num-warps", type=int, default=_DEFAULT_TRITON_NUM_WARPS)
+    parser.add_argument("--triton-num-stages", type=int, default=_DEFAULT_TRITON_NUM_STAGES)
     parser.add_argument("--out", type=Path, default=None)
     return parser.parse_args()
 
@@ -253,6 +487,12 @@ def _main() -> int:
         distribution=args.distribution,
         device=device,
     )
+    data[3]["triangle_backend"] = args.backend
+    data[3]["triton_block_m"] = args.triton_block_m
+    data[3]["triton_block_n"] = args.triton_block_n
+    data[3]["triton_block_k"] = args.triton_block_k
+    data[3]["triton_num_warps"] = args.triton_num_warps
+    data[3]["triton_num_stages"] = args.triton_num_stages
 
     def run_once() -> torch.Tensor:
         return custom_kernel(data)
@@ -292,12 +532,19 @@ def _main() -> int:
             "repeats": args.repeats,
             "warmup": args.warmup,
             "iters": args.iters,
+            "triangle_backend": args.backend,
+            "triton_block_m": args.triton_block_m,
+            "triton_block_n": args.triton_block_n,
+            "triton_block_k": args.triton_block_k,
+            "triton_num_warps": args.triton_num_warps,
+            "triton_num_stages": args.triton_num_stages,
         },
         "env": {
             "host": socket.gethostname(),
             "gpu_name": torch.cuda.get_device_name(device),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "triton": getattr(triton, "__version__", None),
         },
         "correctness": correctness,
         "metrics": {"latency": stats},
