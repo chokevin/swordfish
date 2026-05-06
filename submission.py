@@ -54,6 +54,10 @@ _MAX_CACHED_WEIGHT_CASTS = 16
 _DEFAULT_LINEAR_BACKEND = "auto"
 _LINEAR_BACKENDS = ("auto", "torch", "bf16", "bf16_projection", "bf16_output")
 _DEFAULT_TRIANGLE_BACKEND = "auto"
+_DEFAULT_GATE_PACK_BACKEND = "auto"
+_GATE_PACK_BACKENDS = ("auto", "torch", "triton")
+_DEFAULT_TAIL_BACKEND = "auto"
+_TAIL_BACKENDS = ("auto", "torch", "triton")
 _DEFAULT_TRITON_BLOCK_M = 32
 _DEFAULT_TRITON_BLOCK_N = 32
 _DEFAULT_TRITON_BLOCK_K = 64
@@ -186,9 +190,127 @@ if triton is not None and tl is not None:
             mask=(offs_i[:, None] < n) & (offs_j[None, :] < n),
         )
 
+    @triton.jit
+    def _gate_mask_pack_kernel(
+        projected,
+        mask,
+        left_packed,
+        right_packed,
+        n: tl.constexpr,
+        hidden_dim: tl.constexpr,
+        projected_stride_b: tl.constexpr,
+        projected_stride_i: tl.constexpr,
+        projected_stride_j: tl.constexpr,
+        projected_stride_d: tl.constexpr,
+        mask_stride_b: tl.constexpr,
+        mask_stride_i: tl.constexpr,
+        mask_stride_j: tl.constexpr,
+        has_mask: tl.constexpr,
+        block_m: tl.constexpr,
+        block_n: tl.constexpr,
+    ) -> None:
+        pid_ij = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+        blocks_j = tl.cdiv(n, block_n)
+        block_i = pid_ij // blocks_j
+        block_j = pid_ij - block_i * blocks_j
+        batch = pid_bh // hidden_dim
+        hidden = pid_bh - batch * hidden_dim
+
+        offs_i = block_i * block_m + tl.arange(0, block_m)
+        offs_j = block_j * block_n + tl.arange(0, block_n)
+        valid = (offs_i[:, None] < n) & (offs_j[None, :] < n)
+        projected_base = (
+            batch * projected_stride_b
+            + offs_i[:, None] * projected_stride_i
+            + offs_j[None, :] * projected_stride_j
+            + hidden * projected_stride_d
+        )
+
+        left = tl.load(projected + projected_base, mask=valid, other=0.0).to(tl.float32)
+        right = tl.load(
+            projected + projected_base + hidden_dim * projected_stride_d,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        left_gate = tl.load(
+            projected + projected_base + 2 * hidden_dim * projected_stride_d,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+        right_gate = tl.load(
+            projected + projected_base + 3 * hidden_dim * projected_stride_d,
+            mask=valid,
+            other=0.0,
+        ).to(tl.float32)
+
+        if has_mask:
+            mask_offsets = (
+                batch * mask_stride_b
+                + offs_i[:, None] * mask_stride_i
+                + offs_j[None, :] * mask_stride_j
+            )
+            mask_values = tl.load(mask + mask_offsets, mask=valid, other=0.0).to(tl.float32)
+            left *= mask_values
+            right *= mask_values
+
+        left *= tl.sigmoid(left_gate)
+        right *= tl.sigmoid(right_gate)
+
+        pack_base = pid_bh * n * n
+        left_offsets = pack_base + offs_i[:, None] * n + offs_j[None, :]
+        right_offsets = pack_base + offs_j[None, :] * n + offs_i[:, None]
+        tl.store(left_packed + left_offsets, left, mask=valid)
+        tl.store(right_packed + right_offsets, right, mask=valid)
+
+    @triton.jit
+    def _tail_norm_gate_kernel(
+        out,
+        out_gate,
+        norm_weight,
+        norm_bias,
+        fused,
+        rows: tl.constexpr,
+        hidden_dim: tl.constexpr,
+        out_stride_row: tl.constexpr,
+        out_stride_d: tl.constexpr,
+        gate_stride_b: tl.constexpr,
+        gate_stride_i: tl.constexpr,
+        gate_stride_j: tl.constexpr,
+        gate_stride_d: tl.constexpr,
+        n: tl.constexpr,
+        eps: tl.constexpr,
+        block_h: tl.constexpr,
+    ) -> None:
+        row = tl.program_id(0)
+        offs_h = tl.arange(0, block_h)
+        hidden_mask = offs_h < hidden_dim
+
+        batch = row // (n * n)
+        rem = row - batch * n * n
+        i = rem // n
+        j = rem - i * n
+
+        out_offsets = row * out_stride_row + offs_h * out_stride_d
+        gate_offsets = (
+            batch * gate_stride_b + i * gate_stride_i + j * gate_stride_j + offs_h * gate_stride_d
+        )
+        values = tl.load(out + out_offsets, mask=hidden_mask, other=0.0).to(tl.float32)
+        mean = tl.sum(values, axis=0) / hidden_dim
+        centered = tl.where(hidden_mask, values - mean, 0.0)
+        var = tl.sum(centered * centered, axis=0) / hidden_dim
+        normed = centered * tl.rsqrt(var + eps)
+        weight = tl.load(norm_weight + offs_h, mask=hidden_mask, other=0.0).to(tl.float32)
+        bias = tl.load(norm_bias + offs_h, mask=hidden_mask, other=0.0).to(tl.float32)
+        gate = tl.load(out_gate + gate_offsets, mask=hidden_mask, other=0.0).to(tl.float32)
+        result = (normed * weight + bias) * tl.sigmoid(gate)
+        tl.store(fused + out_offsets, result, mask=hidden_mask)
+
 else:
     _triangle_multiply_kernel = None
     _triangle_multiply_packed_kernel = None
+    _gate_mask_pack_kernel = None
+    _tail_norm_gate_kernel = None
 
 
 def _stacked_projection_weight(
@@ -351,6 +473,65 @@ def _triangle_multiply_bmm(left: torch.Tensor, right: torch.Tensor) -> torch.Ten
     return out.reshape(batch, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
 
 
+def _pack_triangle_left(left: torch.Tensor) -> torch.Tensor:
+    batch, n, _, hidden_dim = left.shape
+    return (
+        left.permute(0, 3, 1, 2).contiguous().to(torch.bfloat16).reshape(batch * hidden_dim, n, n)
+    )
+
+
+def _pack_triangle_right(right: torch.Tensor) -> torch.Tensor:
+    batch, n, _, hidden_dim = right.shape
+    return (
+        right.permute(0, 3, 2, 1).contiguous().to(torch.bfloat16).reshape(batch * hidden_dim, n, n)
+    )
+
+
+def _triangle_packed_matmul(
+    left_packed: torch.Tensor,
+    right_packed: torch.Tensor,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+) -> torch.Tensor:
+    if triton is None or _triangle_multiply_packed_kernel is None:
+        raise RuntimeError("Triton packed backend requested, but Triton is not available")
+    if left_packed.shape != right_packed.shape:
+        raise ValueError(
+            f"expected matching packed tensors, got {left_packed.shape} and {right_packed.shape}"
+        )
+    _, n, right_n = left_packed.shape
+    if right_n != n:
+        raise ValueError(f"expected packed [B*H, N, N] tensors, got {left_packed.shape}")
+
+    out_packed = torch.empty_like(left_packed, dtype=torch.float32)
+    grid = (
+        triton.cdiv(n, block_m) * triton.cdiv(n, block_n),
+        left_packed.shape[0],
+    )
+    _triangle_multiply_packed_kernel[grid](
+        left_packed,
+        right_packed,
+        out_packed,
+        n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out_packed
+
+
+def _unpack_triangle_output(
+    out_packed: torch.Tensor, *, batch: int, n: int, hidden_dim: int
+) -> torch.Tensor:
+    return out_packed.reshape(batch, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+
 def _triangle_multiply_triton_packed(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -375,29 +556,18 @@ def _triangle_multiply_triton_packed(
             f"expected matching [B, N, N, H] tensors, got {left.shape} and {right.shape}"
         )
 
-    left_packed = (
-        left.permute(0, 3, 1, 2).contiguous().to(torch.bfloat16).reshape(batch * hidden_dim, n, n)
-    )
-    right_packed = (
-        right.permute(0, 3, 2, 1).contiguous().to(torch.bfloat16).reshape(batch * hidden_dim, n, n)
-    )
-    out_packed = torch.empty_like(left_packed, dtype=torch.float32)
-    grid = (
-        triton.cdiv(n, block_m) * triton.cdiv(n, block_n),
-        batch * hidden_dim,
-    )
-    _triangle_multiply_packed_kernel[grid](
+    left_packed = _pack_triangle_left(left)
+    right_packed = _pack_triangle_right(right)
+    out_packed = _triangle_packed_matmul(
         left_packed,
         right_packed,
-        out_packed,
-        n,
         block_m=block_m,
         block_n=block_n,
         block_k=block_k,
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    return out_packed.reshape(batch, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+    return _unpack_triangle_output(out_packed, batch=batch, n=n, hidden_dim=hidden_dim)
 
 
 def _triangle_multiply(
@@ -411,18 +581,7 @@ def _triangle_multiply(
     triton_num_warps: int,
     triton_num_stages: int,
 ) -> torch.Tensor:
-    if backend == "auto":
-        backend = (
-            "triton_packed"
-            if (
-                left.is_cuda
-                and triton is not None
-                and _triangle_multiply_packed_kernel is not None
-                and torch.cuda.is_bf16_supported()
-                and left.shape[1] <= 256
-            )
-            else "torch"
-        )
+    backend = _resolve_triangle_backend(left, backend)
     if backend == "triton":
         return _triangle_multiply_triton(
             left,
@@ -450,6 +609,119 @@ def _triangle_multiply(
     raise ValueError(f"unknown triangle backend: {backend}")
 
 
+def _resolve_triangle_backend(left: torch.Tensor, backend: str) -> str:
+    if backend != "auto":
+        return backend
+    if (
+        left.is_cuda
+        and triton is not None
+        and _triangle_multiply_packed_kernel is not None
+        and torch.cuda.is_bf16_supported()
+        and left.shape[1] <= 256
+    ):
+        return "triton_packed"
+    return "torch"
+
+
+def _resolve_gate_pack_backend(projected: torch.Tensor, backend: str, triangle_backend: str) -> str:
+    if backend != "auto":
+        return backend
+    return "torch"
+
+
+def _resolve_tail_backend(input_tensor: torch.Tensor, backend: str, hidden_dim: int) -> str:
+    if backend != "auto":
+        return backend
+    if (
+        input_tensor.is_cuda
+        and triton is not None
+        and _tail_norm_gate_kernel is not None
+        and hidden_dim == 128
+        and input_tensor.shape[1] <= 256
+    ):
+        return "triton"
+    return "torch"
+
+
+def _gate_mask_pack_triton(
+    projected: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    hidden_dim: int,
+    has_mask: bool,
+    block_m: int,
+    block_n: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if triton is None or _gate_mask_pack_kernel is None:
+        raise RuntimeError("Triton gate-pack backend requested, but Triton is not available")
+    batch, n, right_n, projected_dim = projected.shape
+    if right_n != n or projected_dim != hidden_dim * 5:
+        raise ValueError(f"expected projected [B, N, N, 5H], got {projected.shape}")
+    left_packed = torch.empty(
+        (batch * hidden_dim, n, n), device=projected.device, dtype=torch.bfloat16
+    )
+    right_packed = torch.empty_like(left_packed)
+    grid = (triton.cdiv(n, block_m) * triton.cdiv(n, block_n), batch * hidden_dim)
+    _gate_mask_pack_kernel[grid](
+        projected,
+        mask,
+        left_packed,
+        right_packed,
+        n,
+        hidden_dim,
+        projected.stride(0),
+        projected.stride(1),
+        projected.stride(2),
+        projected.stride(3),
+        mask.stride(0),
+        mask.stride(1),
+        mask.stride(2),
+        has_mask,
+        block_m=block_m,
+        block_n=block_n,
+        num_warps=4,
+    )
+    return left_packed, right_packed
+
+
+def _tail_norm_gate_triton(
+    out: torch.Tensor,
+    out_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    *,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    if triton is None or _tail_norm_gate_kernel is None:
+        raise RuntimeError("Triton tail backend requested, but Triton is not available")
+    batch, n, right_n, hidden_dim = out.shape
+    if right_n != n or hidden_dim != 128:
+        raise ValueError(f"expected output [B, N, N, 128], got {out.shape}")
+    out_contiguous = out.contiguous()
+    fused = torch.empty_like(out_contiguous)
+    rows = batch * n * n
+    _tail_norm_gate_kernel[(rows,)](
+        out_contiguous,
+        out_gate,
+        norm_weight,
+        norm_bias,
+        fused,
+        rows,
+        hidden_dim,
+        out_contiguous.stride(2),
+        out_contiguous.stride(3),
+        out_gate.stride(0),
+        out_gate.stride(1),
+        out_gate.stride(2),
+        out_gate.stride(3),
+        n,
+        eps,
+        block_h=triton.next_power_of_2(hidden_dim),
+        num_warps=4,
+    )
+    return fused
+
+
 @torch.no_grad()
 def custom_kernel(data: input_t) -> output_t:
     """Outgoing Triangle Multiplicative Update forward pass."""
@@ -474,6 +746,19 @@ def _custom_kernel_impl(
             "triangle_backend", os.environ.get("TRIMUL_TRIANGLE_BACKEND", _DEFAULT_TRIANGLE_BACKEND)
         )
     ).lower()
+    gate_pack_backend = str(
+        config.get(
+            "gate_pack_backend",
+            os.environ.get("TRIMUL_GATE_PACK_BACKEND", _DEFAULT_GATE_PACK_BACKEND),
+        )
+    ).lower()
+    tail_backend = str(
+        config.get("tail_backend", os.environ.get("TRIMUL_TAIL_BACKEND", _DEFAULT_TAIL_BACKEND))
+    ).lower()
+    if gate_pack_backend not in _GATE_PACK_BACKENDS:
+        raise ValueError(f"unknown gate-pack backend: {gate_pack_backend}")
+    if tail_backend not in _TAIL_BACKENDS:
+        raise ValueError(f"unknown tail backend: {tail_backend}")
     triton_block_m = int(
         config.get(
             "triton_block_m", os.environ.get("TRIMUL_TRITON_BLOCK_M", _DEFAULT_TRITON_BLOCK_M)
@@ -528,37 +813,102 @@ def _custom_kernel_impl(
     left, right, left_gate, right_gate, out_gate = projected.split(hidden_dim, dim=-1)
     mark("stacked_projection")
 
-    if _has_real_mask(mask):
-        mask_view = mask.unsqueeze(-1).to(dtype=left.dtype)
-        left = left * mask_view
-        right = right * mask_view
-
-    left_gate.sigmoid_()
-    right_gate.sigmoid_()
-    out_gate.sigmoid_()
-    left = left * left_gate
-    right = right * right_gate
-    mark("gate_mask")
-
-    out = _triangle_multiply(
-        left,
-        right,
-        backend=triangle_backend,
-        triton_block_m=triton_block_m,
-        triton_block_n=triton_block_n,
-        triton_block_k=triton_block_k,
-        triton_num_warps=triton_num_warps,
-        triton_num_stages=triton_num_stages,
+    resolved_triangle_backend = _resolve_triangle_backend(left, triangle_backend)
+    resolved_gate_pack_backend = _resolve_gate_pack_backend(
+        projected, gate_pack_backend, resolved_triangle_backend
     )
-    mark("triangle")
-    out = F.layer_norm(
-        out,
-        (hidden_dim,),
-        weights["to_out_norm.weight"],
-        weights["to_out_norm.bias"],
-    )
-    out = out * out_gate
-    mark("tail_norm_gate")
+    resolved_tail_backend = _resolve_tail_backend(input_tensor, tail_backend, hidden_dim)
+    has_real_mask = _has_real_mask(mask)
+
+    if resolved_gate_pack_backend == "triton":
+        left_packed, right_packed = _gate_mask_pack_triton(
+            projected,
+            mask,
+            hidden_dim=hidden_dim,
+            has_mask=has_real_mask,
+            block_m=triton_block_m,
+            block_n=triton_block_n,
+        )
+        mark("gate_mask_pack")
+        out_packed = _triangle_packed_matmul(
+            left_packed,
+            right_packed,
+            block_m=triton_block_m,
+            block_n=triton_block_n,
+            block_k=triton_block_k,
+            num_warps=triton_num_warps,
+            num_stages=triton_num_stages,
+        )
+        mark("triangle_matmul")
+        out = _unpack_triangle_output(
+            out_packed, batch=input_tensor.shape[0], n=input_tensor.shape[1], hidden_dim=hidden_dim
+        )
+        mark("triangle_unpack")
+    else:
+        if has_real_mask:
+            mask_view = mask.unsqueeze(-1).to(dtype=left.dtype)
+            left = left * mask_view
+            right = right * mask_view
+
+        left_gate.sigmoid_()
+        right_gate.sigmoid_()
+        left = left * left_gate
+        right = right * right_gate
+        mark("gate_mask")
+
+        if collect_timings and resolved_triangle_backend == "triton_packed":
+            left_packed = _pack_triangle_left(left)
+            mark("triangle_pack_left")
+            right_packed = _pack_triangle_right(right)
+            mark("triangle_pack_right")
+            out_packed = _triangle_packed_matmul(
+                left_packed,
+                right_packed,
+                block_m=triton_block_m,
+                block_n=triton_block_n,
+                block_k=triton_block_k,
+                num_warps=triton_num_warps,
+                num_stages=triton_num_stages,
+            )
+            mark("triangle_matmul")
+            out = _unpack_triangle_output(
+                out_packed,
+                batch=input_tensor.shape[0],
+                n=input_tensor.shape[1],
+                hidden_dim=hidden_dim,
+            )
+            mark("triangle_unpack")
+        else:
+            out = _triangle_multiply(
+                left,
+                right,
+                backend=resolved_triangle_backend,
+                triton_block_m=triton_block_m,
+                triton_block_n=triton_block_n,
+                triton_block_k=triton_block_k,
+                triton_num_warps=triton_num_warps,
+                triton_num_stages=triton_num_stages,
+            )
+            mark("triangle")
+
+    if resolved_tail_backend == "triton":
+        out = _tail_norm_gate_triton(
+            out,
+            out_gate,
+            weights["to_out_norm.weight"],
+            weights["to_out_norm.bias"],
+        )
+        mark("tail_norm_gate_fused")
+    else:
+        out_gate = out_gate.sigmoid()
+        out = F.layer_norm(
+            out,
+            (hidden_dim,),
+            weights["to_out_norm.weight"],
+            weights["to_out_norm.bias"],
+        )
+        out = out * out_gate
+        mark("tail_norm_gate")
     out_linear = out if output_dtype == out.dtype else out.to(output_dtype)
     output = F.linear(out_linear, _cached_weight_cast(weights["to_out.weight"], output_dtype)).to(
         torch.float32
@@ -712,6 +1062,18 @@ def _parse_args() -> argparse.Namespace:
         default=os.environ.get("TRIMUL_TRIANGLE_BACKEND", _DEFAULT_TRIANGLE_BACKEND),
         help="triangle contraction backend",
     )
+    parser.add_argument(
+        "--gate-pack-backend",
+        choices=list(_GATE_PACK_BACKENDS),
+        default=os.environ.get("TRIMUL_GATE_PACK_BACKEND", _DEFAULT_GATE_PACK_BACKEND),
+        help="gate/mask/packed-layout backend",
+    )
+    parser.add_argument(
+        "--tail-backend",
+        choices=list(_TAIL_BACKENDS),
+        default=os.environ.get("TRIMUL_TAIL_BACKEND", _DEFAULT_TAIL_BACKEND),
+        help="output layernorm/out-gate backend",
+    )
     parser.add_argument("--triton-block-m", type=int, default=_DEFAULT_TRITON_BLOCK_M)
     parser.add_argument("--triton-block-n", type=int, default=_DEFAULT_TRITON_BLOCK_N)
     parser.add_argument("--triton-block-k", type=int, default=_DEFAULT_TRITON_BLOCK_K)
@@ -738,6 +1100,8 @@ def _main() -> int:
     )
     data[3]["triangle_backend"] = args.backend
     data[3]["linear_backend"] = args.linear_backend
+    data[3]["gate_pack_backend"] = args.gate_pack_backend
+    data[3]["tail_backend"] = args.tail_backend
     data[3]["triton_block_m"] = args.triton_block_m
     data[3]["triton_block_n"] = args.triton_block_n
     data[3]["triton_block_k"] = args.triton_block_k
@@ -798,6 +1162,8 @@ def _main() -> int:
             "profile_ops": args.profile_ops,
             "linear_backend": args.linear_backend,
             "triangle_backend": args.backend,
+            "gate_pack_backend": args.gate_pack_backend,
+            "tail_backend": args.tail_backend,
             "triton_block_m": args.triton_block_m,
             "triton_block_n": args.triton_block_n,
             "triton_block_k": args.triton_block_k,
