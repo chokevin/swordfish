@@ -30,17 +30,24 @@ or rune's native `--profile-mode=ncu` (binary `.ncu-rep`), and finally attaches
 the profiler summary to the unprofiled timing JSON. This keeps NCU replay
 overhead out of `metrics.latency`.
 
-If Nsight Compute reports `ERR_NVGPUCTRPERM`, the node driver is restricting
-performance counters. NCU on A100 needs container `SYS_ADMIN`, which rune
-profiles cannot currently request — this is a known limitation tracked in
-`docs/airun/a100-ncu-blocker.md`. Do not mark NCU complete unless the attached
-CSV/rep contains every required metric.
+If Nsight Compute reports `ERR_NVGPUCTRPERM`, first check that the submitted pod
+actually rendered `securityContext.capabilities.add: [SYS_ADMIN]`. Current
+Swordfish dispatch preflights A100 `--profile-mode ncu` submits and refuses to
+run if the local Rune binary drops the `swordfish-*-a100-ncu` profile security
+context. Rebuild/install Rune before retrying; otherwise the job will fail after
+reserving the A100.
 
 If Nsight Compute then changes to `Profiling failed because a driver resource
 was unavailable`, check for DCGM/profiler contention. The A100 NCU lane requires
 temporarily excluding `nvidia-dcgm-exporter` from A100 nodes during the NCU
 profiling window, then restoring the DaemonSet and confirming rollout. This is
-an operational profiling window, not a permanent monitoring change.
+an operational profiling window, not a permanent monitoring change:
+
+```bash
+make airun-a100-ncu-pause KUBE_CONTEXT=voice-agent-flex
+# submit the A100 NCU job
+make airun-a100-ncu-restore KUBE_CONTEXT=voice-agent-flex
+```
 
 Use the matrix validator as the completion gate for cross-GPU GEMM runs:
 
@@ -134,6 +141,24 @@ Once installed, double-clicking a `.ncu-rep` (or `open file.ncu-rep`) launches
 the full Speed-of-Light dashboard with occupancy, source-attributed SASS, and
 baseline comparison sets — the same view kernel engineers use to drive Liger /
 Triton kernel work.
+
+For multi-job handoff to a Mac or to Hermes, bundle traces into the stable local
+handoff root:
+
+```bash
+uv run python -m swordfish.runner bundle-traces \
+  sf-vectorsum-v2-ncu-230122-h100:ncu \
+  sf-fsdp-ovl-230122-h200-tb:nsys \
+  --context voice-agent-flex \
+  --bundle-name kernel-handoff-230122
+```
+
+This writes `runs/traces/kernel-handoff-230122/manifest.json` plus one
+subdirectory per job, and creates `runs/traces/kernel-handoff-230122.tar.gz`.
+The expanded directory is convenient for local inspection; the tarball is the
+single file to send to Hermes or copy back to a Mac. Each manifest entry records
+the local files and the original PVC path, e.g.
+`/data/<job-name>/profile/profile.ncu-rep`.
 
 ### Reading kernel-level detail without ncu-ui (`ncu-summary`)
 

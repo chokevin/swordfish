@@ -124,6 +124,10 @@ RUNE_NATIVE_PROFILE_MODES = ("ncu", "nsys")  # subset rune knows about
 # format the legacy SWORDFISH_PROFILE script-side path produces). Downstream
 # tooling that expects CSV needs to call `ncu --import` to convert.
 PROFILE_EXTENSIONS = {"ncu": "ncu-rep", "nsys": "nsys-rep", "torch": "json"}
+VECTOR_SUM_BACKENDS = ("torch", "triton")
+VECTOR_SUM_DTYPES = ("fp16", "bf16", "fp32")
+VECTOR_SUM_DEFAULT_SIZE = 1_638_400
+VECTOR_SUM_DEFAULT_BLOCK_SIZE = 8192
 
 _NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
 
@@ -602,6 +606,138 @@ class TorchGemmRun:
 
 
 @dataclass
+class VectorSumRun:
+    """One vectorsum_v2 reduction benchmark on a single arch."""
+
+    arch: str = "a100"
+    backend: str = "triton"
+    size: int = VECTOR_SUM_DEFAULT_SIZE
+    dtype: str = "fp32"
+    repeats: int = 5
+    warmup: int = 10
+    iters: int = 50
+    block_size: int = VECTOR_SUM_DEFAULT_BLOCK_SIZE
+    name: str | None = None
+    namespace: str = DEFAULT_NAMESPACE
+    context: str | None = None
+    image: str = DEFAULT_IMAGE
+    script: str | Path = DEFAULT_BENCH_SCRIPT
+    pvc: str = DEFAULT_PVC
+    result_root: str = DEFAULT_RESULT_ROOT
+    preset: str | None = None
+    allow_raw_preset: bool = False
+    profile: str | None = None
+    extra_args: list[str] = field(default_factory=list)
+    container_env: dict[str, str] = field(default_factory=dict)
+    rune_bin: str = "rune"
+    profile_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.arch not in ARCH_TO_PRESET:
+            raise ValueError(
+                f"unknown arch {self.arch!r}; expected one of {sorted(ARCH_TO_PRESET)}"
+            )
+        if self.backend not in VECTOR_SUM_BACKENDS:
+            raise ValueError(f"backend {self.backend!r} not in {VECTOR_SUM_BACKENDS}")
+        if self.dtype not in VECTOR_SUM_DTYPES:
+            raise ValueError(f"dtype {self.dtype!r} not in {VECTOR_SUM_DTYPES}")
+        if min(self.size, self.repeats, self.iters, self.block_size) <= 0 or self.warmup < 0:
+            raise ValueError(
+                "size, repeats, iters, and block_size must be positive; warmup must be non-negative"
+            )
+        if self.block_size & (self.block_size - 1) != 0:
+            raise ValueError("block_size must be a power of two")
+        if self.preset and self.profile:
+            raise ValueError("preset and profile are mutually exclusive")
+        _check_raw_preset_guard(preset=self.preset, allow_raw_preset=self.allow_raw_preset)
+        if self.profile_mode and self.profile_mode not in PROFILE_MODES:
+            raise ValueError(f"profile_mode {self.profile_mode!r} not in {PROFILE_MODES}")
+
+    @property
+    def resolved_name(self) -> str:
+        return _normalize_name(
+            self.name or f"sf-vectorsum-v2-{self.backend}-{self.size}-{self.arch}"
+        )
+
+    @property
+    def resolved_preset(self) -> str:
+        if self.profile:
+            return ""
+        return self.preset or ARCH_TO_PRESET[self.arch]
+
+    @property
+    def resolved_profile(self) -> str | None:
+        if self.profile:
+            return self.profile
+        if self.preset:
+            return None
+        return default_profile_for_mode(self.arch, self.profile_mode)
+
+    @property
+    def out_path(self) -> str:
+        if self.name is not None:
+            return f"{self.result_root}/vectorsum-v2/{self.resolved_name}.json"
+        return f"{self.result_root}/vectorsum-v2/{self.backend}-{self.size}-{self.arch}.json"
+
+    @property
+    def forwarded_args(self) -> list[str]:
+        return [
+            "bench-vectorsum",
+            "--backend",
+            self.backend,
+            "--size",
+            str(self.size),
+            "--dtype",
+            self.dtype,
+            "--repeats",
+            str(self.repeats),
+            "--warmup",
+            str(self.warmup),
+            "--iters",
+            str(self.iters),
+            "--device",
+            "auto",
+            "--arch-label",
+            self.arch,
+            "--block-size",
+            str(self.block_size),
+            "--out",
+            self.out_path,
+        ]
+
+    def to_rune_submit(self) -> RuneSubmit:
+        rune_native_mode, container_env = _resolve_torch_profile(
+            self.profile_mode, self.resolved_name, self.container_env
+        )
+        kwargs: dict = dict(
+            name=self.resolved_name,
+            image=self.image,
+            script=self.script,
+            namespace=self.namespace,
+            context=self.context,
+            volumes=[f"data=pvc:{self.pvc}"],
+            extra_args=_inject_gpu_class(self.arch, self.extra_args),
+            forwarded_args=self.forwarded_args,
+            container_env=container_env,
+            rune_bin=self.rune_bin,
+            profile_mode=rune_native_mode,
+            output=self.out_path,
+        )
+        resolved_profile = self.resolved_profile
+        if resolved_profile:
+            kwargs["profile"] = resolved_profile
+        else:
+            kwargs["preset"] = self.resolved_preset
+        return RuneSubmit(**kwargs)
+
+    def to_command(self, *, dry_run: str | None = None) -> str:
+        return self.to_rune_submit().to_command(dry_run=dry_run)
+
+    def submit(self, *, dry_run: str | None = None, check: bool = True) -> RuneSubmitResult:
+        return self.to_rune_submit().submit(dry_run=dry_run, check=check)
+
+
+@dataclass
 class LigerFsdpRun:
     """One end-to-end Llama train-step row for the Liger FSDP reproduction."""
 
@@ -618,6 +754,10 @@ class LigerFsdpRun:
     nproc_per_node: int = 8
     gradient_checkpointing: bool = True
     profile_steady_state: bool = False
+    fsdp_wrap_policy: str = "root"
+    fsdp_backward_prefetch: str = "default"
+    fsdp_forward_prefetch: bool = False
+    fsdp_limit_all_gathers: bool = True
     name: str | None = None
     namespace: str = DEFAULT_NAMESPACE
     context: str | None = None
@@ -644,6 +784,17 @@ class LigerFsdpRun:
             raise ValueError("model_source must be 'reference' or 'transformers'")
         if self.model_preset not in {"tiny", "llama3-8b"}:
             raise ValueError("model_preset must be 'tiny' or 'llama3-8b'")
+        if self.fsdp_wrap_policy not in {"root", "transformer-block"}:
+            raise ValueError("fsdp_wrap_policy must be 'root' or 'transformer-block'")
+        if self.fsdp_backward_prefetch not in {
+            "default",
+            "backward-pre",
+            "backward-post",
+            "none",
+        }:
+            raise ValueError(
+                "fsdp_backward_prefetch must be one of: default, backward-pre, backward-post, none"
+            )
         if self.preset and self.profile:
             raise ValueError("preset and profile are mutually exclusive")
         _check_raw_preset_guard(preset=self.preset, allow_raw_preset=self.allow_raw_preset)
@@ -674,6 +825,8 @@ class LigerFsdpRun:
 
     @property
     def out_path(self) -> str:
+        if self.name is not None:
+            return f"{self.result_root}/liger-fsdp/{self.resolved_name}.json"
         return f"{self.result_root}/liger-fsdp/{self.model_preset}-{self.mode}-{self.arch}.json"
 
     @property
@@ -731,6 +884,14 @@ class LigerFsdpRun:
             args.append("--no-gradient-checkpointing")
         if self.profile_steady_state:
             args.append("--profile-steady-state")
+        if self.fsdp_wrap_policy != "root":
+            args.extend(["--fsdp-wrap-policy", self.fsdp_wrap_policy])
+        if self.fsdp_backward_prefetch != "default":
+            args.extend(["--fsdp-backward-prefetch", self.fsdp_backward_prefetch])
+        if self.fsdp_forward_prefetch:
+            args.append("--fsdp-forward-prefetch")
+        if not self.fsdp_limit_all_gathers:
+            args.append("--no-fsdp-limit-all-gathers")
         return args
 
     def to_rune_submit(self) -> RuneSubmit:

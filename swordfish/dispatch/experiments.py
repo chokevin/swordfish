@@ -17,15 +17,22 @@ from swordfish.dispatch.runs import (
     LigerFsdpRun,
     LigerPerkernelRun,
     TorchGemmRun,
+    VectorSumRun,
     default_fsdp_profile_for,
     default_profile_for,
 )
 
-ExperimentWorkload = Literal["gemm", "liger-rmsnorm", "liger-swiglu", "liger-fsdp"]
+ExperimentWorkload = Literal[
+    "gemm",
+    "vectorsum-v2",
+    "liger-rmsnorm",
+    "liger-swiglu",
+    "liger-fsdp",
+]
 ProfileFamily = Literal["bench", "fsdp"]
-ExperimentRun = TorchGemmRun | LigerPerkernelRun | LigerFsdpRun
+ExperimentRun = TorchGemmRun | VectorSumRun | LigerPerkernelRun | LigerFsdpRun
 
-COMMON_RUN_OVERRIDES = {"name", "profile_mode", "result_root", "script"}
+COMMON_RUN_OVERRIDES = {"name", "profile_mode", "result_root", "script", "context", "image"}
 
 
 @dataclass(frozen=True)
@@ -81,6 +88,22 @@ EXPERIMENTS: dict[str, ExperimentSpec] = {
         },
         description="One-GPU torch/cuBLAS GEMM baseline.",
     ),
+    "vectorsum-v2": ExperimentSpec(
+        name="vectorsum-v2",
+        workload="vectorsum-v2",
+        profile_family="bench",
+        allowed_arches=ARCHES,
+        defaults={
+            "backend": "triton",
+            "size": 1_638_400,
+            "dtype": "fp32",
+            "repeats": 5,
+            "warmup": 10,
+            "iters": 50,
+            "block_size": 8192,
+        },
+        description="One-GPU vector sum reduction target.",
+    ),
     "liger-rmsnorm": ExperimentSpec(
         name="liger-rmsnorm",
         workload="liger-rmsnorm",
@@ -124,6 +147,11 @@ EXPERIMENTS: dict[str, ExperimentSpec] = {
             "iters": 5,
             "nproc_per_node": 8,
             "gradient_checkpointing": True,
+            "profile_steady_state": False,
+            "fsdp_wrap_policy": "root",
+            "fsdp_backward_prefetch": "default",
+            "fsdp_forward_prefetch": False,
+            "fsdp_limit_all_gathers": True,
         },
         description="8-GPU Llama train-step reproduction row for baseline or Liger FSDP.",
     ),
@@ -212,7 +240,8 @@ def build_run_for_experiment(
         "profile_mode": values.get("profile_mode"),
         "result_root": values.get("result_root"),
         "script": values.get("script"),
-        "profile": resolved.profile,
+        "context": values.get("context"),
+        "image": values.get("image"),
     }
     common = {k: v for k, v in common.items() if v is not None}
 
@@ -227,6 +256,19 @@ def build_run_for_experiment(
             repeats=int(values["repeats"]),
             warmup=int(values["warmup"]),
             iters=int(values["iters"]),
+            **common,
+        )
+
+    if spec.workload == "vectorsum-v2":
+        return VectorSumRun(
+            arch=arch,
+            backend=str(values["backend"]),
+            size=int(values["size"]),
+            dtype=str(values["dtype"]),
+            repeats=int(values["repeats"]),
+            warmup=int(values["warmup"]),
+            iters=int(values["iters"]),
+            block_size=int(values["block_size"]),
             **common,
         )
 
@@ -256,6 +298,11 @@ def build_run_for_experiment(
             iters=int(values["iters"]),
             nproc_per_node=int(values["nproc_per_node"]),
             gradient_checkpointing=bool(values["gradient_checkpointing"]),
+            profile_steady_state=bool(values["profile_steady_state"]),
+            fsdp_wrap_policy=str(values["fsdp_wrap_policy"]),
+            fsdp_backward_prefetch=str(values["fsdp_backward_prefetch"]),
+            fsdp_forward_prefetch=bool(values["fsdp_forward_prefetch"]),
+            fsdp_limit_all_gathers=bool(values["fsdp_limit_all_gathers"]),
             **common,
         )
 

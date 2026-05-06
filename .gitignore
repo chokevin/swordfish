@@ -46,3 +46,4 @@ infra/airun/generated/
 # local junk
 scratch/
 tmp/
+.tmp/
