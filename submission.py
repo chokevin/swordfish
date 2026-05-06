@@ -47,7 +47,7 @@ _MAX_CACHED_PROJECTIONS = 8
 _projection_cache: OrderedDict[tuple[tuple[int, ...], torch.device, torch.dtype], torch.Tensor] = (
     OrderedDict()
 )
-_DEFAULT_TRIANGLE_BACKEND = "torch"
+_DEFAULT_TRIANGLE_BACKEND = "auto"
 _DEFAULT_TRITON_BLOCK_M = 32
 _DEFAULT_TRITON_BLOCK_N = 32
 _DEFAULT_TRITON_BLOCK_K = 64
@@ -135,8 +135,54 @@ if triton is not None and tl is not None:
             mask=(offs_i[:, None] < n) & (offs_j[None, :] < n),
         )
 
+    @triton.jit
+    def _triangle_multiply_packed_kernel(
+        left,
+        right,
+        out,
+        n: tl.constexpr,
+        block_m: tl.constexpr,
+        block_n: tl.constexpr,
+        block_k: tl.constexpr,
+    ) -> None:
+        pid_ij = tl.program_id(0)
+        pid_bh = tl.program_id(1)
+        blocks_j = tl.cdiv(n, block_n)
+        block_i = pid_ij // blocks_j
+        block_j = pid_ij - block_i * blocks_j
+
+        offs_i = block_i * block_m + tl.arange(0, block_m)
+        offs_j = block_j * block_n + tl.arange(0, block_n)
+        offs_k = tl.arange(0, block_k)
+        base = pid_bh * n * n
+        acc = tl.zeros((block_m, block_n), dtype=tl.float32)
+
+        for k_start in range(0, n, block_k):
+            k = k_start + offs_k
+            left_offsets = base + offs_i[:, None] * n + k[None, :]
+            right_offsets = base + k[:, None] * n + offs_j[None, :]
+            left_tile = tl.load(
+                left + left_offsets,
+                mask=(offs_i[:, None] < n) & (k[None, :] < n),
+                other=0.0,
+            )
+            right_tile = tl.load(
+                right + right_offsets,
+                mask=(k[:, None] < n) & (offs_j[None, :] < n),
+                other=0.0,
+            )
+            acc += tl.dot(left_tile, right_tile, out_dtype=tl.float32)
+
+        out_offsets = base + offs_i[:, None] * n + offs_j[None, :]
+        tl.store(
+            out + out_offsets,
+            acc,
+            mask=(offs_i[:, None] < n) & (offs_j[None, :] < n),
+        )
+
 else:
     _triangle_multiply_kernel = None
+    _triangle_multiply_packed_kernel = None
 
 
 def _stacked_projection_weight(weights: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -231,6 +277,74 @@ def _triangle_multiply_triton(
     return out
 
 
+def _triangle_multiply_bmm(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    """Triangle contraction as explicit batched GEMM over [B * H, N, N]."""
+    batch, n, right_n, hidden_dim = left.shape
+    if right.shape != (batch, n, right_n, hidden_dim) or right_n != n:
+        raise ValueError(
+            f"expected matching [B, N, N, H] tensors, got {left.shape} and {right.shape}"
+        )
+
+    matmul_dtype = torch.bfloat16 if left.is_cuda and torch.cuda.is_bf16_supported() else left.dtype
+    left_bh = (
+        left.permute(0, 3, 1, 2).contiguous().to(matmul_dtype).reshape(batch * hidden_dim, n, n)
+    )
+    right_bh = (
+        right.permute(0, 3, 2, 1).contiguous().to(matmul_dtype).reshape(batch * hidden_dim, n, n)
+    )
+    out = torch.bmm(left_bh, right_bh).to(torch.float32)
+    return out.reshape(batch, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+
+def _triangle_multiply_triton_packed(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    *,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    num_warps: int,
+    num_stages: int,
+) -> torch.Tensor:
+    """Triton contraction over packed [B * H, N, N] BF16 matrices."""
+    if triton is None or _triangle_multiply_packed_kernel is None:
+        raise RuntimeError("Triton packed backend requested, but Triton is not available")
+    if not left.is_cuda:
+        raise RuntimeError("Triton packed backend requires CUDA tensors")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("Triton packed backend requires BF16-capable CUDA hardware")
+
+    batch, n, right_n, hidden_dim = left.shape
+    if right.shape != (batch, n, right_n, hidden_dim) or right_n != n:
+        raise ValueError(
+            f"expected matching [B, N, N, H] tensors, got {left.shape} and {right.shape}"
+        )
+
+    left_packed = (
+        left.permute(0, 3, 1, 2).contiguous().to(torch.bfloat16).reshape(batch * hidden_dim, n, n)
+    )
+    right_packed = (
+        right.permute(0, 3, 2, 1).contiguous().to(torch.bfloat16).reshape(batch * hidden_dim, n, n)
+    )
+    out_packed = torch.empty_like(left_packed, dtype=torch.float32)
+    grid = (
+        triton.cdiv(n, block_m) * triton.cdiv(n, block_n),
+        batch * hidden_dim,
+    )
+    _triangle_multiply_packed_kernel[grid](
+        left_packed,
+        right_packed,
+        out_packed,
+        n,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_warps=num_warps,
+        num_stages=num_stages,
+    )
+    return out_packed.reshape(batch, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+
 def _triangle_multiply(
     left: torch.Tensor,
     right: torch.Tensor,
@@ -243,9 +357,31 @@ def _triangle_multiply(
     triton_num_stages: int,
 ) -> torch.Tensor:
     if backend == "auto":
-        backend = "triton" if left.is_cuda and triton is not None else "torch"
+        backend = (
+            "triton_packed"
+            if (
+                left.is_cuda
+                and triton is not None
+                and _triangle_multiply_packed_kernel is not None
+                and torch.cuda.is_bf16_supported()
+                and left.shape[1] <= 256
+            )
+            else "torch"
+        )
     if backend == "triton":
         return _triangle_multiply_triton(
+            left,
+            right,
+            block_m=triton_block_m,
+            block_n=triton_block_n,
+            block_k=triton_block_k,
+            num_warps=triton_num_warps,
+            num_stages=triton_num_stages,
+        )
+    if backend == "bmm":
+        return _triangle_multiply_bmm(left, right)
+    if backend == "triton_packed":
+        return _triangle_multiply_triton_packed(
             left,
             right,
             block_m=triton_block_m,
@@ -459,7 +595,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--check-reference", action="store_true")
     parser.add_argument(
         "--backend",
-        choices=["auto", "torch", "triton"],
+        choices=["auto", "torch", "bmm", "triton", "triton_packed"],
         default=os.environ.get("TRIMUL_TRIANGLE_BACKEND", _DEFAULT_TRIANGLE_BACKEND),
         help="triangle contraction backend",
     )
