@@ -102,6 +102,69 @@ The report writes `docs/dashboard/completion-report.md` by default, includes the
 same strict matrix gate used by `make validate-results`, and summarizes the
 indexed artifacts found under `RESULT_DIR`.
 
+## TriMul outgoing tuning handoff
+
+The GPUMODE outgoing TriMul work lives on PR
+[`#7`](https://github.com/chokevin/swordfish/pull/7), branch
+`chokevin/trimul-outgoing-20260506`. The current fused-tail iteration landed in
+commit `26c543b` (`trimul: fuse tail norm gate`).
+
+### What changed
+
+- `submission.py` now splits the packed triangle path into explicit pack,
+  packed-matmul, and unpack stages so `--profile-ops` reports
+  `triangle_pack_left`, `triangle_pack_right`, `triangle_matmul`, and
+  `triangle_unpack` instead of one opaque `triangle` phase.
+- `--gate-pack-backend {auto,torch,triton}` exists for the fused
+  mask/gate/pack prototype. It is intentionally **not** selected by `auto`
+  because the measured Triton prototype regressed.
+- `--tail-backend {auto,torch,triton}` controls a fused Triton output
+  layernorm plus output-gate kernel. `auto` promotes it for CUDA
+  `H=128,N<=256` and keeps larger shapes on the previous PyTorch path.
+
+### H200 evidence
+
+Default `auto` with fused tail, all reference checks passing:
+
+| Shape | Mean latency | Max abs error |
+| --- | ---: | ---: |
+| `B=2,N=256,C=128,H=128,normal,nomask` | `1.1111 ms` | `0.01318` |
+| `B=2,N=256,C=128,H=128,cauchy,nomask` | `1.1085 ms` | `0.01000` |
+| `B=2,N=256,C=384,H=128,normal,masked` | `1.4953 ms` | `0.01095` |
+| `B=1,N=512,C=128,H=128,normal,nomask` | `3.7624 ms` | `0.00626` |
+
+Isolated first-shape comparisons:
+
+| Variant | Mean latency | Takeaway |
+| --- | ---: | --- |
+| no new fusion | `1.3298 ms` | baseline after BF16 projection policy |
+| tail-only | `1.1087 ms` | promoted winner |
+| gate-pack-only | `1.4178 ms` | correct but slower |
+| gate-pack + tail | `1.1920 ms` | tail win partly offset by gate-pack regression |
+
+The packed triangle matmul itself is not the dominant H200 N=256 cost anymore:
+`triangle_matmul` measured about `0.054 ms`; pack-left, pack-right, and unpack
+each measured around `0.11 ms`.
+
+### Do not repeat
+
+Do not continue the current channel-at-a-time `gate_mask_pack` design. It reads
+`projected [B,N,N,5H]` one hidden channel per program, which loses coalescing
+over the contiguous hidden lanes. A second attempt should either coalesce hidden
+lanes in the projection layout or move the fusion into a projection epilogue.
+
+### Next fresh-eyes target
+
+For a real push toward `0.5 ms`, attack materialization and layout traffic
+around input layernorm, stacked projection, gate/mask, pack/unpack, and final
+projection. Another standalone elementwise Triton pass is unlikely to be enough;
+a projection epilogue or custom CUDA/CUTLASS-style path is the more plausible
+next step.
+
+Evidence artifacts from this iteration are under `runs/trimul/` in the local
+worktree, with names starting `sf-trimul-tailauto-*` and
+`sf-trimul-fuse-*`.
+
 ## Inspecting a finished run locally (Mac)
 
 The day-to-day kernel-tuning loop is: edit kernel → submit to cluster → fetch
