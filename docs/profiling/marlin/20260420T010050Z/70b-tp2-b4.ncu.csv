@@ -1,0 +1,6 @@
+==PROF== Connected to process 1375 (/usr/bin/python3.10)
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0. For instructions on enabling permissions and to get more information see https://developer.nvidia.com/ERR_NVGPUCTRPERM
+{'name': '70b-tp2-b4', 'M': 4, 'N': 8192, 'K': 4096, 'group_size': 128, 'priority': 0, 'tag': 'llama-3-70b', 'impl': 'fp16', 'ms_mean': 0.41987199783325196, 'ms_p50': 0.41987199783325196, 'ms_p95': 0.41987199783325196, 'ms_min': 0.41987199783325196, 'tflops_mean': 0.6393268838723712, 'error': None, 'speedup_vs_fp16': 1.0}
+{'name': '70b-tp2-b4', 'M': 4, 'N': 8192, 'K': 4096, 'group_size': 128, 'priority': 0, 'tag': 'llama-3-70b', 'impl': 'marlin', 'ms_mean': 0.6886784076690674, 'ms_p50': 0.6886784076690674, 'ms_p95': 0.6886784076690674, 'ms_min': 0.6886784076690674, 'tflops_mean': 0.3897834649826746, 'error': None, 'speedup_vs_fp16': 0.6096778890663496}
+==PROF== Disconnected from process 1375
+==WARNING== No kernels were profiled.

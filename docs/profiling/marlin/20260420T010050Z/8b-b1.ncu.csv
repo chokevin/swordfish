@@ -1,0 +1,6 @@
+==PROF== Connected to process 639 (/usr/bin/python3.10)
+==ERROR== ERR_NVGPUCTRPERM - The user does not have permission to access NVIDIA GPU Performance Counters on the target device 0. For instructions on enabling permissions and to get more information see https://developer.nvidia.com/ERR_NVGPUCTRPERM
+{'name': '8b-b1', 'M': 1, 'N': 4096, 'K': 4096, 'group_size': 128, 'priority': 0, 'tag': 'llama-3-8b', 'impl': 'fp16', 'ms_mean': 0.36798079013824464, 'ms_p50': 0.36798079013824464, 'ms_p95': 0.36798079013824464, 'ms_min': 0.36798079013824464, 'tflops_mean': 0.09118528167569324, 'error': None, 'speedup_vs_fp16': 1.0}
+{'name': '8b-b1', 'M': 1, 'N': 4096, 'K': 4096, 'group_size': 128, 'priority': 0, 'tag': 'llama-3-8b', 'impl': 'marlin', 'ms_mean': 0.665228796005249, 'ms_p50': 0.665228796005249, 'ms_p95': 0.665228796005249, 'ms_min': 0.665228796005249, 'tflops_mean': 0.05044043823944031, 'error': None, 'speedup_vs_fp16': 0.5531642531832628}
+==PROF== Disconnected from process 639
+==WARNING== No kernels were profiled.
